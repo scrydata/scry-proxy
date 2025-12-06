@@ -1,0 +1,79 @@
+[package]
+name = "scry"
+version = "0.1.0"
+edition = "2021"
+authors = []
+description = "A transparent proxy for SQL systems with built-in observability"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+
+# Postgres protocol handling
+tokio-postgres = "0.7"
+postgres-protocol = "0.6"
+bytes = "1.5"
+
+# Configuration
+config = "0.14"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# Observability - OpenTelemetry
+opentelemetry = "0.21"
+opentelemetry_sdk = { version = "0.21", features = ["rt-tokio-current-thread"] }
+opentelemetry-otlp = "0.14"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-opentelemetry = "0.22"
+
+# Query journaling - FlatBuffers / FlexBuffers
+flatbuffers = "23.5"
+flexbuffers = "2.0"
+
+# Connection pooling
+deadpool = "0.10"
+deadpool-postgres = "0.12"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Async utilities
+futures = "0.3"
+pin-project = "1.1"
+async-trait = "0.1"
+
+# Utilities
+uuid = { version = "1.6", features = ["v4", "serde"] }
+
+# Query anonymization
+sqlparser = { version = "0.52", features = ["visitor"] }
+blake3 = "1.5"
+
+# HTTP client for production event publisher
+reqwest = { version = "0.12", features = ["json", "gzip"] }
+
+# Metrics and observability infrastructure
+hdrhistogram = "7.5"
+parking_lot = "0.12"
+axum = "0.7"
+tower = "0.4"
+tower-http = { version = "0.5", features = ["trace", "cors"] }
+ahash = "0.8"
+
+[dev-dependencies]
+# Integration testing
+testcontainers = "0.15"
+testcontainers-modules = { version = "0.3", features = ["postgres"] }
+
+# Testing utilities
+tokio-test = "0.4"
+criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+proptest = "1.4"
+
+[[bench]]
+name = "proxy_throughput"
+harness = false

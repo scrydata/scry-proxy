@@ -1,0 +1,55 @@
+// FlatBuffers schema for QueryEvent
+// This defines the wire format for publishing query events to the central analytics service
+
+namespace scry.events;
+
+// A captured SQL query event from the proxy
+table QueryEvent {
+  // Unique identifier for this event
+  event_id: string (required);
+
+  // Timestamp (Unix timestamp in microseconds)
+  timestamp_us: uint64;
+
+  // The SQL query text (raw if anonymization disabled)
+  query: string (required);
+
+  // Normalized query with placeholders (if anonymization enabled)
+  normalized_query: string;
+
+  // Fingerprints of literal values (if anonymization enabled)
+  // Enables hot data detection while protecting PII
+  value_fingerprints: [string];
+
+  // Query execution duration in microseconds
+  duration_us: uint64;
+
+  // Number of rows affected/returned (if available)
+  rows: uint64;
+
+  // Whether the query succeeded
+  success: bool = true;
+
+  // Error message if query failed
+  error: string;
+
+  // Database name
+  database: string (required);
+
+  // Client connection ID
+  connection_id: string (required);
+}
+
+// A batch of query events
+table QueryEventBatch {
+  // Array of events in this batch
+  events: [QueryEvent] (required);
+
+  // Proxy instance identifier (for multi-proxy deployments)
+  proxy_id: string;
+
+  // Batch sequence number (for ordering/deduplication)
+  batch_seq: uint64;
+}
+
+root_type QueryEventBatch;
