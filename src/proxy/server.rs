@@ -2,6 +2,7 @@ use super::{ConnectionHandler, EventBatcher, TcpConnectionPool};
 use crate::config::{Config, PoolingStrategy};
 use crate::observability::ProxyMetrics;
 use crate::protocol::{Protocol, ProtocolConfig, ProtocolRegistry};
+use crate::resilience::{ActiveHealthcheck, CircuitBreaker};
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,6 +43,54 @@ impl ProxyServer {
             "Protocol initialized"
         );
 
+        // Start active healthcheck background task if enabled
+        if config.resilience.healthcheck.active_enabled {
+            let healthcheck_config = config.resilience.healthcheck.clone();
+            let protocol_config = ProtocolConfig {
+                host: config.backend.host.clone(),
+                port: config.backend.port,
+                database: Some(config.backend.database.clone()),
+                user: Some(config.backend.user.clone()),
+                password: Some(config.backend.password.clone()),
+            };
+
+            let healthcheck = Arc::new(ActiveHealthcheck::new(
+                healthcheck_config.clone(),
+                Arc::clone(&protocol),
+                protocol_config,
+            ));
+
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(
+                    healthcheck_config.interval_secs,
+                ));
+
+                loop {
+                    interval.tick().await;
+
+                    match healthcheck.check().await {
+                        Ok(is_healthy) => {
+                            if is_healthy {
+                                tracing::debug!("Active healthcheck passed");
+                            } else {
+                                tracing::warn!("Active healthcheck failed threshold");
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "Active healthcheck error");
+                        }
+                    }
+                }
+            });
+
+            info!(
+                interval_secs = config.resilience.healthcheck.interval_secs,
+                "Active healthcheck loop started"
+            );
+        } else {
+            info!("Active healthcheck disabled");
+        }
+
         // Create connection pool if pooling is enabled
         let pool = if config.performance.connection_pooling != PoolingStrategy::Disabled {
             info!(
@@ -60,11 +109,46 @@ impl ProxyServer {
                 password: Some(config.backend.password.clone()),
             };
 
+            // Create circuit breaker if enabled
+            let circuit_breaker = if config.resilience.circuit_breaker.enabled {
+                let health_monitor = if config.resilience.circuit_breaker.use_health_monitor {
+                    Some(Arc::clone(metrics.health_monitor()))
+                } else {
+                    None
+                };
+
+                let cb = Arc::new(CircuitBreaker::new(
+                    config.resilience.circuit_breaker.clone(),
+                    health_monitor,
+                ));
+
+                // Store circuit breaker in metrics for observability
+                metrics.set_circuit_breaker(Some(Arc::clone(&cb)));
+
+                info!("Circuit breaker created and enabled");
+                Some(cb)
+            } else {
+                info!("Circuit breaker disabled");
+                metrics.set_circuit_breaker(None);
+                None
+            };
+
+            // Pass retry config if enabled
+            let retry_config = if config.resilience.connection_retry.enabled {
+                info!("Connection retries enabled");
+                Some(config.resilience.connection_retry.clone())
+            } else {
+                info!("Connection retries disabled");
+                None
+            };
+
             let pool = TcpConnectionPool::new(
                 Arc::clone(&protocol),
                 protocol_config,
                 config.performance.pool_size,
                 Some(config.performance.pool_min_idle),
+                circuit_breaker,
+                retry_config,
             )
             .context("Failed to create TCP connection pool")?;
 

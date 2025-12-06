@@ -33,6 +33,7 @@ pub struct ProxyMetrics {
     health: Arc<HealthMonitor>,
     start_time: Instant,
     active_connections: Arc<AtomicUsize>,
+    circuit_breaker: Arc<RwLock<Option<Arc<crate::resilience::CircuitBreaker>>>>,
 }
 
 impl ProxyMetrics {
@@ -49,7 +50,13 @@ impl ProxyMetrics {
             health: Arc::new(HealthMonitor::new(health_config)),
             start_time: Instant::now(),
             active_connections: Arc::new(AtomicUsize::new(0)),
+            circuit_breaker: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Set the circuit breaker (called from server setup)
+    pub fn set_circuit_breaker(&self, cb: Option<Arc<crate::resilience::CircuitBreaker>>) {
+        *self.circuit_breaker.write() = cb;
     }
 
     /// Record a completed query with timeline breakdown
@@ -153,6 +160,14 @@ impl ProxyMetrics {
 
     pub fn uptime(&self) -> Duration {
         self.start_time.elapsed()
+    }
+
+    /// Get circuit breaker metrics if circuit breaker is enabled
+    pub fn circuit_breaker_metrics(&self) -> Option<crate::resilience::CircuitBreakerMetrics> {
+        self.circuit_breaker
+            .read()
+            .as_ref()
+            .map(|cb| cb.get_metrics())
     }
 }
 

@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use scry::{config::*, proxy::*, publisher::*};
+use scry::{config::*, observability::{HealthConfig, ProxyMetrics}, proxy::*, publisher::*};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use testcontainers::{clients::Cli, RunnableImage};
@@ -56,8 +56,10 @@ fn create_test_config(backend_host: String, backend_port: u16) -> Config {
         proxy: ProxyConfig {
             listen_address: "127.0.0.1:0".to_string(),
             max_connections: 100,
+            shutdown_timeout_secs: 30,
         },
         backend: BackendConfig {
+            protocol: DatabaseProtocol::Postgres,
             host: backend_host,
             port: backend_port,
             database: "postgres".to_string(),
@@ -70,6 +72,8 @@ fn create_test_config(backend_host: String, backend_port: u16) -> Config {
             enable_tracing: false,
             otlp_endpoint: None,
             service_name: "scry-bench".to_string(),
+            metrics_server_address: "127.0.0.1:0".to_string(),
+            enable_metrics_server: false,
         },
         publisher: PublisherConfig {
             enabled: true,
@@ -86,8 +90,37 @@ fn create_test_config(backend_host: String, backend_port: u16) -> Config {
         },
         performance: PerformanceConfig {
             target_latency_ms: 1,
-            connection_pooling: false,
+            connection_pooling: PoolingStrategy::Disabled,
+            pool_size: 100,
+            pool_min_idle: 10,
+            pool_timeout_secs: 30,
+            pool_recycle_secs: 3600,
+            pool_aggressive_unpinning: false,
             buffer_size: 8192,
+        },
+        resilience: ResilienceConfig {
+            circuit_breaker: CircuitBreakerConfig {
+                enabled: false, // Disable for benchmarks to avoid interference
+                failure_threshold: 5,
+                success_threshold: 2,
+                window_secs: 30,
+                open_timeout_secs: 60,
+                use_health_monitor: false,
+            },
+            connection_retry: ConnectionRetryConfig {
+                enabled: false, // Disable for benchmarks
+                max_attempts: 1,
+                initial_backoff_ms: 50,
+                max_backoff_ms: 5000,
+                backoff_multiplier: 2.0,
+                jitter_factor: 0.1,
+            },
+            healthcheck: HealthcheckConfig {
+                active_enabled: false, // Disable for benchmarks
+                interval_secs: 30,
+                timeout_ms: 1000,
+                failure_threshold: 3,
+            },
         },
     }
 }
@@ -103,7 +136,8 @@ async fn start_test_proxy(
         config.publisher.max_queue_size,
     );
 
-    let server = ProxyServer::new(config.clone(), batcher).await?;
+    let metrics = Arc::new(ProxyMetrics::new(100, HealthConfig::default()));
+    let server = ProxyServer::new(config.clone(), batcher, metrics).await?;
     let port = server.local_addr()?.port();
 
     tokio::spawn(async move {

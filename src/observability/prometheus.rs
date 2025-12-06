@@ -39,6 +39,9 @@ pub fn export_metrics(metrics: &ProxyMetrics) -> String {
     // Export uptime
     export_uptime(&mut output, metrics);
 
+    // Export circuit breaker metrics
+    export_circuit_breaker_metrics(&mut output, metrics);
+
     output
 }
 
@@ -227,6 +230,82 @@ fn export_uptime(output: &mut String, metrics: &ProxyMetrics) {
     writeln!(output, "# HELP scry_uptime_seconds Proxy uptime in seconds").unwrap();
     writeln!(output, "# TYPE scry_uptime_seconds counter").unwrap();
     writeln!(output, "scry_uptime_seconds {}", uptime_secs).unwrap();
+}
+
+fn export_circuit_breaker_metrics(output: &mut String, metrics: &ProxyMetrics) {
+    if let Some(cb_metrics) = metrics.circuit_breaker_metrics() {
+        // Circuit breaker state (0=Closed, 1=Open, 2=HalfOpen)
+        let state_value = match cb_metrics.state.as_str() {
+            "closed" => 0,
+            "open" => 1,
+            "half_open" => 2,
+            _ => 0,
+        };
+
+        writeln!(
+            output,
+            "# HELP scry_circuit_breaker_state Circuit breaker state (0=Closed, 1=Open, 2=HalfOpen)"
+        )
+        .unwrap();
+        writeln!(output, "# TYPE scry_circuit_breaker_state gauge").unwrap();
+        writeln!(output, "scry_circuit_breaker_state {}", state_value).unwrap();
+
+        // Consecutive failures
+        writeln!(
+            output,
+            "# HELP scry_circuit_breaker_consecutive_failures Consecutive failures in current window"
+        )
+        .unwrap();
+        writeln!(output, "# TYPE scry_circuit_breaker_consecutive_failures gauge").unwrap();
+        writeln!(
+            output,
+            "scry_circuit_breaker_consecutive_failures {}",
+            cb_metrics.consecutive_failures
+        )
+        .unwrap();
+
+        // Consecutive successes
+        writeln!(
+            output,
+            "# HELP scry_circuit_breaker_consecutive_successes Consecutive successes in half-open state"
+        )
+        .unwrap();
+        writeln!(output, "# TYPE scry_circuit_breaker_consecutive_successes gauge").unwrap();
+        writeln!(
+            output,
+            "scry_circuit_breaker_consecutive_successes {}",
+            cb_metrics.consecutive_successes
+        )
+        .unwrap();
+
+        // Requests allowed
+        writeln!(
+            output,
+            "# HELP scry_circuit_breaker_requests_allowed_total Total requests allowed through"
+        )
+        .unwrap();
+        writeln!(output, "# TYPE scry_circuit_breaker_requests_allowed_total counter").unwrap();
+        writeln!(
+            output,
+            "scry_circuit_breaker_requests_allowed_total {}",
+            cb_metrics.requests_allowed
+        )
+        .unwrap();
+
+        // Requests rejected
+        writeln!(
+            output,
+            "# HELP scry_circuit_breaker_requests_rejected_total Total requests rejected (circuit open)"
+        )
+        .unwrap();
+        writeln!(output, "# TYPE scry_circuit_breaker_requests_rejected_total counter").unwrap();
+        writeln!(
+            output,
+            "scry_circuit_breaker_requests_rejected_total {}",
+            cb_metrics.requests_rejected
+        )
+        .unwrap();
+    }
 }
 
 /// Helper to export quantiles for a histogram

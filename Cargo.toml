@@ -48,6 +48,7 @@ async-trait = "0.1"
 
 # Utilities
 uuid = { version = "1.6", features = ["v4", "serde"] }
+rand = "0.8"  # For retry jitter
 
 # Query anonymization
 sqlparser = { version = "0.52", features = ["visitor"] }
@@ -60,6 +61,7 @@ reqwest = { version = "0.12", features = ["json", "gzip"] }
 hdrhistogram = "7.5"
 parking_lot = "0.12"
 axum = "0.7"
+http-body-util = "0.1"
 tower = "0.4"
 tower-http = { version = "0.5", features = ["trace", "cors"] }
 ahash = "0.8"

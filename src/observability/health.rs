@@ -69,29 +69,34 @@ impl HealthMonitor {
     pub fn check_and_update(&self, current: &HealthSnapshot) {
         let mut warnings = Vec::new();
 
-        // Update baseline with current sample
+        // Read baseline BEFORE updating (we check against the OLD baseline)
         let mut baseline = self.baseline.write();
-        baseline.update(current);
+        let baseline_snapshot = BaselineSnapshot {
+            avg_error_rate: baseline.avg_error_rate,
+            avg_latency_p99_ms: baseline.avg_latency_p99,
+            avg_pool_utilization: baseline.avg_pool_utilization,
+            sample_count: baseline.sample_count,
+        };
 
-        // Check for error rate spike
-        if current.error_rate > 0.0 && baseline.avg_error_rate > 0.0 {
-            let spike_factor = current.error_rate / baseline.avg_error_rate;
+        // Check for error rate spike (compare against old baseline)
+        if current.error_rate > 0.0 && baseline_snapshot.avg_error_rate > 0.0 {
+            let spike_factor = current.error_rate / baseline_snapshot.avg_error_rate;
             if spike_factor >= self.config.error_rate_spike_factor {
                 warnings.push(HealthWarning::ErrorRateSpike {
                     current: current.error_rate,
-                    baseline: baseline.avg_error_rate,
+                    baseline: baseline_snapshot.avg_error_rate,
                     factor: spike_factor,
                 });
             }
         }
 
-        // Check for latency spike
-        if current.latency_p99_ms > 0.0 && baseline.avg_latency_p99 > 0.0 {
-            let spike_factor = current.latency_p99_ms / baseline.avg_latency_p99;
+        // Check for latency spike (compare against old baseline)
+        if current.latency_p99_ms > 0.0 && baseline_snapshot.avg_latency_p99_ms > 0.0 {
+            let spike_factor = current.latency_p99_ms / baseline_snapshot.avg_latency_p99_ms;
             if spike_factor >= self.config.latency_spike_factor {
                 warnings.push(HealthWarning::LatencySpike {
                     current_p99_ms: current.latency_p99_ms,
-                    baseline_p99_ms: baseline.avg_latency_p99,
+                    baseline_p99_ms: baseline_snapshot.avg_latency_p99_ms,
                     factor: spike_factor,
                 });
             }
@@ -113,6 +118,9 @@ impl HealthMonitor {
                 wait_queue,
             });
         }
+
+        // NOW update baseline with current sample (after checking)
+        baseline.update(current);
 
         // Update warnings
         *self.warnings.write() = warnings;
@@ -357,7 +365,7 @@ mod tests {
         assert_eq!(warnings.len(), 1);
 
         match &warnings[0] {
-            HealthWarning::ErrorRateSpike { current, baseline, factor } => {
+            HealthWarning::ErrorRateSpike { current, baseline: _, factor } => {
                 assert_eq!(*current, 0.03);
                 assert!(factor >= &3.0);
             }

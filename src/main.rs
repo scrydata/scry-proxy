@@ -3,6 +3,7 @@ mod observability;
 mod protocol;
 mod proxy;
 mod publisher;
+mod resilience;
 
 use anyhow::Result;
 use std::sync::Arc;

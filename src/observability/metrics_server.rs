@@ -284,6 +284,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_metrics_endpoint() {
+        use axum::body::Body;
+        use http_body_util::BodyExt;
+
         let metrics = Arc::new(ProxyMetrics::new(100, HealthConfig::default()));
 
         // Record a query
@@ -293,11 +296,14 @@ mod tests {
         // Call handler
         let response = metrics_handler(State(metrics)).await;
 
-        // Extract body
-        let body = match response.into_body() {
-            axum::body::Body::from(bytes) => String::from_utf8_lossy(&bytes.to_vec()).to_string(),
-            _ => panic!("Unexpected body type"),
-        };
+        // Extract body bytes
+        let body_bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("Failed to collect body")
+            .to_bytes();
+        let body = String::from_utf8_lossy(&body_bytes);
 
         // Verify Prometheus format
         assert!(body.contains("scry_queries_total"));

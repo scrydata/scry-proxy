@@ -40,6 +40,7 @@ pub struct Config {
     pub observability: ObservabilityConfig,
     pub publisher: PublisherConfig,
     pub performance: PerformanceConfig,
+    pub resilience: ResilienceConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,6 +119,74 @@ pub struct PerformanceConfig {
     pub buffer_size: usize,
 }
 
+/// Resilience configuration - circuit breaking, retries, healthchecks
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResilienceConfig {
+    pub circuit_breaker: CircuitBreakerConfig,
+    pub connection_retry: ConnectionRetryConfig,
+    pub healthcheck: HealthcheckConfig,
+}
+
+/// Circuit breaker configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CircuitBreakerConfig {
+    /// Enable circuit breaker
+    pub enabled: bool,
+
+    /// Failure threshold to open circuit (consecutive failures)
+    pub failure_threshold: u32,
+
+    /// Success threshold to close circuit from half-open (consecutive successes)
+    pub success_threshold: u32,
+
+    /// Time window for failure counting (seconds)
+    pub window_secs: u64,
+
+    /// Timeout in open state before transitioning to half-open (seconds)
+    pub open_timeout_secs: u64,
+
+    /// Use health monitor for intelligent state transitions
+    pub use_health_monitor: bool,
+}
+
+/// Connection retry configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectionRetryConfig {
+    /// Enable connection retries
+    pub enabled: bool,
+
+    /// Maximum retry attempts
+    pub max_attempts: u32,
+
+    /// Initial backoff delay in milliseconds
+    pub initial_backoff_ms: u64,
+
+    /// Maximum backoff delay in milliseconds
+    pub max_backoff_ms: u64,
+
+    /// Backoff multiplier
+    pub backoff_multiplier: f64,
+
+    /// Jitter factor (0.0-1.0) to prevent thundering herd
+    pub jitter_factor: f64,
+}
+
+/// Active healthcheck configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthcheckConfig {
+    /// Enable active healthchecks (passive healthchecks always enabled)
+    pub active_enabled: bool,
+
+    /// Active healthcheck interval (seconds)
+    pub interval_secs: u64,
+
+    /// Active healthcheck timeout (milliseconds)
+    pub timeout_ms: u64,
+
+    /// Number of consecutive failures before marking unhealthy
+    pub failure_threshold: u32,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -165,6 +234,30 @@ impl Default for Config {
                 pool_recycle_secs: 3600,
                 pool_aggressive_unpinning: false,
                 buffer_size: 8192,
+            },
+            resilience: ResilienceConfig {
+                circuit_breaker: CircuitBreakerConfig {
+                    enabled: true,
+                    failure_threshold: 5,
+                    success_threshold: 2,
+                    window_secs: 30,
+                    open_timeout_secs: 60,
+                    use_health_monitor: true,
+                },
+                connection_retry: ConnectionRetryConfig {
+                    enabled: true,
+                    max_attempts: 3,
+                    initial_backoff_ms: 50,
+                    max_backoff_ms: 5000,
+                    backoff_multiplier: 2.0,
+                    jitter_factor: 0.1,
+                },
+                healthcheck: HealthcheckConfig {
+                    active_enabled: true,
+                    interval_secs: 30,
+                    timeout_ms: 1000,
+                    failure_threshold: 3,
+                },
             },
         }
     }
