@@ -6,7 +6,8 @@ mod tcp_pool;
 pub use connection::ConnectionHandler;
 pub use event_batcher::EventBatcher;
 pub use server::ProxyServer;
-pub use tcp_pool::{TcpConnectionPool, PooledConnection, PoolStatus};
+pub use tcp_pool::{TcpConnectionPool, PoolStatus};
+pub(crate) use tcp_pool::PooledConnection;
 
 use crate::config::Config;
 use crate::observability::ProxyMetrics;

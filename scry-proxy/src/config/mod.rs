@@ -6,12 +6,10 @@ use serde::{Deserialize, Serialize};
 pub enum DatabaseProtocol {
     /// PostgreSQL (and compatible databases like CockroachDB)
     Postgres,
-    /// MySQL (and compatible databases like MariaDB) - Future
-    #[cfg(feature = "mysql")]
-    Mysql,
-    /// MongoDB - Future
-    #[cfg(feature = "mongodb")]
-    Mongodb,
+    // Future: MySQL (and compatible databases like MariaDB)
+    // Mysql,
+    // Future: MongoDB
+    // Mongodb,
 }
 
 impl DatabaseProtocol {
@@ -19,10 +17,9 @@ impl DatabaseProtocol {
     pub fn as_str(&self) -> &'static str {
         match self {
             DatabaseProtocol::Postgres => "postgres",
-            #[cfg(feature = "mysql")]
-            DatabaseProtocol::Mysql => "mysql",
-            #[cfg(feature = "mongodb")]
-            DatabaseProtocol::Mongodb => "mongodb",
+            // Future protocol support:
+            // DatabaseProtocol::Mysql => "mysql",
+            // DatabaseProtocol::Mongodb => "mongodb",
         }
     }
 }

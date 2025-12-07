@@ -114,14 +114,13 @@ impl ProtocolRegistry {
             DatabaseProtocol::Postgres => {
                 Ok(Box::new(crate::protocol::postgres::PostgresProtocol::new()))
             }
-            #[cfg(feature = "mysql")]
-            DatabaseProtocol::Mysql => {
-                Err(anyhow::anyhow!("MySQL protocol not yet implemented"))
-            }
-            #[cfg(feature = "mongodb")]
-            DatabaseProtocol::Mongodb => {
-                Err(anyhow::anyhow!("MongoDB protocol not yet implemented"))
-            }
+            // Future protocol support - uncomment when implementing:
+            // DatabaseProtocol::Mysql => {
+            //     Err(anyhow::anyhow!("MySQL protocol not yet implemented"))
+            // }
+            // DatabaseProtocol::Mongodb => {
+            //     Err(anyhow::anyhow!("MongoDB protocol not yet implemented"))
+            // }
         }
     }
 }

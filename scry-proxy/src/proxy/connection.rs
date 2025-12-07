@@ -67,7 +67,7 @@ impl ConnectionHandler {
 
     /// Handle the connection, forwarding messages until completion
     #[instrument(skip(self), fields(connection_id = self.connection_id, client_addr = %self.client_addr))]
-    pub async fn handle(mut self) -> Result<()> {
+    pub async fn handle(self) -> Result<()> {
         info!("Starting connection handler");
 
         // Get backend connection - either from pool or create direct connection

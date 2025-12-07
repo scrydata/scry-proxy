@@ -8,7 +8,7 @@
 /// 2. Top-K Heap: Maintains the K most frequently accessed fingerprints
 /// 3. Temporal Decay: Recent accesses weighted more heavily than old ones
 
-use ahash::{AHasher, RandomState};
+use ahash::RandomState;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
@@ -20,7 +20,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub struct HotDataTracker {
     sketch: RwLock<CountMinSketch>,
     top_k: RwLock<TopKHeap>,
-    k: usize,
     decay_factor: f64,
 }
 
@@ -34,7 +33,6 @@ impl HotDataTracker {
         Self {
             sketch: RwLock::new(CountMinSketch::new(2048, 4)),
             top_k: RwLock::new(TopKHeap::new(k)),
-            k,
             decay_factor,
         }
     }
@@ -132,6 +130,7 @@ impl CountMinSketch {
     }
 
     /// Get estimated count for a fingerprint (minimum across all hash functions)
+    #[cfg(test)]
     fn estimate(&self, fingerprint: &str) -> u64 {
         let mut min_count = u64::MAX;
 

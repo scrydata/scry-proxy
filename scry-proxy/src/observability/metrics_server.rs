@@ -21,7 +21,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
-use tracing::{error, info};
+use tracing::info;
 
 /// Configuration for metrics server
 #[derive(Debug, Clone)]

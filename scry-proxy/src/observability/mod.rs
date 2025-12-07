@@ -35,7 +35,7 @@ pub fn init(config: &ObservabilityConfig) -> Result<()> {
                 "Initializing OpenTelemetry with OTLP exporter"
             );
 
-            use opentelemetry::{global, KeyValue};
+            use opentelemetry::KeyValue;
             use opentelemetry_otlp::WithExportConfig;
             use opentelemetry_sdk::{runtime, trace as sdktrace, Resource};
             use tracing_opentelemetry::OpenTelemetryLayer;

@@ -19,7 +19,7 @@ use tracing::{debug, info, warn};
 ///
 /// This type wraps a pooled TCP stream connection. When dropped, the connection
 /// is automatically returned to the pool for reuse.
-pub type PooledConnection = deadpool::managed::Object<TcpStreamManager>;
+pub(crate) type PooledConnection = deadpool::managed::Object<TcpStreamManager>;
 
 /// TCP connection pool for database backends
 ///
@@ -174,7 +174,7 @@ pub struct PoolStatus {
 /// Implements deadpool's Manager trait to handle connection lifecycle:
 /// - Creating new connections
 /// - Recycling connections between uses
-pub(crate) struct TcpStreamManager {
+pub struct TcpStreamManager {
     backend_addr: String,
     protocol: Arc<dyn Protocol>,
 }

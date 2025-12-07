@@ -16,7 +16,6 @@ pub struct ProxyServer {
     listener: TcpListener,
     batcher: Arc<EventBatcher>,
     pool: Option<Arc<TcpConnectionPool>>,
-    protocol: Arc<dyn Protocol>,
     metrics: Arc<ProxyMetrics>,
 }
 
@@ -164,7 +163,6 @@ impl ProxyServer {
             listener,
             batcher: Arc::new(batcher),
             pool,
-            protocol,
             metrics,
         })
     }
