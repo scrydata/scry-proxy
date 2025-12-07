@@ -3,7 +3,7 @@
 /// Tests that the proxy correctly handles shutdown signals, drains connections,
 /// and flushes events before exiting.
 
-use scry::{config::*, proxy::*, publisher::*};
+use scry::{config::*, observability::*, proxy::*, publisher::*};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use testcontainers::{clients::Cli, RunnableImage};
@@ -64,6 +64,8 @@ fn create_test_config(backend_host: String, backend_port: u16, shutdown_timeout:
             enable_tracing: false,
             otlp_endpoint: None,
             service_name: "scry-test".to_string(),
+            enable_metrics_server: false,
+            metrics_server_address: "127.0.0.1:9090".to_string(),
         },
         publisher: PublisherConfig {
             enabled: true,
@@ -87,6 +89,30 @@ fn create_test_config(backend_host: String, backend_port: u16, shutdown_timeout:
             pool_recycle_secs: 3600,
             pool_aggressive_unpinning: false,
             buffer_size: 8192,
+        },
+        resilience: ResilienceConfig {
+            circuit_breaker: CircuitBreakerConfig {
+                enabled: false,
+                failure_threshold: 5,
+                success_threshold: 2,
+                window_secs: 30,
+                open_timeout_secs: 60,
+                use_health_monitor: false,
+            },
+            connection_retry: ConnectionRetryConfig {
+                enabled: false,
+                max_attempts: 3,
+                initial_backoff_ms: 50,
+                max_backoff_ms: 5000,
+                backoff_multiplier: 2.0,
+                jitter_factor: 0.1,
+            },
+            healthcheck: HealthcheckConfig {
+                active_enabled: false,
+                interval_secs: 30,
+                timeout_ms: 1000,
+                failure_threshold: 3,
+            },
         },
     }
 }
@@ -115,7 +141,8 @@ async fn test_graceful_shutdown_drains_connections() {
         config.publisher.max_queue_size,
     );
 
-    let server = ProxyServer::new(config.clone(), batcher)
+    let metrics = Arc::new(ProxyMetrics::new(100, HealthConfig::default()));
+    let server = ProxyServer::new(config.clone(), batcher, metrics)
         .await
         .expect("Failed to create proxy server");
 
@@ -202,7 +229,8 @@ async fn test_shutdown_timeout() {
         config.publisher.max_queue_size,
     );
 
-    let server = ProxyServer::new(config.clone(), batcher)
+    let metrics = Arc::new(ProxyMetrics::new(100, HealthConfig::default()));
+    let server = ProxyServer::new(config.clone(), batcher, metrics)
         .await
         .expect("Failed to create proxy server");
 

@@ -4,7 +4,7 @@
 /// Reference: https://prometheus.io/docs/instrumenting/exposition_formats/
 ///
 /// Example output:
-/// ```
+/// ```text
 /// # HELP scry_query_latency_seconds Query latency in seconds
 /// # TYPE scry_query_latency_seconds summary
 /// scry_query_latency_seconds{quantile="0.5"} 0.002

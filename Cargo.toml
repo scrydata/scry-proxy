@@ -1,12 +1,14 @@
-[package]
-name = "scry"
+[workspace]
+members = ["scry-proxy"]
+resolver = "2"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
 authors = []
-description = "A transparent proxy for SQL systems with built-in observability"
 license = "MIT OR Apache-2.0"
 
-[dependencies]
+[workspace.dependencies]
 # Async runtime
 tokio = { version = "1.35", features = ["full"] }
 
@@ -48,7 +50,7 @@ async-trait = "0.1"
 
 # Utilities
 uuid = { version = "1.6", features = ["v4", "serde"] }
-rand = "0.8"  # For retry jitter
+rand = "0.8"
 
 # Query anonymization
 sqlparser = { version = "0.52", features = ["visitor"] }
@@ -66,7 +68,6 @@ tower = "0.4"
 tower-http = { version = "0.5", features = ["trace", "cors"] }
 ahash = "0.8"
 
-[dev-dependencies]
 # Integration testing
 testcontainers = "0.15"
 testcontainers-modules = { version = "0.3", features = ["postgres"] }
@@ -75,7 +76,3 @@ testcontainers-modules = { version = "0.3", features = ["postgres"] }
 tokio-test = "0.4"
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 proptest = "1.4"
-
-[[bench]]
-name = "proxy_throughput"
-harness = false

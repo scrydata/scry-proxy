@@ -1,11 +1,9 @@
 mod debug_logger;
-mod event;
-mod flatbuffers_serializer;
 mod http_publisher;
 mod r#trait;
 
 pub use debug_logger::DebugLoggerPublisher;
-pub use event::{QueryEvent, QueryEventBuilder};
+pub use scry_protocol::{QueryEvent, QueryEventBuilder};
 pub use http_publisher::HttpPublisher;
 pub use r#trait::EventPublisher;
 

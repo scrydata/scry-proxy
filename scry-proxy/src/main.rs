@@ -1,9 +1,4 @@
-mod config;
-mod observability;
-mod protocol;
-mod proxy;
-mod publisher;
-mod resilience;
+use scry::{config, observability, proxy, publisher};
 
 use anyhow::Result;
 use std::sync::Arc;

@@ -6,6 +6,15 @@ Built in Rust with Tokio, Scry sits between your application and database to pro
 
 Scry is a modern alternative to traditional connection poolers like PgBouncer, adding comprehensive observability, circuit breaking, and health monitoring while maintaining the same pooling efficiency. It protects your database from connection explosions even when applications have their own connection pools.
 
+## Project Structure
+
+This repository is organized as a Cargo workspace:
+
+- **`scry-proxy/`** - Main proxy server implementation
+- **`scry-protocol/`** - Standalone event protocol library
+
+The protocol library (`scry-protocol`) is published separately and can be used by analytics services, monitoring dashboards, or any tool that needs to serialize/deserialize Scry query events. It provides types, FlexBuffers serialization, and the canonical FlatBuffers schema.
+
 ## Features
 
 Scry enhances your database infrastructure with enterprise-grade capabilities:

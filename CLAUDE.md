@@ -31,15 +31,47 @@ just postgres-up        # Start Postgres container
 just postgres-down      # Stop Postgres container
 ```
 
+## Workspace Structure
+
+This repository is organized as a Cargo workspace with two crates:
+
+- **`scry-proxy/`** - Main SQL proxy server
+- **`scry-protocol/`** - Event protocol library (standalone, reusable)
+
+### scry-protocol
+
+Standalone crate for the query event protocol. Can be used independently by:
+- The proxy itself (for event creation and serialization)
+- Analytics services (for event deserialization and processing)
+- Monitoring dashboards
+- Third-party tools
+
+**Location**: `scry-protocol/`
+**Public API**:
+- `QueryEvent`, `QueryEventBuilder` - Event types
+- `FlatBuffersSerializer` - FlexBuffers serialization
+- `FlexBuffersDeserializer` - FlexBuffers deserialization
+- `DeserializedBatch` - Deserialized batch result
+
+**Schema**: `scry-protocol/schema/query_event.fbs` (canonical FlatBuffers schema)
+
+See `scry-protocol/README.md` for usage examples.
+
+### scry-proxy
+
+Main proxy server implementation.
+
+**Location**: `scry-proxy/src/`
+
 ## Architecture
 
-### Core Modules
+### Core Modules (scry-proxy)
 
-- **`src/proxy/`** - Main proxy server, connection handling, request forwarding
-- **`src/protocol/`** - Postgres wire protocol parsing and message handling
-- **`src/publisher/`** - Event publishing abstraction and implementations
-- **`src/config/`** - Configuration loading (12-factor app style)
-- **`src/observability/`** - Tracing, metrics, OpenTelemetry setup
+- **`scry-proxy/src/proxy/`** - Main proxy server, connection handling, request forwarding
+- **`scry-proxy/src/protocol/`** - Postgres wire protocol parsing and message handling
+- **`scry-proxy/src/publisher/`** - Event publishing abstraction and implementations
+- **`scry-proxy/src/config/`** - Configuration loading (12-factor app style)
+- **`scry-proxy/src/observability/`** - Tracing, metrics, OpenTelemetry setup
 
 ### Key Architectural Decisions
 

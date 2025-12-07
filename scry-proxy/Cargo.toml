@@ -1,0 +1,84 @@
+[package]
+name = "scry"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "A transparent proxy for SQL systems with built-in observability"
+license.workspace = true
+
+[[bin]]
+name = "scry"
+path = "src/main.rs"
+
+[dependencies]
+# Protocol dependency (external sibling repository)
+scry-protocol = { path = "../../scry-protocol" }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Postgres protocol handling
+tokio-postgres = { workspace = true }
+postgres-protocol = { workspace = true }
+bytes = { workspace = true }
+
+# Configuration
+config = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+
+# Observability - OpenTelemetry
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+
+# Connection pooling
+deadpool = { workspace = true }
+deadpool-postgres = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Async utilities
+futures = { workspace = true }
+pin-project = { workspace = true }
+async-trait = { workspace = true }
+
+# Utilities
+uuid = { workspace = true }
+rand = { workspace = true }
+
+# Query anonymization
+sqlparser = { workspace = true }
+blake3 = { workspace = true }
+
+# HTTP client for production event publisher
+reqwest = { workspace = true }
+
+# Metrics and observability infrastructure
+hdrhistogram = { workspace = true }
+parking_lot = { workspace = true }
+axum = { workspace = true }
+http-body-util = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+ahash = { workspace = true }
+
+[dev-dependencies]
+# Integration testing
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }
+
+# Testing utilities
+tokio-test = { workspace = true }
+criterion = { workspace = true }
+proptest = { workspace = true }
+
+[[bench]]
+name = "proxy_throughput"
+harness = false

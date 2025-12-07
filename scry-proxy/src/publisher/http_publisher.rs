@@ -1,4 +1,5 @@
-use super::{flatbuffers_serializer::FlatBuffersSerializer, EventPublisher, QueryEvent};
+use super::{EventPublisher, QueryEvent};
+use scry_protocol::FlatBuffersSerializer;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use reqwest::Client;
