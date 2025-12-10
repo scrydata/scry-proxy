@@ -103,3 +103,23 @@ postgres-logs:
 generate-schemas:
     @echo "Generating FlatBuffers schemas..."
     @echo "Run: flatc --rust -o src/generated schemas/*.fbs"
+
+# ============================================
+# Docker Commands
+# ============================================
+
+# Build Docker image (run from parent directory to include scry-protocol)
+docker-build:
+    Push-Location ..; docker build -t scry-proxy -f scry-proxy/Dockerfile .; Pop-Location
+
+# Build Docker image with no cache
+docker-build-no-cache:
+    Push-Location ..; docker build --no-cache -t scry-proxy -f scry-proxy/Dockerfile .; Pop-Location
+
+# Run Docker container
+docker-run:
+    docker run --rm -it -p 5433:5433 -p 9090:9090 scry-proxy
+
+# Tag and push to registry (requires REGISTRY env var)
+docker-push TAG="latest":
+    docker tag scry-proxy ${env:REGISTRY}/scry-proxy:{{TAG}}; docker push ${env:REGISTRY}/scry-proxy:{{TAG}}

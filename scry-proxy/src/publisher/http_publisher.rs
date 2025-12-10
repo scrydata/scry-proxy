@@ -19,11 +19,13 @@ use tracing::{debug, error, info, warn};
 /// - Timeout protection
 /// - Optional gzip compression
 /// - API key authentication support
+/// - Shadow ID routing for scry-platform
 pub struct HttpPublisher {
     client: Client,
     endpoint: String,
     max_retries: u32,
     api_key: Option<String>,
+    shadow_id: Option<String>,
     proxy_id: String,
     metrics: Arc<PublisherMetrics>,
 }
@@ -44,6 +46,7 @@ impl HttpPublisher {
         timeout_ms: u64,
         max_retries: u32,
         api_key: Option<String>,
+        shadow_id: Option<String>,
         compression: bool,
     ) -> Result<Self> {
         // Generate a unique proxy ID for this instance
@@ -68,6 +71,7 @@ impl HttpPublisher {
             max_retries = max_retries,
             compression = compression,
             proxy_id = %proxy_id,
+            shadow_id = ?shadow_id,
             "Initializing HttpPublisher"
         );
 
@@ -76,6 +80,7 @@ impl HttpPublisher {
             endpoint,
             max_retries,
             api_key,
+            shadow_id,
             proxy_id,
             metrics: Arc::new(PublisherMetrics {
                 total_events: AtomicU64::new(0),
@@ -142,6 +147,11 @@ impl HttpPublisher {
         // Add API key if configured
         if let Some(api_key) = &self.api_key {
             request = request.header("X-API-Key", api_key);
+        }
+
+        // Add shadow ID header for routing to scry-platform
+        if let Some(shadow_id) = &self.shadow_id {
+            request = request.header("X-Shadow-Id", shadow_id);
         }
 
         let response = request
@@ -251,6 +261,7 @@ mod tests {
             1000,
             2,
             None,
+            Some("550e8400-e29b-41d4-a716-446655440000".to_string()),
             false,
         );
 

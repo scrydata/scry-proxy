@@ -90,6 +90,12 @@ pub struct PublisherConfig {
     pub http_max_retries: u32,
     pub http_api_key: Option<String>,
     pub http_compression: bool,
+
+    /// Shadow ID for routing events to a specific shadow instance.
+    /// Used when sending events to scry-platform.
+    /// Can be set via SCRY_PUBLISHER__SHADOW_ID or read from SHADOW_ID_FILE env var.
+    #[serde(default)]
+    pub shadow_id: Option<String>,
 }
 
 /// Connection pooling strategy
@@ -221,6 +227,7 @@ impl Default for Config {
                 http_max_retries: 2,
                 http_api_key: None,
                 http_compression: true,
+                shadow_id: None,
             },
             performance: PerformanceConfig {
                 target_latency_ms: 1,
@@ -293,8 +300,11 @@ impl Config {
         // 3. Override with environment variables
         // Use separator "__" to support nested config
         // e.g., SCRY_BACKEND__HOST=localhost
+        // Note: prefix_separator must match the separator used in keys,
+        // otherwise "SCRY_BACKEND__HOST" would be parsed incorrectly
         builder = builder.add_source(
             Environment::with_prefix("SCRY")
+                .prefix_separator("__")
                 .separator("__")
                 .try_parsing(true),
         );

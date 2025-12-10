@@ -25,13 +25,25 @@ pub fn create_publisher(config: &PublisherConfig) -> Result<Arc<dyn EventPublish
                 .as_ref()
                 .context("http_endpoint is required when publisher_type = 'http'")?;
 
-            info!(endpoint = %endpoint, "Creating HttpPublisher");
+            // Get shadow_id from config or from SHADOW_ID_FILE environment variable
+            let shadow_id = config.shadow_id.clone().or_else(|| {
+                std::env::var("SHADOW_ID_FILE").ok().and_then(|path| {
+                    std::fs::read_to_string(&path).ok().map(|s| s.trim().to_string())
+                })
+            });
+
+            info!(
+                endpoint = %endpoint,
+                shadow_id = ?shadow_id,
+                "Creating HttpPublisher"
+            );
 
             let publisher = HttpPublisher::new(
                 endpoint.clone(),
                 config.http_timeout_ms,
                 config.http_max_retries,
                 config.http_api_key.clone(),
+                shadow_id,
                 config.http_compression,
             )?;
 
