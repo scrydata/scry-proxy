@@ -68,9 +68,9 @@ async fn main() -> Result<()> {
         tracing::info!("Background observability tasks started");
     }
 
-    // Initialize event publisher (currently using debug logger stub)
+    // Initialize event publisher based on config
     let publisher: Arc<dyn publisher::EventPublisher> =
-        Arc::new(publisher::DebugLoggerPublisher::new());
+        publisher::create_publisher(&config.publisher)?;
 
     // Start proxy server
     tracing::info!("Starting proxy server");
