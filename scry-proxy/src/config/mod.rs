@@ -300,11 +300,11 @@ impl Config {
         // 3. Override with environment variables
         // Use separator "__" to support nested config
         // e.g., SCRY_BACKEND__HOST=localhost
-        // Note: prefix_separator must match the separator used in keys,
-        // otherwise "SCRY_BACKEND__HOST" would be parsed incorrectly
+        // prefix_separator("_") means: SCRY_BACKEND__HOST (single underscore after prefix)
+        // separator("__") means: nested keys use double underscore
         builder = builder.add_source(
             Environment::with_prefix("SCRY")
-                .prefix_separator("__")
+                .prefix_separator("_")
                 .separator("__")
                 .try_parsing(true),
         );
