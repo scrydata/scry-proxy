@@ -1,8 +1,10 @@
 mod extractor;
 mod anonymize;
+pub mod bind;
 pub mod traits;
 pub mod postgres;
 
+pub use bind::decode_params;
 pub use extractor::MessageExtractor;
 pub use anonymize::{QueryAnonymizer, AnonymizedQuery};
 pub use traits::{Protocol, ProtocolConfig, ProtocolRegistry};
