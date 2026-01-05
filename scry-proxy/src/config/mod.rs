@@ -35,6 +35,7 @@ pub struct Config {
     pub proxy: ProxyConfig,
     pub backend: BackendConfig,
     pub observability: ObservabilityConfig,
+    pub protocol: ProtocolConfig,
     pub publisher: PublisherConfig,
     pub performance: PerformanceConfig,
     pub resilience: ResilienceConfig,
@@ -68,6 +69,13 @@ pub struct ObservabilityConfig {
     pub service_name: String,
     pub metrics_server_address: String,
     pub enable_metrics_server: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProtocolConfig {
+    /// Maximum prepared statements cached per connection.
+    /// Uses LRU eviction when limit is reached.
+    pub max_prepared_statements: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -214,6 +222,9 @@ impl Default for Config {
                 service_name: "scry-proxy".to_string(),
                 metrics_server_address: "127.0.0.1:9090".to_string(),
                 enable_metrics_server: true,
+            },
+            protocol: ProtocolConfig {
+                max_prepared_statements: 1000,
             },
             publisher: PublisherConfig {
                 enabled: true,
