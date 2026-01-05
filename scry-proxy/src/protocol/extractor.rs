@@ -263,6 +263,52 @@ impl MessageExtractor {
         }
     }
 
+    /// Extract ALL messages from raw protocol data
+    ///
+    /// Returns a Vec of all parsed Message enums from the buffer.
+    /// Extended query protocol bundles multiple messages (Parse+Bind+Execute+Sync)
+    /// in a single TCP packet, so we need to extract them all.
+    pub fn extract_messages(&self, data: &[u8]) -> Vec<Message> {
+        let mut messages = Vec::new();
+        let mut offset = 0;
+
+        while offset + 5 <= data.len() {
+            let msg_type = data[offset];
+            let length = i32::from_be_bytes([
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+                data[offset + 4],
+            ]) as usize;
+
+            // Check if we have the complete message
+            if offset + 1 + length > data.len() {
+                break; // Incomplete message
+            }
+
+            let payload = &data[offset + 5..offset + 1 + length];
+
+            let msg = match msg_type {
+                MSG_QUERY => self.parse_query_message(payload),
+                MSG_PARSE => self.parse_parse_message(payload),
+                MSG_BIND => self.parse_bind_message(payload),
+                MSG_EXECUTE => self.parse_execute_message(payload),
+                MSG_CLOSE => self.parse_close_message(payload),
+                MSG_SYNC => Some(Message::Sync),
+                MSG_TERMINATE => Some(Message::Terminate),
+                _ => None,
+            };
+
+            if let Some(m) = msg {
+                messages.push(m);
+            }
+
+            offset += 1 + length;
+        }
+
+        messages
+    }
+
     fn parse_query_message(&self, payload: &[u8]) -> Option<Message> {
         let query = Self::read_cstring(payload, 0)?;
         Some(Message::Query { query })

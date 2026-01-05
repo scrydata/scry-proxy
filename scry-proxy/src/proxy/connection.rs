@@ -1,9 +1,10 @@
-use super::{EventBatcher, TcpConnectionPool};
+use super::{EventBatcher, TcpConnectionPool, PreparedStatementCache, PreparedStatement, PendingExecution};
 use crate::config::Config;
 use crate::observability::{ProxyMetrics, QueryTimeline};
-use crate::protocol::{MessageExtractor, QueryAnonymizer};
+use crate::protocol::{MessageExtractor, QueryAnonymizer, Message, decode_params};
 use crate::publisher::QueryEventBuilder;
 use anyhow::{Context, Result};
+use scry_protocol::ParamValue;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -109,7 +110,7 @@ impl ConnectionHandler {
         let metrics = Arc::clone(&self.metrics);
 
         let extractor = MessageExtractor::new();
-        let current_query: Arc<Mutex<Option<(String, Instant, QueryTimeline)>>> = Arc::new(Mutex::new(None));
+        let mut stmt_cache = PreparedStatementCache::new(self.config.protocol.max_prepared_statements);
 
         let mut client_buffer = vec![0u8; self.config.performance.buffer_size];
         let mut backend_buffer = vec![0u8; self.config.performance.buffer_size];
@@ -126,12 +127,67 @@ impl ConnectionHandler {
                         Ok(n) => {
                             let data = &client_buffer[..n];
 
-                            // Try to extract query
-                            if let Some(query) = extractor.extract_query(data) {
-                                debug!(query = %query, "Extracted query from client");
-                                let mut timeline = QueryTimeline::new();
-                                timeline.mark_backend_start();
-                                *current_query.lock().await = Some((query, Instant::now(), timeline));
+                            // Process ALL protocol messages in buffer
+                            for msg in extractor.extract_messages(data) {
+                                match msg {
+                                    Message::Parse { name, query, param_oids } => {
+                                        debug!(name = %name, query = %query, "Cached prepared statement");
+                                        stmt_cache.insert_statement(name.clone(), PreparedStatement {
+                                            query: query.clone(),
+                                            param_oids,
+                                        });
+                                        // Set pending with empty params for Parse errors
+                                        // Will be overwritten by Bind if Parse succeeds
+                                        stmt_cache.set_pending(String::new(), PendingExecution {
+                                            query,
+                                            params: vec![],
+                                            params_incomplete: true,
+                                            started_at: Instant::now(),
+                                        });
+                                    }
+                                    Message::Bind { portal, statement, format_codes, params_raw } => {
+                                        let (query, params, incomplete) = match stmt_cache.get_statement(&statement) {
+                                            Some(stmt) => {
+                                                let params = decode_params(&params_raw, &format_codes, &stmt.param_oids);
+                                                (stmt.query.clone(), params, false)
+                                            }
+                                            None => {
+                                                warn!(statement = %statement, "Statement not in cache");
+                                                let params: Vec<ParamValue> = params_raw.iter()
+                                                    .map(|p| match p {
+                                                        Some(data) => ParamValue::Unknown { oid: 0, data: data.clone() },
+                                                        None => ParamValue::Null,
+                                                    })
+                                                    .collect();
+                                                (format!("[unknown: {}]", statement), params, true)
+                                            }
+                                        };
+
+                                        stmt_cache.set_pending(portal, PendingExecution {
+                                            query,
+                                            params,
+                                            params_incomplete: incomplete,
+                                            started_at: Instant::now(),
+                                        });
+                                    }
+                                    Message::Query { query } => {
+                                        debug!(query = %query, "Simple query");
+                                        stmt_cache.set_pending(String::new(), PendingExecution {
+                                            query,
+                                            params: vec![],
+                                            params_incomplete: false,
+                                            started_at: Instant::now(),
+                                        });
+                                    }
+                                    Message::Close { kind, name } => {
+                                        match kind {
+                                            'S' => stmt_cache.remove_statement(&name),
+                                            'P' => stmt_cache.clear_pending(&name),
+                                            _ => {}
+                                        }
+                                    }
+                                    _ => {}
+                                }
                             }
 
                             // Forward to backend (using DerefMut to get &mut TcpStream)
@@ -156,14 +212,15 @@ impl ConnectionHandler {
 
                             // Check for error response
                             if let Some(error_msg) = extractor.extract_error(data) {
-                                let mut query_guard = current_query.lock().await;
-                                if let Some((query, start_time, mut timeline)) = query_guard.take() {
-                                    timeline.mark_backend_end();
-                                    let duration = start_time.elapsed();
-                                    warn!(query = %query, error = %error_msg, duration_ms = duration.as_millis(), "Query failed");
+                                // Try unnamed portal first (simple query), then named
+                                if let Some(pending) = stmt_cache.take_pending("") {
+                                    let duration = pending.started_at.elapsed();
+                                    warn!(query = %pending.query, error = %error_msg, duration_ms = duration.as_millis(), "Query failed");
 
-                                    let (builder, fingerprints) = Self::build_query_event(query, connection_id, database.clone(), anonymize);
+                                    let (builder, fingerprints) = Self::build_query_event(pending.query, connection_id, database.clone(), anonymize);
                                     let event = builder
+                                        .params(pending.params)
+                                        .params_incomplete(pending.params_incomplete)
                                         .duration(duration)
                                         .success(false)
                                         .error(error_msg)
@@ -173,8 +230,7 @@ impl ConnectionHandler {
                                         warn!(error = %e, "Failed to send event to batcher");
                                     }
 
-                                    // Record metrics
-                                    metrics.record_query(&timeline, false);
+                                    metrics.record_query(&QueryTimeline::new(), false);
                                     if !fingerprints.is_empty() {
                                         metrics.record_hot_data(&fingerprints);
                                     }
@@ -182,14 +238,14 @@ impl ConnectionHandler {
                             }
                             // Check for query completion
                             else if extractor.is_query_complete(data) {
-                                let mut query_guard = current_query.lock().await;
-                                if let Some((query, start_time, mut timeline)) = query_guard.take() {
-                                    timeline.mark_backend_end();
-                                    let duration = start_time.elapsed();
-                                    debug!(query = %query, duration_ms = duration.as_millis(), "Query completed successfully");
+                                if let Some(pending) = stmt_cache.take_pending("") {
+                                    let duration = pending.started_at.elapsed();
+                                    debug!(query = %pending.query, duration_ms = duration.as_millis(), "Query completed successfully");
 
-                                    let (builder, fingerprints) = Self::build_query_event(query, connection_id, database.clone(), anonymize);
+                                    let (builder, fingerprints) = Self::build_query_event(pending.query, connection_id, database.clone(), anonymize);
                                     let event = builder
+                                        .params(pending.params)
+                                        .params_incomplete(pending.params_incomplete)
                                         .duration(duration)
                                         .success(true)
                                         .build();
@@ -198,8 +254,7 @@ impl ConnectionHandler {
                                         warn!(error = %e, "Failed to send event to batcher");
                                     }
 
-                                    // Record metrics
-                                    metrics.record_query(&timeline, true);
+                                    metrics.record_query(&QueryTimeline::new(), true);
                                     if !fingerprints.is_empty() {
                                         metrics.record_hot_data(&fingerprints);
                                     }
@@ -234,12 +289,13 @@ impl ConnectionHandler {
         let config_clone = Arc::clone(&self.config);
         let anonymize = self.config.publisher.anonymize;
         let metrics = Arc::clone(&self.metrics);
+        let max_stmts = self.config.protocol.max_prepared_statements;
 
-        // Track query timing and timeline - shared between both async tasks
-        let current_query: Arc<Mutex<Option<(String, Instant, QueryTimeline)>>> = Arc::new(Mutex::new(None));
+        // Shared prepared statement cache between both async tasks
+        let stmt_cache: Arc<Mutex<PreparedStatementCache>> = Arc::new(Mutex::new(PreparedStatementCache::new(max_stmts)));
 
-        // Client -> Backend forwarding with query extraction
-        let query_tracker = Arc::clone(&current_query);
+        // Client -> Backend forwarding with message extraction
+        let cache_writer = Arc::clone(&stmt_cache);
         let client_to_backend = async move {
             let mut buffer = vec![0u8; config_clone.performance.buffer_size];
             let extractor = MessageExtractor::new();
@@ -253,12 +309,71 @@ impl ConnectionHandler {
                     Ok(n) => {
                         let data = &buffer[..n];
 
-                        // Try to extract query information
-                        if let Some(query) = extractor.extract_query(data) {
-                            debug!(query = %query, "Extracted query from client");
-                            let mut timeline = QueryTimeline::new();
-                            timeline.mark_backend_start(); // Start backend execution timing
-                            *query_tracker.lock().await = Some((query, Instant::now(), timeline));
+                        // Process ALL protocol messages in buffer
+                        let messages = extractor.extract_messages(data);
+                        if !messages.is_empty() {
+                            let mut cache = cache_writer.lock().await;
+                            for msg in messages {
+                                match msg {
+                                    Message::Parse { name, query, param_oids } => {
+                                        debug!(name = %name, query = %query, "Cached prepared statement");
+                                        cache.insert_statement(name.clone(), PreparedStatement {
+                                            query: query.clone(),
+                                            param_oids,
+                                        });
+                                        // Set pending with empty params for Parse errors
+                                        // Will be overwritten by Bind if Parse succeeds
+                                        cache.set_pending(String::new(), PendingExecution {
+                                            query,
+                                            params: vec![],
+                                            params_incomplete: true,
+                                            started_at: Instant::now(),
+                                        });
+                                    }
+                                    Message::Bind { portal, statement, format_codes, params_raw } => {
+                                        let (query, params, incomplete) = match cache.get_statement(&statement) {
+                                            Some(stmt) => {
+                                                let params = decode_params(&params_raw, &format_codes, &stmt.param_oids);
+                                                (stmt.query.clone(), params, false)
+                                            }
+                                            None => {
+                                                warn!(statement = %statement, "Statement not in cache");
+                                                let params: Vec<ParamValue> = params_raw.iter()
+                                                    .map(|p| match p {
+                                                        Some(data) => ParamValue::Unknown { oid: 0, data: data.clone() },
+                                                        None => ParamValue::Null,
+                                                    })
+                                                    .collect();
+                                                (format!("[unknown: {}]", statement), params, true)
+                                            }
+                                        };
+
+                                        cache.set_pending(portal, PendingExecution {
+                                            query,
+                                            params,
+                                            params_incomplete: incomplete,
+                                            started_at: Instant::now(),
+                                        });
+                                    }
+                                    Message::Query { query } => {
+                                        debug!(query = %query, "Simple query");
+                                        cache.set_pending(String::new(), PendingExecution {
+                                            query,
+                                            params: vec![],
+                                            params_incomplete: false,
+                                            started_at: Instant::now(),
+                                        });
+                                    }
+                                    Message::Close { kind, name } => {
+                                        match kind {
+                                            'S' => cache.remove_statement(&name),
+                                            'P' => cache.clear_pending(&name),
+                                            _ => {}
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
                         }
 
                         // Forward to backend
@@ -276,7 +391,7 @@ impl ConnectionHandler {
         };
 
         // Backend -> Client forwarding with response detection
-        let query_tracker = Arc::clone(&current_query);
+        let cache_reader = Arc::clone(&stmt_cache);
         let backend_to_client = async move {
             let mut buffer = vec![0u8; self.config.performance.buffer_size];
             let extractor = MessageExtractor::new();
@@ -292,25 +407,25 @@ impl ConnectionHandler {
 
                         // Check for error response first
                         if let Some(error_msg) = extractor.extract_error(data) {
-                            let mut query_guard = query_tracker.lock().await;
-                            if let Some((query, start_time, mut timeline)) = query_guard.take() {
-                                timeline.mark_backend_end(); // Mark backend completion
-                                let duration = start_time.elapsed();
+                            let mut cache = cache_reader.lock().await;
+                            if let Some(pending) = cache.take_pending("") {
+                                let duration = pending.started_at.elapsed();
                                 warn!(
-                                    query = %query,
+                                    query = %pending.query,
                                     error = %error_msg,
                                     duration_ms = duration.as_millis(),
                                     "Query failed"
                                 );
 
-                                // Create and send error event
                                 let (builder, fingerprints) = Self::build_query_event(
-                                    query,
+                                    pending.query,
                                     connection_id,
                                     database.clone(),
                                     anonymize,
                                 );
                                 let event = builder
+                                    .params(pending.params)
+                                    .params_incomplete(pending.params_incomplete)
                                     .duration(duration)
                                     .success(false)
                                     .error(error_msg)
@@ -320,8 +435,7 @@ impl ConnectionHandler {
                                     warn!(error = %e, "Failed to send event to batcher");
                                 }
 
-                                // Record metrics
-                                metrics.record_query(&timeline, false);
+                                metrics.record_query(&QueryTimeline::new(), false);
                                 if !fingerprints.is_empty() {
                                     metrics.record_hot_data(&fingerprints);
                                 }
@@ -329,24 +443,24 @@ impl ConnectionHandler {
                         }
                         // Check if this is a successful query completion
                         else if extractor.is_query_complete(data) {
-                            let mut query_guard = query_tracker.lock().await;
-                            if let Some((query, start_time, mut timeline)) = query_guard.take() {
-                                timeline.mark_backend_end(); // Mark backend completion
-                                let duration = start_time.elapsed();
+                            let mut cache = cache_reader.lock().await;
+                            if let Some(pending) = cache.take_pending("") {
+                                let duration = pending.started_at.elapsed();
                                 debug!(
-                                    query = %query,
+                                    query = %pending.query,
                                     duration_ms = duration.as_millis(),
                                     "Query completed successfully"
                                 );
 
-                                // Create and send success event
                                 let (builder, fingerprints) = Self::build_query_event(
-                                    query,
+                                    pending.query,
                                     connection_id,
                                     database.clone(),
                                     anonymize,
                                 );
                                 let event = builder
+                                    .params(pending.params)
+                                    .params_incomplete(pending.params_incomplete)
                                     .duration(duration)
                                     .success(true)
                                     .build();
@@ -355,8 +469,7 @@ impl ConnectionHandler {
                                     warn!(error = %e, "Failed to send event to batcher");
                                 }
 
-                                // Record metrics
-                                metrics.record_query(&timeline, true);
+                                metrics.record_query(&QueryTimeline::new(), true);
                                 if !fingerprints.is_empty() {
                                     metrics.record_hot_data(&fingerprints);
                                 }
