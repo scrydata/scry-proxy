@@ -1,8 +1,10 @@
+mod cache;
 mod connection;
 mod event_batcher;
 mod server;
 mod tcp_pool;
 
+pub use cache::{PreparedStatementCache, PreparedStatement, PendingExecution};
 pub use connection::ConnectionHandler;
 pub use event_batcher::EventBatcher;
 pub use server::ProxyServer;
