@@ -233,6 +233,174 @@ impl MessageExtractor {
             }
         }
     }
+
+    /// Extract a typed message from raw protocol data
+    ///
+    /// Returns a parsed Message enum for extended query protocol messages
+    pub fn extract_message(&self, data: &[u8]) -> Option<Message> {
+        if data.len() < 5 {
+            return None;
+        }
+
+        let msg_type = data[0];
+        let length = i32::from_be_bytes([data[1], data[2], data[3], data[4]]) as usize;
+
+        if data.len() < 1 + length {
+            return None; // Incomplete message
+        }
+
+        let payload = &data[5..1 + length];
+
+        match msg_type {
+            MSG_QUERY => self.parse_query_message(payload),
+            MSG_PARSE => self.parse_parse_message(payload),
+            MSG_BIND => self.parse_bind_message(payload),
+            MSG_EXECUTE => self.parse_execute_message(payload),
+            MSG_CLOSE => self.parse_close_message(payload),
+            MSG_SYNC => Some(Message::Sync),
+            MSG_TERMINATE => Some(Message::Terminate),
+            _ => None,
+        }
+    }
+
+    fn parse_query_message(&self, payload: &[u8]) -> Option<Message> {
+        let query = Self::read_cstring(payload, 0)?;
+        Some(Message::Query { query })
+    }
+
+    fn parse_parse_message(&self, payload: &[u8]) -> Option<Message> {
+        let mut offset = 0;
+
+        // Statement name
+        let name = Self::read_cstring(payload, offset)?;
+        offset += name.len() + 1;
+
+        // Query string
+        let query = Self::read_cstring(payload, offset)?;
+        offset += query.len() + 1;
+
+        // Number of parameter types
+        if offset + 2 > payload.len() {
+            return None;
+        }
+        let num_params = i16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
+        offset += 2;
+
+        // Parameter OIDs
+        let mut param_oids = Vec::with_capacity(num_params);
+        for _ in 0..num_params {
+            if offset + 4 > payload.len() {
+                return None;
+            }
+            let oid = u32::from_be_bytes([
+                payload[offset],
+                payload[offset + 1],
+                payload[offset + 2],
+                payload[offset + 3],
+            ]);
+            param_oids.push(oid);
+            offset += 4;
+        }
+
+        Some(Message::Parse { name, query, param_oids })
+    }
+
+    fn parse_bind_message(&self, payload: &[u8]) -> Option<Message> {
+        let mut offset = 0;
+
+        // Portal name
+        let portal = Self::read_cstring(payload, offset)?;
+        offset += portal.len() + 1;
+
+        // Statement name
+        let statement = Self::read_cstring(payload, offset)?;
+        offset += statement.len() + 1;
+
+        // Number of format codes
+        if offset + 2 > payload.len() {
+            return None;
+        }
+        let num_format_codes = i16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
+        offset += 2;
+
+        // Format codes
+        let mut format_codes = Vec::with_capacity(num_format_codes);
+        for _ in 0..num_format_codes {
+            if offset + 2 > payload.len() {
+                return None;
+            }
+            let code = i16::from_be_bytes([payload[offset], payload[offset + 1]]);
+            format_codes.push(code);
+            offset += 2;
+        }
+
+        // Number of parameters
+        if offset + 2 > payload.len() {
+            return None;
+        }
+        let num_params = i16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
+        offset += 2;
+
+        // Parameters
+        let mut params_raw = Vec::with_capacity(num_params);
+        for _ in 0..num_params {
+            if offset + 4 > payload.len() {
+                return None;
+            }
+            let len = i32::from_be_bytes([
+                payload[offset],
+                payload[offset + 1],
+                payload[offset + 2],
+                payload[offset + 3],
+            ]);
+            offset += 4;
+
+            if len == -1 {
+                // NULL value
+                params_raw.push(None);
+            } else {
+                let len = len as usize;
+                if offset + len > payload.len() {
+                    return None;
+                }
+                params_raw.push(Some(payload[offset..offset + len].to_vec()));
+                offset += len;
+            }
+        }
+
+        Some(Message::Bind {
+            portal,
+            statement,
+            format_codes,
+            params_raw,
+        })
+    }
+
+    fn parse_execute_message(&self, payload: &[u8]) -> Option<Message> {
+        let portal = Self::read_cstring(payload, 0)?;
+        Some(Message::Execute { portal })
+    }
+
+    fn parse_close_message(&self, payload: &[u8]) -> Option<Message> {
+        if payload.is_empty() {
+            return None;
+        }
+        let kind = payload[0] as char;
+        let name = Self::read_cstring(payload, 1)?;
+        Some(Message::Close { kind, name })
+    }
+
+    fn read_cstring(data: &[u8], offset: usize) -> Option<String> {
+        let start = offset;
+        let mut end = start;
+        while end < data.len() && data[end] != 0 {
+            end += 1;
+        }
+        if end >= data.len() {
+            return None; // No null terminator found
+        }
+        String::from_utf8(data[start..end].to_vec()).ok()
+    }
 }
 
 impl Default for MessageExtractor {
@@ -341,5 +509,119 @@ mod tests {
 
         let result = extractor.extract_error(&msg);
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_extract_bind_message() {
+        let extractor = MessageExtractor::new();
+
+        // Build Bind message: B + len + portal\0 + stmt\0 + format_count + params_count + param_len + param_data
+        let mut msg = vec![MSG_BIND];
+
+        // Length placeholder (will calculate)
+        let len_pos = msg.len();
+        msg.extend_from_slice(&[0, 0, 0, 0]);
+
+        // Portal name (empty = unnamed)
+        msg.push(0);
+
+        // Statement name
+        msg.extend_from_slice(b"stmt1");
+        msg.push(0);
+
+        // Number of format codes: 1
+        msg.extend_from_slice(&1i16.to_be_bytes());
+        // Format code: 0 (text)
+        msg.extend_from_slice(&0i16.to_be_bytes());
+
+        // Number of parameters: 1
+        msg.extend_from_slice(&1i16.to_be_bytes());
+        // Parameter length: 2
+        msg.extend_from_slice(&2i32.to_be_bytes());
+        // Parameter value: "42"
+        msg.extend_from_slice(b"42");
+
+        // Result format codes: 0
+        msg.extend_from_slice(&0i16.to_be_bytes());
+
+        // Fix length
+        let len = (msg.len() - 1) as i32;
+        msg[len_pos..len_pos + 4].copy_from_slice(&len.to_be_bytes());
+
+        let result = extractor.extract_message(&msg);
+        assert!(matches!(result, Some(Message::Bind { .. })));
+
+        if let Some(Message::Bind { portal, statement, params_raw, .. }) = result {
+            assert_eq!(portal, "");
+            assert_eq!(statement, "stmt1");
+            assert_eq!(params_raw.len(), 1);
+            assert_eq!(params_raw[0], Some(b"42".to_vec()));
+        }
+    }
+
+    #[test]
+    fn test_extract_parse_message() {
+        let extractor = MessageExtractor::new();
+
+        // Build Parse message: P + len + name\0 + query\0 + param_count + oids
+        let mut msg = vec![MSG_PARSE];
+        let len_pos = msg.len();
+        msg.extend_from_slice(&[0, 0, 0, 0]);
+
+        // Statement name
+        msg.extend_from_slice(b"stmt1");
+        msg.push(0);
+
+        // Query
+        msg.extend_from_slice(b"SELECT * FROM users WHERE id = $1");
+        msg.push(0);
+
+        // Number of parameter types: 1
+        msg.extend_from_slice(&1i16.to_be_bytes());
+        // OID for int4: 23
+        msg.extend_from_slice(&23u32.to_be_bytes());
+
+        let len = (msg.len() - 1) as i32;
+        msg[len_pos..len_pos + 4].copy_from_slice(&len.to_be_bytes());
+
+        let result = extractor.extract_message(&msg);
+
+        if let Some(Message::Parse { name, query, param_oids }) = result {
+            assert_eq!(name, "stmt1");
+            assert_eq!(query, "SELECT * FROM users WHERE id = $1");
+            assert_eq!(param_oids, vec![23]);
+        } else {
+            panic!("Expected Parse message");
+        }
+    }
+
+    #[test]
+    fn test_extract_bind_with_null() {
+        let extractor = MessageExtractor::new();
+
+        let mut msg = vec![MSG_BIND];
+        let len_pos = msg.len();
+        msg.extend_from_slice(&[0, 0, 0, 0]);
+
+        msg.push(0); // portal
+        msg.extend_from_slice(b"stmt1");
+        msg.push(0); // statement
+
+        msg.extend_from_slice(&0i16.to_be_bytes()); // no format codes
+        msg.extend_from_slice(&1i16.to_be_bytes()); // 1 param
+        msg.extend_from_slice(&(-1i32).to_be_bytes()); // NULL
+        msg.extend_from_slice(&0i16.to_be_bytes()); // no result formats
+
+        let len = (msg.len() - 1) as i32;
+        msg[len_pos..len_pos + 4].copy_from_slice(&len.to_be_bytes());
+
+        let result = extractor.extract_message(&msg);
+
+        if let Some(Message::Bind { params_raw, .. }) = result {
+            assert_eq!(params_raw.len(), 1);
+            assert_eq!(params_raw[0], None);
+        } else {
+            panic!("Expected Bind message");
+        }
     }
 }

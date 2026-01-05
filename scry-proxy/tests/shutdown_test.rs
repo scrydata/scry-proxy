@@ -67,6 +67,9 @@ fn create_test_config(backend_host: String, backend_port: u16, shutdown_timeout:
             enable_metrics_server: false,
             metrics_server_address: "127.0.0.1:9090".to_string(),
         },
+        protocol: ProtocolConfig {
+            max_prepared_statements: 1000,
+        },
         publisher: PublisherConfig {
             enabled: true,
             batch_size: 10,
@@ -79,6 +82,7 @@ fn create_test_config(backend_host: String, backend_port: u16, shutdown_timeout:
             http_max_retries: 2,
             http_api_key: None,
             http_compression: true,
+            shadow_id: None,
         },
         performance: PerformanceConfig {
             target_latency_ms: 1,
