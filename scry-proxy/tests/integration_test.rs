@@ -3,6 +3,7 @@
 /// These tests spin up a real Postgres instance using testcontainers,
 /// start the proxy, and verify end-to-end query execution and event publishing.
 use scry::{config::*, observability::*, proxy::*, publisher::*};
+use scry_protocol::ParamValue;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use testcontainers::{clients::Cli, RunnableImage};
@@ -533,4 +534,137 @@ async fn test_mixed_success_and_error_queries() {
 
     assert!(success_count >= 1, "Expected at least 1 successful query");
     assert!(error_count >= 1, "Expected at least 1 failed query");
+}
+
+#[tokio::test]
+async fn test_prepared_statement_params_captured() {
+    // Setup: Start Postgres container
+    let docker = Cli::default();
+    let postgres_image = RunnableImage::from(Postgres::default()).with_tag("16-alpine");
+    let postgres = docker.run(postgres_image);
+
+    let postgres_port = postgres.get_host_port_ipv4(5432);
+    let postgres_host = "127.0.0.1".to_string();
+
+    sleep(Duration::from_secs(2)).await;
+
+    let config = create_test_config(postgres_host, postgres_port);
+    let test_publisher = TestPublisher::new();
+    let publisher = Arc::new(test_publisher.clone());
+
+    let proxy_port =
+        start_test_proxy(config.clone(), publisher).await.expect("Failed to start proxy");
+
+    sleep(Duration::from_millis(100)).await;
+
+    // Connect client
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user={} password={} dbname={}",
+            proxy_port, config.backend.user, config.backend.password, config.backend.database
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("Failed to connect to proxy");
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("Connection error: {}", e);
+        }
+    });
+
+    // Execute prepared statement with various parameter types
+    let stmt = client
+        .prepare("SELECT $1::int4 as num, $2::text as txt, $3::bool as flag")
+        .await
+        .expect("Failed to prepare statement");
+
+    let rows = client
+        .query(&stmt, &[&42i32, &"hello", &true])
+        .await
+        .expect("Failed to execute prepared statement");
+
+    assert_eq!(rows.len(), 1);
+    let num: i32 = rows[0].get(0);
+    let txt: &str = rows[0].get(1);
+    let flag: bool = rows[0].get(2);
+    assert_eq!(num, 42);
+    assert_eq!(txt, "hello");
+    assert!(flag);
+
+    // Wait for events to be published
+    sleep(Duration::from_millis(300)).await;
+
+    // Verify captured event has correct params
+    let events = test_publisher.events();
+
+    // Print all events for debugging
+    println!("All events:");
+    for (i, e) in events.iter().enumerate() {
+        println!("  Event {}: query='{}', params={:?}, success={}", i, e.query, e.params, e.success);
+    }
+
+    // Find the event with our query AND non-empty params
+    // (The prepare() call also emits an event, but with empty params)
+    let event = events.iter()
+        .find(|e| e.query.contains("SELECT $1") && !e.params.is_empty())
+        .expect("Expected to find query event with params");
+
+    // Print debug info
+    println!("Found event with params: query='{}', params={:?}", event.query, event.params);
+
+    // Verify params were captured
+    assert!(
+        !event.params.is_empty(),
+        "Expected params to be captured, but got empty params"
+    );
+
+    // Verify we got 3 params
+    assert_eq!(
+        event.params.len(), 3,
+        "Expected 3 params, got {}: {:?}",
+        event.params.len(), event.params
+    );
+
+    // Verify param values
+    // Note: tokio_postgres sends Parse with num_params=0 (server infers types),
+    // so we get Unknown variants with raw binary data.
+    // The raw data is still correct and can be decoded by the replay engine
+    // which will have the schema information.
+
+    match &event.params[0] {
+        ParamValue::Int32(n) => assert_eq!(*n, 42, "First param should be 42"),
+        ParamValue::Unknown { oid: _, data } => {
+            // Binary format: 4 bytes big-endian i32
+            assert_eq!(data.len(), 4, "Int32 should be 4 bytes");
+            let val = i32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+            assert_eq!(val, 42, "First param should be 42");
+        }
+        other => panic!("Expected Int32(42) or Unknown, got {:?}", other),
+    }
+
+    match &event.params[1] {
+        ParamValue::Text(s) => assert_eq!(s, "hello", "Second param should be 'hello'"),
+        ParamValue::Unknown { oid: _, data } => {
+            // Binary format: raw bytes
+            let val = String::from_utf8(data.clone()).expect("Should be valid UTF-8");
+            assert_eq!(val, "hello", "Second param should be 'hello'");
+        }
+        other => panic!("Expected Text('hello') or Unknown, got {:?}", other),
+    }
+
+    match &event.params[2] {
+        ParamValue::Bool(b) => assert!(*b, "Third param should be true"),
+        ParamValue::Unknown { oid: _, data } => {
+            // Binary format: 1 byte, non-zero = true
+            assert_eq!(data.len(), 1, "Bool should be 1 byte");
+            assert_eq!(data[0], 1, "Third param should be true (1)");
+        }
+        other => panic!("Expected Bool(true) or Unknown, got {:?}", other),
+    }
+
+    // params_incomplete may be true if OIDs weren't in Parse message
+    // (tokio_postgres uses server-inferred types)
+    println!("params_incomplete: {}", event.params_incomplete);
 }
