@@ -69,6 +69,7 @@ http-body-util = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
 ahash = { workspace = true }
+indexmap = "2.7"
 
 [dev-dependencies]
 # Integration testing

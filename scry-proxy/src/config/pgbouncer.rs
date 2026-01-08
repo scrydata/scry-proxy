@@ -19,11 +19,11 @@
 //! let scry_config = pgb_config.to_scry_config(Config::default());
 //! ```
 
-use std::collections::HashMap;
 use std::env;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use indexmap::IndexMap;
 use ini::Ini;
 
 use super::{Config, PoolingStrategy};
@@ -69,8 +69,10 @@ impl DatabaseEntry {
 /// Maps PgBouncer configuration options to Scry equivalents.
 #[derive(Debug, Clone, Default)]
 pub struct PgBouncerConfig {
-    /// Database connection definitions from [databases] section
-    pub databases: HashMap<String, DatabaseEntry>,
+    /// Database connection definitions from [databases] section.
+    /// Uses IndexMap to preserve insertion order from the INI file,
+    /// ensuring deterministic selection of the first database.
+    pub databases: IndexMap<String, DatabaseEntry>,
 
     /// Address to listen on (default: 127.0.0.1)
     pub listen_addr: Option<String>,
@@ -93,7 +95,9 @@ pub struct PgBouncerConfig {
     /// Server idle timeout in seconds
     pub server_idle_timeout: Option<u64>,
 
-    /// Query timeout in seconds (0 = unlimited)
+    /// Query timeout in seconds (0 = unlimited).
+    /// Note: This is parsed for compatibility but not yet mapped to a Scry config option.
+    /// Scry does not currently support per-query timeouts.
     pub query_timeout: Option<u64>,
 
     /// Server connect timeout in seconds
@@ -238,8 +242,10 @@ impl PgBouncerConfig {
         config.proxy.listen_address = format!("{}:{}", host, port);
 
         // Map pool_mode to PoolingStrategy
+        // Note: We normalize to lowercase to handle case-insensitive matching
+        // (e.g., "TRANSACTION", "Transaction", "transaction" all work)
         if let Some(ref mode) = self.pool_mode {
-            config.performance.connection_pooling = match mode.as_str() {
+            config.performance.connection_pooling = match mode.to_lowercase().as_str() {
                 "session" => PoolingStrategy::Session,
                 "transaction" => PoolingStrategy::Transaction,
                 "statement" => {
@@ -880,14 +886,24 @@ pool_mode = session
         let mut pgb = PgBouncerConfig::default();
         pgb.pool_mode = Some("TRANSACTION".to_string());
 
-        // The from_env normalizes to lowercase
+        // to_scry_config normalizes to lowercase before matching
         let config = pgb.to_scry_config(Config::default());
 
-        // This should still work because we check lowercase in to_scry_config
-        // But since the value is already uppercase, it won't match
-        assert_eq!(config.performance.connection_pooling, PoolingStrategy::Hybrid);
+        // Uppercase should work now that we normalize in to_scry_config
+        assert_eq!(
+            config.performance.connection_pooling,
+            PoolingStrategy::Transaction
+        );
 
-        // Now with lowercase (as from_file does)
+        // Mixed case also works
+        pgb.pool_mode = Some("Transaction".to_string());
+        let config = pgb.to_scry_config(Config::default());
+        assert_eq!(
+            config.performance.connection_pooling,
+            PoolingStrategy::Transaction
+        );
+
+        // Lowercase works as before
         pgb.pool_mode = Some("transaction".to_string());
         let config = pgb.to_scry_config(Config::default());
         assert_eq!(
@@ -900,7 +916,7 @@ pool_mode = session
     fn test_multiple_databases_uses_first() {
         let mut pgb = PgBouncerConfig::default();
 
-        // Insert in a specific order (though HashMap doesn't guarantee order)
+        // Insert in a specific order - IndexMap preserves insertion order
         pgb.databases.insert(
             "db1".to_string(),
             DatabaseEntry {
@@ -918,10 +934,7 @@ pool_mode = session
 
         let config = pgb.to_scry_config(Config::default());
 
-        // One of the hosts should be used (we can't guarantee which due to HashMap)
-        assert!(
-            config.backend.host == "host1.example.com"
-                || config.backend.host == "host2.example.com"
-        );
+        // IndexMap guarantees insertion order, so we always get the first inserted database
+        assert_eq!(config.backend.host, "host1.example.com");
     }
 }
