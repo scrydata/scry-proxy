@@ -735,6 +735,77 @@ async fn test_rollback_releases_connection() {
     println!("Connection release after rollback verified");
 }
 
+/// Test that transaction mode rejects SET commands outside transactions
+///
+/// In transaction pooling mode, SET commands outside of a transaction
+/// block would modify session state that could affect other clients
+/// when the connection is returned to the pool. The proxy should reject
+/// such commands with an error.
+///
+/// NOTE: This test may fail until Phase 8 (connection handler integration)
+/// is complete. The ModeEnforcer is built but not yet integrated.
+#[tokio::test]
+async fn test_transaction_mode_rejects_set_outside_transaction() {
+    let docker = Cli::default();
+    let postgres_image = RunnableImage::from(Postgres::default()).with_tag("16-alpine");
+    let postgres = docker.run(postgres_image);
+
+    let postgres_port = postgres.get_host_port_ipv4(5432);
+    let postgres_host = "127.0.0.1".to_string();
+
+    sleep(Duration::from_secs(2)).await;
+
+    let config = create_test_config(postgres_host, postgres_port, PoolingStrategy::Transaction);
+    let test_publisher = TestPublisher::new();
+    let publisher = Arc::new(test_publisher.clone());
+
+    let proxy_port = start_test_proxy(config.clone(), publisher)
+        .await
+        .expect("Failed to start proxy");
+
+    sleep(Duration::from_millis(100)).await;
+
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user={} password={} dbname={}",
+            proxy_port, config.backend.user, config.backend.password, config.backend.database
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("Failed to connect to proxy");
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("Connection error: {}", e);
+        }
+    });
+
+    // SET outside transaction should be rejected in transaction mode
+    // because it would modify session state that persists after connection
+    // is returned to the pool
+    let result = client.execute("SET search_path TO public", &[]).await;
+
+    // The proxy should reject this command
+    assert!(
+        result.is_err(),
+        "Transaction mode should reject SET commands outside transactions"
+    );
+
+    // Verify the error message indicates the restriction
+    if let Err(e) = result {
+        let error_msg = e.to_string().to_lowercase();
+        assert!(
+            error_msg.contains("transaction")
+                || error_msg.contains("not supported")
+                || error_msg.contains("not allowed")
+                || error_msg.contains("pooling"),
+            "Error should mention transaction pooling restriction, got: {}",
+            e
+        );
+    }
+}
+
 /// Test that events are captured for transaction operations
 ///
 /// BEGIN, COMMIT, ROLLBACK should all be captured as query events.
