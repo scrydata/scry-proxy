@@ -125,6 +125,7 @@ fn create_test_config(host: String, port: u16, pooling: PoolingStrategy) -> Conf
                 failure_threshold: 3,
             },
         },
+        tls: TlsConfig::default(),
     }
 }
 

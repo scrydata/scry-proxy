@@ -129,6 +129,7 @@ fn create_test_config(backend_host: String, backend_port: u16) -> Config {
                 failure_threshold: 3,
             },
         },
+        tls: TlsConfig::default(),
     }
 }
 

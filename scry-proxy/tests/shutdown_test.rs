@@ -116,6 +116,7 @@ fn create_test_config(backend_host: String, backend_port: u16, shutdown_timeout:
                 failure_threshold: 3,
             },
         },
+        tls: TlsConfig::default(),
     }
 }
 

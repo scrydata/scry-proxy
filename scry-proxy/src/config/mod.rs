@@ -42,6 +42,7 @@ pub struct Config {
     pub publisher: PublisherConfig,
     pub performance: PerformanceConfig,
     pub resilience: ResilienceConfig,
+    pub tls: TlsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,6 +122,64 @@ pub enum PoolingStrategy {
     Transaction,
     /// Hybrid pooling - dynamic pinning with automatic state tracking (default)
     Hybrid,
+}
+
+/// TLS SSL mode - matches PgBouncer naming for familiarity
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TlsSslMode {
+    /// Plain TCP, TLS disabled (default)
+    #[default]
+    Disable,
+    /// If client requests TLS, use it; otherwise plain TCP
+    Allow,
+    /// Client must use TLS, but certificate not validated
+    Require,
+    /// Client must use TLS with valid certificate (CA verified)
+    #[serde(rename = "verify-ca")]
+    VerifyCa,
+    /// Client must use TLS with valid certificate + hostname match
+    #[serde(rename = "verify-full")]
+    VerifyFull,
+}
+
+/// TLS configuration for client and server connections
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TlsConfig {
+    // Client-facing TLS (clients -> proxy)
+    /// TLS mode for client connections
+    pub client_tls_sslmode: TlsSslMode,
+    /// Path to server certificate file (PEM format)
+    pub client_tls_cert_file: Option<String>,
+    /// Path to server private key file (PEM format)
+    pub client_tls_key_file: Option<String>,
+    /// Path to CA certificate for client certificate validation
+    pub client_tls_ca_file: Option<String>,
+
+    // Server-facing TLS (proxy -> backend)
+    /// TLS mode for backend connections
+    pub server_tls_sslmode: TlsSslMode,
+    /// Path to CA certificate for server certificate validation
+    pub server_tls_ca_file: Option<String>,
+    /// Path to client certificate for backend authentication
+    pub server_tls_cert_file: Option<String>,
+    /// Path to client private key for backend authentication
+    pub server_tls_key_file: Option<String>,
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self {
+            client_tls_sslmode: TlsSslMode::Disable,
+            client_tls_cert_file: None,
+            client_tls_key_file: None,
+            client_tls_ca_file: None,
+            server_tls_sslmode: TlsSslMode::Disable,
+            server_tls_ca_file: None,
+            server_tls_cert_file: None,
+            server_tls_key_file: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -286,6 +345,7 @@ impl Default for Config {
                     failure_threshold: 3,
                 },
             },
+            tls: TlsConfig::default(),
         }
     }
 }
@@ -380,5 +440,21 @@ mod tests {
         assert_ne!(PoolingStrategy::Disabled, PoolingStrategy::Session);
         assert_ne!(PoolingStrategy::Session, PoolingStrategy::Transaction);
         assert_ne!(PoolingStrategy::Transaction, PoolingStrategy::Hybrid);
+    }
+
+    #[test]
+    fn test_tls_sslmode_default_is_disable() {
+        let config = Config::default();
+        assert_eq!(config.tls.client_tls_sslmode, TlsSslMode::Disable);
+        assert_eq!(config.tls.server_tls_sslmode, TlsSslMode::Disable);
+    }
+
+    #[test]
+    fn test_tls_config_defaults() {
+        let config = Config::default();
+        assert!(config.tls.client_tls_cert_file.is_none());
+        assert!(config.tls.client_tls_key_file.is_none());
+        assert!(config.tls.client_tls_ca_file.is_none());
+        assert!(config.tls.server_tls_ca_file.is_none());
     }
 }
