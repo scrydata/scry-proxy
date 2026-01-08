@@ -753,10 +753,7 @@ async fn test_transaction_mode_rejects_set_outside_transaction() {
                 db_err.message()
             );
         } else {
-            panic!(
-                "Expected a database error (DbError) but got a different error type: {}",
-                e
-            );
+            panic!("Expected a database error (DbError) but got a different error type: {}", e);
         }
     }
 }

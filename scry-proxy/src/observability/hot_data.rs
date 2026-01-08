@@ -150,8 +150,6 @@ impl CountMinSketch {
 
     /// Hash a fingerprint with the i-th hash function
     fn hash(&self, fingerprint: &str, hash_index: usize) -> u64 {
-        
-        
         self.hash_builders[hash_index].hash_one(fingerprint)
     }
 }

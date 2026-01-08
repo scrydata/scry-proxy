@@ -274,7 +274,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_metrics_endpoint() {
-        
         use http_body_util::BodyExt;
 
         let metrics = Arc::new(ProxyMetrics::new(100, HealthConfig::default()));
