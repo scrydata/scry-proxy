@@ -2,7 +2,6 @@
 ///
 /// Tests that the proxy correctly handles shutdown signals, drains connections,
 /// and flushes events before exiting.
-
 use scry::{config::*, observability::*, proxy::*, publisher::*};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -18,9 +17,7 @@ struct TestPublisher {
 
 impl TestPublisher {
     fn new() -> Self {
-        Self {
-            events: Arc::new(Mutex::new(Vec::new())),
-        }
+        Self { events: Arc::new(Mutex::new(Vec::new())) }
     }
 
     fn event_count(&self) -> usize {
@@ -67,9 +64,7 @@ fn create_test_config(backend_host: String, backend_port: u16, shutdown_timeout:
             enable_metrics_server: false,
             metrics_server_address: "127.0.0.1:9090".to_string(),
         },
-        protocol: ProtocolConfig {
-            max_prepared_statements: 1000,
-        },
+        protocol: ProtocolConfig { max_prepared_statements: 1000 },
         publisher: PublisherConfig {
             enabled: true,
             batch_size: 10,
@@ -156,9 +151,7 @@ async fn test_graceful_shutdown_drains_connections() {
     let proxy_port = server.local_addr().expect("Failed to get local addr").port();
 
     // Start proxy in background
-    let proxy_handle = tokio::spawn(async move {
-        server.run().await
-    });
+    let proxy_handle = tokio::spawn(async move { server.run().await });
 
     sleep(Duration::from_millis(100)).await;
 
@@ -180,10 +173,7 @@ async fn test_graceful_shutdown_drains_connections() {
     });
 
     // Execute a simple query to verify connection works
-    client
-        .execute("SELECT 1", &[])
-        .await
-        .expect("Query failed");
+    client.execute("SELECT 1", &[]).await.expect("Query failed");
 
     // Simulate shutdown signal by dropping the proxy handle
     // (In real scenario, this would be triggered by Ctrl+C or SIGTERM)
@@ -200,11 +190,7 @@ async fn test_graceful_shutdown_drains_connections() {
 
     // Verify events were captured
     let event_count = test_publisher.event_count();
-    assert!(
-        event_count >= 2,
-        "Expected at least 2 events, got {}",
-        event_count
-    );
+    assert!(event_count >= 2, "Expected at least 2 events, got {}", event_count);
 
     // Cleanup
     drop(client);
@@ -244,9 +230,7 @@ async fn test_shutdown_timeout() {
     let proxy_port = server.local_addr().expect("Failed to get local addr").port();
 
     // Start proxy in background
-    let proxy_handle = tokio::spawn(async move {
-        server.run().await
-    });
+    let proxy_handle = tokio::spawn(async move { server.run().await });
 
     sleep(Duration::from_millis(100)).await;
 
@@ -272,21 +256,14 @@ async fn test_shutdown_timeout() {
 
     // Execute queries on all connections
     for client in &clients {
-        client
-            .execute("SELECT 1", &[])
-            .await
-            .expect("Query failed");
+        client.execute("SELECT 1", &[]).await.expect("Query failed");
     }
 
     sleep(Duration::from_millis(500)).await;
 
     // Verify events were captured
     let event_count = test_publisher.event_count();
-    assert!(
-        event_count >= 3,
-        "Expected at least 3 events, got {}",
-        event_count
-    );
+    assert!(event_count >= 3, "Expected at least 3 events, got {}", event_count);
 
     // Cleanup
     drop(clients);

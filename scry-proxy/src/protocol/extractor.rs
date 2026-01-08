@@ -10,9 +10,7 @@ pub struct MessageExtractor {
 
 impl MessageExtractor {
     pub fn new() -> Self {
-        Self {
-            buffer: Mutex::new(Vec::new()),
-        }
+        Self { buffer: Mutex::new(Vec::new()) }
     }
 
     /// Try to extract a query from the given data
@@ -414,12 +412,7 @@ impl MessageExtractor {
             }
         }
 
-        Some(Message::Bind {
-            portal,
-            statement,
-            format_codes,
-            params_raw,
-        })
+        Some(Message::Bind { portal, statement, format_codes, params_raw })
     }
 
     fn parse_execute_message(&self, payload: &[u8]) -> Option<Message> {
@@ -753,7 +746,7 @@ mod tests {
         // DataRow: 'D' + length + data
         msg.extend_from_slice(&[MSG_DATA_ROW, 0, 0, 0, 11]);
         msg.extend_from_slice(&[0, 1, 0, 0, 0, 1, b'1']); // 1 column, value "1"
-        // CommandComplete: 'C' + length + "SELECT 1\0"
+                                                          // CommandComplete: 'C' + length + "SELECT 1\0"
         msg.extend_from_slice(&[MSG_COMMAND_COMPLETE, 0, 0, 0, 13]);
         msg.extend_from_slice(b"SELECT 1\0");
         // ReadyForQuery

@@ -25,9 +25,7 @@ pub struct QueryAnonymizer {
 impl QueryAnonymizer {
     /// Create a new query anonymizer with default settings
     pub fn new() -> Self {
-        Self {
-            salt: b"scry-default-salt".to_vec(),
-        }
+        Self { salt: b"scry-default-salt".to_vec() }
     }
 
     /// Create a new query anonymizer with a custom salt
@@ -114,10 +112,7 @@ struct ValueCollector {
 
 impl ValueCollector {
     fn new(salt: &[u8]) -> Self {
-        Self {
-            fingerprints: Vec::new(),
-            salt: salt.to_vec(),
-        }
+        Self { fingerprints: Vec::new(), salt: salt.to_vec() }
     }
 
     fn hash_value(&self, value: &str) -> String {
@@ -192,7 +187,9 @@ impl ValueReplacer {
                 for projection in &mut select.projection {
                     if let sqlparser::ast::SelectItem::UnnamedExpr(expr) = projection {
                         self.visit_expr(expr);
-                    } else if let sqlparser::ast::SelectItem::ExprWithAlias { expr, .. } = projection {
+                    } else if let sqlparser::ast::SelectItem::ExprWithAlias { expr, .. } =
+                        projection
+                    {
                         self.visit_expr(expr);
                     }
                 }
@@ -238,21 +235,19 @@ impl ValueReplacer {
                     self.visit_expr(item);
                 }
             }
-            Expr::Function(func) => {
-                match &mut func.args {
-                    sqlparser::ast::FunctionArguments::None => {}
-                    sqlparser::ast::FunctionArguments::Subquery(_) => {}
-                    sqlparser::ast::FunctionArguments::List(arg_list) => {
-                        for arg in &mut arg_list.args {
-                            if let sqlparser::ast::FunctionArg::Unnamed(arg_expr) = arg {
-                                if let sqlparser::ast::FunctionArgExpr::Expr(e) = arg_expr {
-                                    self.visit_expr(e);
-                                }
+            Expr::Function(func) => match &mut func.args {
+                sqlparser::ast::FunctionArguments::None => {}
+                sqlparser::ast::FunctionArguments::Subquery(_) => {}
+                sqlparser::ast::FunctionArguments::List(arg_list) => {
+                    for arg in &mut arg_list.args {
+                        if let sqlparser::ast::FunctionArg::Unnamed(arg_expr) = arg {
+                            if let sqlparser::ast::FunctionArgExpr::Expr(e) = arg_expr {
+                                self.visit_expr(e);
                             }
                         }
                     }
                 }
-            }
+            },
             Expr::Nested(inner) => {
                 self.visit_expr(inner);
             }
@@ -308,8 +303,7 @@ mod tests {
     #[test]
     fn test_insert_statement() {
         let anonymizer = QueryAnonymizer::new();
-        let result =
-            anonymizer.anonymize("INSERT INTO users (name, age) VALUES ('Alice', 30)");
+        let result = anonymizer.anonymize("INSERT INTO users (name, age) VALUES ('Alice', 30)");
 
         assert!(result.is_some());
         let anon = result.unwrap();

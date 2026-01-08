@@ -17,9 +17,7 @@ pub struct TransactionTracker {
 
 impl TransactionTracker {
     pub fn new() -> Self {
-        Self {
-            state: TransactionState::Idle,
-        }
+        Self { state: TransactionState::Idle }
     }
 
     /// Update state from ReadyForQuery message status byte

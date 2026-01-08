@@ -9,10 +9,10 @@
 //! This implementation uses a FIFO queue with individual notification channels
 //! for each waiter to ensure strict ordering.
 
+use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use parking_lot::Mutex;
 use tokio::sync::oneshot;
 
 /// A bounded wait queue for clients waiting for pool connections
@@ -55,10 +55,7 @@ impl WaitQueue {
             self.depth.fetch_add(1, Ordering::SeqCst);
         }
 
-        Ok(Waiter {
-            queue: Arc::clone(self),
-            receiver: Some(rx),
-        })
+        Ok(Waiter { queue: Arc::clone(self), receiver: Some(rx) })
     }
 
     /// Notify one waiter that a connection is available

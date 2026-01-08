@@ -4,7 +4,6 @@
 /// must provide. It allows the proxy to support multiple database systems
 /// (Postgres, MySQL, MongoDB, CockroachDB, etc.) with the same core pooling
 /// and forwarding logic.
-
 use anyhow::Result;
 use async_trait::async_trait;
 use tokio::net::TcpStream;
@@ -113,14 +112,13 @@ impl ProtocolRegistry {
         match protocol {
             DatabaseProtocol::Postgres => {
                 Ok(Box::new(crate::protocol::postgres::PostgresProtocol::new()))
-            }
-            // Future protocol support - uncomment when implementing:
-            // DatabaseProtocol::Mysql => {
-            //     Err(anyhow::anyhow!("MySQL protocol not yet implemented"))
-            // }
-            // DatabaseProtocol::Mongodb => {
-            //     Err(anyhow::anyhow!("MongoDB protocol not yet implemented"))
-            // }
+            } // Future protocol support - uncomment when implementing:
+              // DatabaseProtocol::Mysql => {
+              //     Err(anyhow::anyhow!("MySQL protocol not yet implemented"))
+              // }
+              // DatabaseProtocol::Mongodb => {
+              //     Err(anyhow::anyhow!("MongoDB protocol not yet implemented"))
+              // }
         }
     }
 }

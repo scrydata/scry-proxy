@@ -15,10 +15,7 @@ pub enum PinReason {
 impl PinReason {
     /// Check if this pin reason represents unsafe state that cannot be replayed
     pub fn is_unsafe(&self) -> bool {
-        matches!(
-            self,
-            PinReason::TempTable | PinReason::Cursor | PinReason::AdvisoryLock
-        )
+        matches!(self, PinReason::TempTable | PinReason::Cursor | PinReason::AdvisoryLock)
     }
 }
 
@@ -78,9 +75,7 @@ impl ConnectionState {
 
     /// Check if connection has unsafe state that cannot be replayed
     pub fn has_unsafe_state(&self) -> bool {
-        !self.temp_tables.is_empty()
-            || !self.cursors.is_empty()
-            || !self.advisory_locks.is_empty()
+        !self.temp_tables.is_empty() || !self.cursors.is_empty() || !self.advisory_locks.is_empty()
     }
 
     /// Get all current pin reasons
@@ -303,10 +298,7 @@ mod tests {
 
         assert_eq!(replay.prepared_statements.len(), 1);
         assert_eq!(replay.session_variables.len(), 1);
-        assert_eq!(
-            replay.session_variables.get("tz"),
-            Some(&"UTC".to_string())
-        );
+        assert_eq!(replay.session_variables.get("tz"), Some(&"UTC".to_string()));
     }
 
     #[test]

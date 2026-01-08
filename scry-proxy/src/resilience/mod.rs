@@ -7,7 +7,6 @@
 /// - Configurable via 12-factor environment variables
 /// - Independently disableable
 /// - Designed for <1ms latency overhead
-
 pub mod circuit_breaker;
 pub mod errors;
 pub mod healthcheck;

@@ -1,10 +1,12 @@
 use super::{
-    EventBatcher, TcpConnectionPool, PreparedStatementCache, PreparedStatement, PendingExecution,
-    TransactionTracker, ConnectionState, ModeEnforcer, PoolingMode,
+    ConnectionState, EventBatcher, ModeEnforcer, PendingExecution, PoolingMode, PreparedStatement,
+    PreparedStatementCache, TcpConnectionPool, TransactionTracker,
 };
 use crate::config::{Config, PoolingStrategy};
 use crate::observability::{ProxyMetrics, QueryTimeline};
-use crate::protocol::{MessageExtractor, QueryAnonymizer, Message, decode_params, CommandDetector, DetectedCommand};
+use crate::protocol::{
+    decode_params, CommandDetector, DetectedCommand, Message, MessageExtractor, QueryAnonymizer,
+};
 use crate::publisher::QueryEventBuilder;
 use anyhow::{Context, Result};
 use scry_protocol::ParamValue;
@@ -58,9 +60,7 @@ impl ConnectionHandler {
         anonymize: bool,
     ) -> (QueryEventBuilder, Vec<String>) {
         let mut builder = QueryEventBuilder::new(query.clone());
-        builder = builder
-            .connection_id(connection_id.to_string())
-            .database(database);
+        builder = builder.connection_id(connection_id.to_string()).database(database);
 
         let mut fingerprints = Vec::new();
 
@@ -100,7 +100,8 @@ impl ConnectionHandler {
             return self.handle_with_pooled_backend(pooled_conn).await;
         } else {
             info!(backend_addr = %backend_addr, "Creating direct backend connection");
-            let backend_stream = TcpStream::connect(&backend_addr).await.context("Failed to connect to backend")?;
+            let backend_stream =
+                TcpStream::connect(&backend_addr).await.context("Failed to connect to backend")?;
 
             // Use direct connection
             return self.handle_with_owned_backend(backend_stream).await;
@@ -122,7 +123,8 @@ impl ConnectionHandler {
         let metrics = Arc::clone(&self.metrics);
 
         let extractor = MessageExtractor::new();
-        let mut stmt_cache = PreparedStatementCache::new(self.config.protocol.max_prepared_statements);
+        let mut stmt_cache =
+            PreparedStatementCache::new(self.config.protocol.max_prepared_statements);
 
         // Transaction pooling tracking components
         let pooling_mode = Self::pooling_mode(&self.config.performance.connection_pooling);
@@ -449,7 +451,8 @@ impl ConnectionHandler {
         let max_stmts = self.config.protocol.max_prepared_statements;
 
         // Shared prepared statement cache between both async tasks
-        let stmt_cache: Arc<Mutex<PreparedStatementCache>> = Arc::new(Mutex::new(PreparedStatementCache::new(max_stmts)));
+        let stmt_cache: Arc<Mutex<PreparedStatementCache>> =
+            Arc::new(Mutex::new(PreparedStatementCache::new(max_stmts)));
 
         // Client -> Backend forwarding with message extraction
         let cache_writer = Arc::clone(&stmt_cache);
@@ -474,30 +477,48 @@ impl ConnectionHandler {
                                 match msg {
                                     Message::Parse { name, query, param_oids } => {
                                         debug!(name = %name, query = %query, "Cached prepared statement");
-                                        cache.insert_statement(name.clone(), PreparedStatement {
-                                            query: query.clone(),
-                                            param_oids,
-                                        });
+                                        cache.insert_statement(
+                                            name.clone(),
+                                            PreparedStatement { query: query.clone(), param_oids },
+                                        );
                                         // Set pending with empty params for Parse errors
                                         // Will be overwritten by Bind if Parse succeeds
-                                        cache.set_pending(String::new(), PendingExecution {
-                                            query,
-                                            params: vec![],
-                                            params_incomplete: true,
-                                            started_at: Instant::now(),
-                                        });
+                                        cache.set_pending(
+                                            String::new(),
+                                            PendingExecution {
+                                                query,
+                                                params: vec![],
+                                                params_incomplete: true,
+                                                started_at: Instant::now(),
+                                            },
+                                        );
                                     }
-                                    Message::Bind { portal, statement, format_codes, params_raw } => {
-                                        let (query, params, incomplete) = match cache.get_statement(&statement) {
+                                    Message::Bind {
+                                        portal,
+                                        statement,
+                                        format_codes,
+                                        params_raw,
+                                    } => {
+                                        let (query, params, incomplete) = match cache
+                                            .get_statement(&statement)
+                                        {
                                             Some(stmt) => {
-                                                let params = decode_params(&params_raw, &format_codes, &stmt.param_oids);
+                                                let params = decode_params(
+                                                    &params_raw,
+                                                    &format_codes,
+                                                    &stmt.param_oids,
+                                                );
                                                 (stmt.query.clone(), params, false)
                                             }
                                             None => {
                                                 warn!(statement = %statement, "Statement not in cache");
-                                                let params: Vec<ParamValue> = params_raw.iter()
+                                                let params: Vec<ParamValue> = params_raw
+                                                    .iter()
                                                     .map(|p| match p {
-                                                        Some(data) => ParamValue::Unknown { oid: 0, data: data.clone() },
+                                                        Some(data) => ParamValue::Unknown {
+                                                            oid: 0,
+                                                            data: data.clone(),
+                                                        },
                                                         None => ParamValue::Null,
                                                     })
                                                     .collect();
@@ -505,29 +526,33 @@ impl ConnectionHandler {
                                             }
                                         };
 
-                                        cache.set_pending(portal, PendingExecution {
-                                            query,
-                                            params,
-                                            params_incomplete: incomplete,
-                                            started_at: Instant::now(),
-                                        });
+                                        cache.set_pending(
+                                            portal,
+                                            PendingExecution {
+                                                query,
+                                                params,
+                                                params_incomplete: incomplete,
+                                                started_at: Instant::now(),
+                                            },
+                                        );
                                     }
                                     Message::Query { query } => {
                                         debug!(query = %query, "Simple query");
-                                        cache.set_pending(String::new(), PendingExecution {
-                                            query,
-                                            params: vec![],
-                                            params_incomplete: false,
-                                            started_at: Instant::now(),
-                                        });
+                                        cache.set_pending(
+                                            String::new(),
+                                            PendingExecution {
+                                                query,
+                                                params: vec![],
+                                                params_incomplete: false,
+                                                started_at: Instant::now(),
+                                            },
+                                        );
                                     }
-                                    Message::Close { kind, name } => {
-                                        match kind {
-                                            'S' => cache.remove_statement(&name),
-                                            'P' => cache.clear_pending(&name),
-                                            _ => {}
-                                        }
-                                    }
+                                    Message::Close { kind, name } => match kind {
+                                        'S' => cache.remove_statement(&name),
+                                        'P' => cache.clear_pending(&name),
+                                        _ => {}
+                                    },
                                     _ => {}
                                 }
                             }
@@ -699,7 +724,8 @@ mod tests {
 
     #[test]
     fn test_build_ready_for_query_in_transaction() {
-        let msg = ConnectionHandler::build_ready_for_query(super::super::TransactionState::InTransaction);
+        let msg =
+            ConnectionHandler::build_ready_for_query(super::super::TransactionState::InTransaction);
         assert_eq!(msg, vec![b'Z', 0, 0, 0, 5, b'T']);
     }
 
@@ -740,7 +766,10 @@ mod tests {
     #[test]
     fn test_update_connection_state_create_temp_table() {
         let mut conn_state = ConnectionState::new(100);
-        ConnectionHandler::update_connection_state(&mut conn_state, "CREATE TEMP TABLE tmp_users (id int)");
+        ConnectionHandler::update_connection_state(
+            &mut conn_state,
+            "CREATE TEMP TABLE tmp_users (id int)",
+        );
         assert!(conn_state.is_pinned());
         assert!(conn_state.has_unsafe_state());
     }
@@ -748,7 +777,10 @@ mod tests {
     #[test]
     fn test_update_connection_state_declare_cursor() {
         let mut conn_state = ConnectionState::new(100);
-        ConnectionHandler::update_connection_state(&mut conn_state, "DECLARE my_cursor CURSOR FOR SELECT 1");
+        ConnectionHandler::update_connection_state(
+            &mut conn_state,
+            "DECLARE my_cursor CURSOR FOR SELECT 1",
+        );
         assert!(conn_state.is_pinned());
         assert!(conn_state.has_unsafe_state());
     }
@@ -766,7 +798,10 @@ mod tests {
     #[test]
     fn test_update_connection_state_advisory_lock() {
         let mut conn_state = ConnectionState::new(100);
-        ConnectionHandler::update_connection_state(&mut conn_state, "SELECT pg_advisory_lock(12345)");
+        ConnectionHandler::update_connection_state(
+            &mut conn_state,
+            "SELECT pg_advisory_lock(12345)",
+        );
         assert!(conn_state.is_pinned());
         assert!(conn_state.has_unsafe_state());
     }
@@ -777,7 +812,10 @@ mod tests {
         conn_state.add_advisory_lock(12345);
         assert!(conn_state.has_unsafe_state());
 
-        ConnectionHandler::update_connection_state(&mut conn_state, "SELECT pg_advisory_unlock(12345)");
+        ConnectionHandler::update_connection_state(
+            &mut conn_state,
+            "SELECT pg_advisory_unlock(12345)",
+        );
         assert!(!conn_state.has_unsafe_state());
     }
 

@@ -2,7 +2,6 @@
 ///
 /// Tests that the TCP connection pool correctly reuses connections
 /// between client sessions and maintains pool metrics.
-
 use scry::{config::*, observability::*, proxy::*, publisher::*};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -18,9 +17,7 @@ struct TestPublisher {
 
 impl TestPublisher {
     fn new() -> Self {
-        Self {
-            events: Arc::new(Mutex::new(Vec::new())),
-        }
+        Self { events: Arc::new(Mutex::new(Vec::new())) }
     }
 
     fn event_count(&self) -> usize {
@@ -66,9 +63,7 @@ fn create_pooled_config(backend_host: String, backend_port: u16, pool_size: usiz
             enable_metrics_server: false,
             metrics_server_address: "127.0.0.1:9090".to_string(),
         },
-        protocol: ProtocolConfig {
-            max_prepared_statements: 1000,
-        },
+        protocol: ProtocolConfig { max_prepared_statements: 1000 },
         publisher: PublisherConfig {
             enabled: true,
             batch_size: 10,
@@ -181,10 +176,7 @@ async fn test_connection_pool_reuse() {
         });
 
         // Execute a query
-        client
-            .execute(&format!("SELECT {} as num", i + 1), &[])
-            .await
-            .expect("Query failed");
+        client.execute(&format!("SELECT {} as num", i + 1), &[]).await.expect("Query failed");
 
         // Close connection to return it to pool
         drop(client);
@@ -202,11 +194,7 @@ async fn test_connection_pool_reuse() {
     // Verify all queries were executed
     let event_count = test_publisher.event_count();
     println!("Total events captured: {}", event_count);
-    assert!(
-        event_count >= 5,
-        "Expected at least 5 events, got {}",
-        event_count
-    );
+    assert!(event_count >= 5, "Expected at least 5 events, got {}", event_count);
 
     // The pool should have reused connections - we created 5 connections
     // but pool size is only 3, so at least 2 connections were reused
@@ -297,9 +285,10 @@ async fn test_pooling_vs_direct_connections() {
     );
 
     let metrics_with_pool = Arc::new(ProxyMetrics::new(100, HealthConfig::default()));
-    let server_with_pool = ProxyServer::new(config_with_pool.clone(), batcher_with_pool, metrics_with_pool)
-        .await
-        .expect("Failed to create proxy server");
+    let server_with_pool =
+        ProxyServer::new(config_with_pool.clone(), batcher_with_pool, metrics_with_pool)
+            .await
+            .expect("Failed to create proxy server");
 
     let proxy_port_with_pool =
         server_with_pool.local_addr().expect("Failed to get local addr").port();
@@ -453,10 +442,7 @@ async fn test_discard_all_resets_connection_state() {
 
         // Verify temp table no longer exists (DISCARD ALL removed it)
         let result = client.query("SELECT COUNT(*) FROM test_temp", &[]).await;
-        assert!(
-            result.is_err(),
-            "Temp table should not exist after DISCARD ALL"
-        );
+        assert!(result.is_err(), "Temp table should not exist after DISCARD ALL");
 
         // Verify session variable was reset (DISCARD ALL reset it)
         let app_name_rows = client
@@ -464,10 +450,7 @@ async fn test_discard_all_resets_connection_state() {
             .await
             .expect("Failed to show application_name");
         let app_name: String = app_name_rows[0].get(0);
-        assert_ne!(
-            app_name, "test_app",
-            "Session variable should be reset after DISCARD ALL"
-        );
+        assert_ne!(app_name, "test_app", "Session variable should be reset after DISCARD ALL");
 
         println!("DISCARD ALL successfully reset connection state!");
         drop(client);
@@ -476,4 +459,3 @@ async fn test_discard_all_resets_connection_state() {
     // Cleanup
     drop(proxy_handle);
 }
-

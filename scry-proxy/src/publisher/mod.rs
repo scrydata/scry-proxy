@@ -3,9 +3,9 @@ mod http_publisher;
 mod r#trait;
 
 pub use debug_logger::DebugLoggerPublisher;
-pub use scry_protocol::{QueryEvent, QueryEventBuilder};
 pub use http_publisher::HttpPublisher;
 pub use r#trait::EventPublisher;
+pub use scry_protocol::{QueryEvent, QueryEventBuilder};
 
 use crate::config::PublisherConfig;
 use anyhow::{Context, Result};

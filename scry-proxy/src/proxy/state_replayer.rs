@@ -203,10 +203,8 @@ impl StateReplayer {
     pub fn build_set_sql(name: &str, value: &str) -> String {
         // Special case: search_path uses TO syntax with each schema quoted
         if name.eq_ignore_ascii_case("search_path") {
-            let schemas: Vec<String> = value
-                .split(',')
-                .map(|s| quote_identifier(s.trim()))
-                .collect();
+            let schemas: Vec<String> =
+                value.split(',').map(|s| quote_identifier(s.trim())).collect();
             return format!("SET search_path TO {}", schemas.join(", "));
         }
 
@@ -418,10 +416,7 @@ mod tests {
     #[test]
     fn test_build_prepare_sql_with_injection_attempt() {
         // Test SQL injection prevention in statement name
-        let sql = StateReplayer::build_prepare_sql(
-            "bad\"; DROP TABLE users; --",
-            "SELECT $1",
-        );
+        let sql = StateReplayer::build_prepare_sql("bad\"; DROP TABLE users; --", "SELECT $1");
         // The name should be safely quoted
         assert_eq!(sql, "PREPARE \"bad\"\"; DROP TABLE users; --\" AS SELECT $1");
     }
@@ -506,10 +501,8 @@ mod tests {
         let addr = listener.local_addr().unwrap();
 
         // Empty state - no replay needed
-        let state = ReplayableState {
-            prepared_statements: vec![],
-            session_variables: HashMap::new(),
-        };
+        let state =
+            ReplayableState { prepared_statements: vec![], session_variables: HashMap::new() };
 
         // Server task that accepts connection but doesn't need to respond
         let server_handle = tokio::spawn(async move {
@@ -543,10 +536,8 @@ mod tests {
         let mut session_vars = HashMap::new();
         session_vars.insert("timezone".to_string(), "UTC".to_string());
 
-        let state = ReplayableState {
-            prepared_statements: vec![],
-            session_variables: session_vars,
-        };
+        let state =
+            ReplayableState { prepared_statements: vec![], session_variables: session_vars };
 
         // Server task that responds to SET command
         let server_handle = tokio::spawn(async move {

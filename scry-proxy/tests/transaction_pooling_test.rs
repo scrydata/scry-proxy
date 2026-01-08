@@ -23,9 +23,7 @@ struct TestPublisher {
 
 impl TestPublisher {
     fn new() -> Self {
-        Self {
-            events: Arc::new(Mutex::new(Vec::new())),
-        }
+        Self { events: Arc::new(Mutex::new(Vec::new())) }
     }
 
     fn events(&self) -> Vec<QueryEvent> {
@@ -75,9 +73,7 @@ fn create_test_config(host: String, port: u16, pooling: PoolingStrategy) -> Conf
             metrics_server_address: "127.0.0.1:0".to_string(),
             enable_metrics_server: false,
         },
-        protocol: ProtocolConfig {
-            max_prepared_statements: 100,
-        },
+        protocol: ProtocolConfig { max_prepared_statements: 100 },
         publisher: PublisherConfig {
             enabled: true,
             batch_size: 10,
@@ -176,9 +172,8 @@ async fn test_hybrid_mode_allows_set() {
     let test_publisher = TestPublisher::new();
     let publisher = Arc::new(test_publisher.clone());
 
-    let proxy_port = start_test_proxy(config.clone(), publisher)
-        .await
-        .expect("Failed to start proxy");
+    let proxy_port =
+        start_test_proxy(config.clone(), publisher).await.expect("Failed to start proxy");
 
     sleep(Duration::from_millis(100)).await;
 
@@ -200,16 +195,12 @@ async fn test_hybrid_mode_allows_set() {
     });
 
     // SET should work in hybrid mode
-    let result = client
-        .execute("SET application_name = 'hybrid_test'", &[])
-        .await;
+    let result = client.execute("SET application_name = 'hybrid_test'", &[]).await;
     assert!(result.is_ok(), "Hybrid mode should allow SET commands");
 
     // Verify the setting was applied
-    let rows = client
-        .query("SHOW application_name", &[])
-        .await
-        .expect("Failed to show application_name");
+    let rows =
+        client.query("SHOW application_name", &[]).await.expect("Failed to show application_name");
     let app_name: String = rows[0].get(0);
     assert_eq!(app_name, "hybrid_test", "SET should have been applied");
 
@@ -239,9 +230,8 @@ async fn test_hybrid_mode_allows_temp_tables() {
     let test_publisher = TestPublisher::new();
     let publisher = Arc::new(test_publisher.clone());
 
-    let proxy_port = start_test_proxy(config.clone(), publisher)
-        .await
-        .expect("Failed to start proxy");
+    let proxy_port =
+        start_test_proxy(config.clone(), publisher).await.expect("Failed to start proxy");
 
     sleep(Duration::from_millis(100)).await;
 
@@ -262,9 +252,7 @@ async fn test_hybrid_mode_allows_temp_tables() {
     });
 
     // CREATE TEMP TABLE should work in hybrid mode
-    let result = client
-        .execute("CREATE TEMP TABLE hybrid_temp (id INT)", &[])
-        .await;
+    let result = client.execute("CREATE TEMP TABLE hybrid_temp (id INT)", &[]).await;
     assert!(result.is_ok(), "Hybrid mode should allow temp tables");
 
     // Verify the temp table exists
@@ -295,9 +283,8 @@ async fn test_session_mode_allows_set() {
     let test_publisher = TestPublisher::new();
     let publisher = Arc::new(test_publisher.clone());
 
-    let proxy_port = start_test_proxy(config.clone(), publisher)
-        .await
-        .expect("Failed to start proxy");
+    let proxy_port =
+        start_test_proxy(config.clone(), publisher).await.expect("Failed to start proxy");
 
     sleep(Duration::from_millis(100)).await;
 
@@ -341,9 +328,8 @@ async fn test_transaction_block_execution() {
     let test_publisher = TestPublisher::new();
     let publisher = Arc::new(test_publisher.clone());
 
-    let proxy_port = start_test_proxy(config.clone(), publisher)
-        .await
-        .expect("Failed to start proxy");
+    let proxy_port =
+        start_test_proxy(config.clone(), publisher).await.expect("Failed to start proxy");
 
     sleep(Duration::from_millis(100)).await;
 
@@ -365,10 +351,7 @@ async fn test_transaction_block_execution() {
 
     // Execute a transaction block
     client.execute("BEGIN", &[]).await.expect("BEGIN failed");
-    client
-        .execute("SELECT 1", &[])
-        .await
-        .expect("SELECT in txn failed");
+    client.execute("SELECT 1", &[]).await.expect("SELECT in txn failed");
     client.execute("COMMIT", &[]).await.expect("COMMIT failed");
 
     // Transaction should complete successfully
@@ -394,9 +377,8 @@ async fn test_transaction_mode_allows_set_inside_transaction() {
     let test_publisher = TestPublisher::new();
     let publisher = Arc::new(test_publisher.clone());
 
-    let proxy_port = start_test_proxy(config.clone(), publisher)
-        .await
-        .expect("Failed to start proxy");
+    let proxy_port =
+        start_test_proxy(config.clone(), publisher).await.expect("Failed to start proxy");
 
     sleep(Duration::from_millis(100)).await;
 
@@ -420,13 +402,8 @@ async fn test_transaction_mode_allows_set_inside_transaction() {
     // because it's scoped to the transaction
     client.execute("BEGIN", &[]).await.expect("BEGIN failed");
 
-    let result = client
-        .execute("SET LOCAL search_path TO pg_catalog", &[])
-        .await;
-    assert!(
-        result.is_ok(),
-        "SET LOCAL inside transaction should work in transaction mode"
-    );
+    let result = client.execute("SET LOCAL search_path TO pg_catalog", &[]).await;
+    assert!(result.is_ok(), "SET LOCAL inside transaction should work in transaction mode");
 
     client.execute("COMMIT", &[]).await.expect("COMMIT failed");
 }
@@ -453,9 +430,8 @@ async fn test_connection_released_after_transaction() {
     let test_publisher = TestPublisher::new();
     let publisher = Arc::new(test_publisher.clone());
 
-    let proxy_port = start_test_proxy(config.clone(), publisher)
-        .await
-        .expect("Failed to start proxy");
+    let proxy_port =
+        start_test_proxy(config.clone(), publisher).await.expect("Failed to start proxy");
 
     sleep(Duration::from_millis(100)).await;
 
@@ -476,10 +452,7 @@ async fn test_connection_released_after_transaction() {
         });
 
         client.execute("BEGIN", &[]).await.expect("BEGIN failed");
-        client
-            .execute("SELECT 1", &[])
-            .await
-            .expect("SELECT failed");
+        client.execute("SELECT 1", &[]).await.expect("SELECT failed");
         client.execute("COMMIT", &[]).await.expect("COMMIT failed");
 
         drop(client);
@@ -517,10 +490,7 @@ async fn test_connection_released_after_transaction() {
         });
 
         let result = client.execute("SELECT 2", &[]).await;
-        assert!(
-            result.is_ok(),
-            "Client 2 should be able to execute queries"
-        );
+        assert!(result.is_ok(), "Client 2 should be able to execute queries");
     }
 
     println!("Connection release after transaction verified");
@@ -545,9 +515,8 @@ async fn test_prepared_statements_in_transaction_mode() {
     let test_publisher = TestPublisher::new();
     let publisher = Arc::new(test_publisher.clone());
 
-    let proxy_port = start_test_proxy(config.clone(), publisher)
-        .await
-        .expect("Failed to start proxy");
+    let proxy_port =
+        start_test_proxy(config.clone(), publisher).await.expect("Failed to start proxy");
 
     sleep(Duration::from_millis(100)).await;
 
@@ -573,10 +542,8 @@ async fn test_prepared_statements_in_transaction_mode() {
         .await
         .expect("Failed to prepare statement");
 
-    let rows = client
-        .query(&stmt, &[&5i32, &7i32])
-        .await
-        .expect("Failed to execute prepared statement");
+    let rows =
+        client.query(&stmt, &[&5i32, &7i32]).await.expect("Failed to execute prepared statement");
 
     assert_eq!(rows.len(), 1);
     let sum: i32 = rows[0].get(0);
@@ -604,9 +571,8 @@ async fn test_multiple_sequential_transactions() {
     let test_publisher = TestPublisher::new();
     let publisher = Arc::new(test_publisher.clone());
 
-    let proxy_port = start_test_proxy(config.clone(), publisher)
-        .await
-        .expect("Failed to start proxy");
+    let proxy_port =
+        start_test_proxy(config.clone(), publisher).await.expect("Failed to start proxy");
 
     sleep(Duration::from_millis(100)).await;
 
@@ -629,10 +595,7 @@ async fn test_multiple_sequential_transactions() {
     // Execute multiple transactions
     for i in 1..=3 {
         client.execute("BEGIN", &[]).await.expect("BEGIN failed");
-        client
-            .execute(&format!("SELECT {}", i), &[])
-            .await
-            .expect("SELECT failed");
+        client.execute(&format!("SELECT {}", i), &[]).await.expect("SELECT failed");
         client.execute("COMMIT", &[]).await.expect("COMMIT failed");
     }
 
@@ -659,9 +622,8 @@ async fn test_rollback_releases_connection() {
     let test_publisher = TestPublisher::new();
     let publisher = Arc::new(test_publisher.clone());
 
-    let proxy_port = start_test_proxy(config.clone(), publisher)
-        .await
-        .expect("Failed to start proxy");
+    let proxy_port =
+        start_test_proxy(config.clone(), publisher).await.expect("Failed to start proxy");
 
     sleep(Duration::from_millis(100)).await;
 
@@ -682,14 +644,8 @@ async fn test_rollback_releases_connection() {
         });
 
         client.execute("BEGIN", &[]).await.expect("BEGIN failed");
-        client
-            .execute("SELECT 1", &[])
-            .await
-            .expect("SELECT failed");
-        client
-            .execute("ROLLBACK", &[])
-            .await
-            .expect("ROLLBACK failed");
+        client.execute("SELECT 1", &[]).await.expect("SELECT failed");
+        client.execute("ROLLBACK", &[]).await.expect("ROLLBACK failed");
 
         drop(client);
     }
@@ -714,10 +670,7 @@ async fn test_rollback_releases_connection() {
         )
         .await;
 
-        assert!(
-            connect_result.is_ok(),
-            "Client 2 should be able to connect after rollback"
-        );
+        assert!(connect_result.is_ok(), "Client 2 should be able to connect after rollback");
 
         let (client, connection) = connect_result.unwrap().expect("Failed to connect client 2");
 
@@ -726,10 +679,7 @@ async fn test_rollback_releases_connection() {
         });
 
         let result = client.execute("SELECT 2", &[]).await;
-        assert!(
-            result.is_ok(),
-            "Client 2 should be able to execute queries"
-        );
+        assert!(result.is_ok(), "Client 2 should be able to execute queries");
     }
 
     println!("Connection release after rollback verified");
@@ -759,9 +709,8 @@ async fn test_transaction_mode_rejects_set_outside_transaction() {
     let test_publisher = TestPublisher::new();
     let publisher = Arc::new(test_publisher.clone());
 
-    let proxy_port = start_test_proxy(config.clone(), publisher)
-        .await
-        .expect("Failed to start proxy");
+    let proxy_port =
+        start_test_proxy(config.clone(), publisher).await.expect("Failed to start proxy");
 
     sleep(Duration::from_millis(100)).await;
 
@@ -787,10 +736,7 @@ async fn test_transaction_mode_rejects_set_outside_transaction() {
     let result = client.execute("SET search_path TO public", &[]).await;
 
     // The proxy should reject this command
-    assert!(
-        result.is_err(),
-        "Transaction mode should reject SET commands outside transactions"
-    );
+    assert!(result.is_err(), "Transaction mode should reject SET commands outside transactions");
 
     // Verify the error message indicates the restriction
     if let Err(e) = result {
@@ -824,9 +770,8 @@ async fn test_transaction_events_captured() {
     let test_publisher = TestPublisher::new();
     let publisher = Arc::new(test_publisher.clone());
 
-    let proxy_port = start_test_proxy(config.clone(), publisher.clone())
-        .await
-        .expect("Failed to start proxy");
+    let proxy_port =
+        start_test_proxy(config.clone(), publisher.clone()).await.expect("Failed to start proxy");
 
     sleep(Duration::from_millis(100)).await;
 
@@ -848,10 +793,7 @@ async fn test_transaction_events_captured() {
 
     // Execute a full transaction
     client.execute("BEGIN", &[]).await.expect("BEGIN failed");
-    client
-        .execute("SELECT 42", &[])
-        .await
-        .expect("SELECT failed");
+    client.execute("SELECT 42", &[]).await.expect("SELECT failed");
     client.execute("COMMIT", &[]).await.expect("COMMIT failed");
 
     // Wait for events to be published

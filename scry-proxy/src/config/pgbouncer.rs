@@ -121,9 +121,7 @@ impl PgBouncerConfig {
         // Parse [databases] section
         if let Some(databases_section) = ini.section(Some("databases")) {
             for (key, value) in databases_section.iter() {
-                config
-                    .databases
-                    .insert(key.to_string(), DatabaseEntry::parse(value));
+                config.databases.insert(key.to_string(), DatabaseEntry::parse(value));
             }
         }
 
@@ -234,10 +232,7 @@ impl PgBouncerConfig {
     /// | database password      | backend.password                     |
     pub fn to_scry_config(&self, mut config: Config) -> Config {
         // Build listen address
-        let host = self
-            .listen_addr
-            .clone()
-            .unwrap_or_else(|| "127.0.0.1".to_string());
+        let host = self.listen_addr.clone().unwrap_or_else(|| "127.0.0.1".to_string());
         let port = self.listen_port.unwrap_or(6432);
         config.proxy.listen_address = format!("{}:{}", host, port);
 
@@ -370,8 +365,9 @@ mod tests {
 
     #[test]
     fn test_database_entry_parse_full() {
-        let entry =
-            DatabaseEntry::parse("host=localhost port=5432 dbname=mydb user=postgres password=secret");
+        let entry = DatabaseEntry::parse(
+            "host=localhost port=5432 dbname=mydb user=postgres password=secret",
+        );
 
         assert_eq!(entry.host, Some("localhost".to_string()));
         assert_eq!(entry.port, Some(5432));
@@ -666,10 +662,7 @@ pool_mode = transaction
 
         let config = pgb.to_scry_config(Config::default());
 
-        assert_eq!(
-            config.performance.connection_pooling,
-            PoolingStrategy::Transaction
-        );
+        assert_eq!(config.performance.connection_pooling, PoolingStrategy::Transaction);
     }
 
     #[test]
@@ -680,10 +673,7 @@ pool_mode = transaction
 
         let config = pgb.to_scry_config(Config::default());
 
-        assert_eq!(
-            config.performance.connection_pooling,
-            PoolingStrategy::Transaction
-        );
+        assert_eq!(config.performance.connection_pooling, PoolingStrategy::Transaction);
     }
 
     #[test]
@@ -890,26 +880,17 @@ pool_mode = session
         let config = pgb.to_scry_config(Config::default());
 
         // Uppercase should work now that we normalize in to_scry_config
-        assert_eq!(
-            config.performance.connection_pooling,
-            PoolingStrategy::Transaction
-        );
+        assert_eq!(config.performance.connection_pooling, PoolingStrategy::Transaction);
 
         // Mixed case also works
         pgb.pool_mode = Some("Transaction".to_string());
         let config = pgb.to_scry_config(Config::default());
-        assert_eq!(
-            config.performance.connection_pooling,
-            PoolingStrategy::Transaction
-        );
+        assert_eq!(config.performance.connection_pooling, PoolingStrategy::Transaction);
 
         // Lowercase works as before
         pgb.pool_mode = Some("transaction".to_string());
         let config = pgb.to_scry_config(Config::default());
-        assert_eq!(
-            config.performance.connection_pooling,
-            PoolingStrategy::Transaction
-        );
+        assert_eq!(config.performance.connection_pooling, PoolingStrategy::Transaction);
     }
 
     #[test]
@@ -919,17 +900,11 @@ pool_mode = session
         // Insert in a specific order - IndexMap preserves insertion order
         pgb.databases.insert(
             "db1".to_string(),
-            DatabaseEntry {
-                host: Some("host1.example.com".to_string()),
-                ..Default::default()
-            },
+            DatabaseEntry { host: Some("host1.example.com".to_string()), ..Default::default() },
         );
         pgb.databases.insert(
             "db2".to_string(),
-            DatabaseEntry {
-                host: Some("host2.example.com".to_string()),
-                ..Default::default()
-            },
+            DatabaseEntry { host: Some("host2.example.com".to_string()), ..Default::default() },
         );
 
         let config = pgb.to_scry_config(Config::default());

@@ -76,9 +76,7 @@ fn create_test_config(backend_host: String, backend_port: u16) -> Config {
             enable_metrics_server: false,
             metrics_server_address: "127.0.0.1:9090".to_string(),
         },
-        protocol: ProtocolConfig {
-            max_prepared_statements: 1000,
-        },
+        protocol: ProtocolConfig { max_prepared_statements: 1000 },
         publisher: PublisherConfig {
             enabled: true,
             batch_size: 10,
@@ -605,12 +603,16 @@ async fn test_prepared_statement_params_captured() {
     // Print all events for debugging
     println!("All events:");
     for (i, e) in events.iter().enumerate() {
-        println!("  Event {}: query='{}', params={:?}, success={}", i, e.query, e.params, e.success);
+        println!(
+            "  Event {}: query='{}', params={:?}, success={}",
+            i, e.query, e.params, e.success
+        );
     }
 
     // Find the event with our query AND non-empty params
     // (The prepare() call also emits an event, but with empty params)
-    let event = events.iter()
+    let event = events
+        .iter()
         .find(|e| e.query.contains("SELECT $1") && !e.params.is_empty())
         .expect("Expected to find query event with params");
 
@@ -618,16 +620,15 @@ async fn test_prepared_statement_params_captured() {
     println!("Found event with params: query='{}', params={:?}", event.query, event.params);
 
     // Verify params were captured
-    assert!(
-        !event.params.is_empty(),
-        "Expected params to be captured, but got empty params"
-    );
+    assert!(!event.params.is_empty(), "Expected params to be captured, but got empty params");
 
     // Verify we got 3 params
     assert_eq!(
-        event.params.len(), 3,
+        event.params.len(),
+        3,
         "Expected 3 params, got {}: {:?}",
-        event.params.len(), event.params
+        event.params.len(),
+        event.params
     );
 
     // Verify param values

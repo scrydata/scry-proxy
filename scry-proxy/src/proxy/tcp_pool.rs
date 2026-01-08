@@ -4,7 +4,6 @@
 /// database protocol implementing the Protocol trait. The pool manages
 /// raw TCP connections and delegates protocol-specific behavior (state
 /// reset, health checks) to the Protocol implementation.
-
 use crate::config::ConnectionRetryConfig;
 use crate::protocol::{Protocol, ProtocolConfig};
 use crate::resilience::{CircuitBreaker, RetryStrategy};
@@ -54,11 +53,7 @@ impl TcpConnectionPool {
         retry_config: Option<ConnectionRetryConfig>,
         lifo: bool,
     ) -> Result<Self> {
-        let queue_mode = if lifo {
-            QueueMode::Lifo
-        } else {
-            QueueMode::Fifo
-        };
+        let queue_mode = if lifo { QueueMode::Lifo } else { QueueMode::Fifo };
 
         info!(
             protocol = protocol.name(),
@@ -76,9 +71,7 @@ impl TcpConnectionPool {
             protocol: Arc::clone(&protocol),
         };
 
-        let mut builder = Pool::builder(manager)
-            .max_size(max_size)
-            .queue_mode(queue_mode);
+        let mut builder = Pool::builder(manager).max_size(max_size).queue_mode(queue_mode);
 
         if let Some(min) = min_idle {
             builder = builder.runtime(deadpool::Runtime::Tokio1);
@@ -94,13 +87,7 @@ impl TcpConnectionPool {
 
         info!("TCP connection pool created successfully");
 
-        Ok(Self {
-            pool,
-            protocol,
-            config,
-            circuit_breaker,
-            retry_config,
-        })
+        Ok(Self { pool, protocol, config, circuit_breaker, retry_config })
     }
 
     /// Get a connection from the pool with circuit breaker and retry protection
@@ -114,8 +101,7 @@ impl TcpConnectionPool {
     pub async fn get(&self) -> Result<PooledConnection> {
         // 1. Check circuit breaker
         if let Some(ref cb) = self.circuit_breaker {
-            cb.allow_request()
-                .map_err(|e| anyhow::anyhow!("Circuit breaker: {}", e))?;
+            cb.allow_request().map_err(|e| anyhow::anyhow!("Circuit breaker: {}", e))?;
         }
 
         // 2. Try to get connection (with retries if enabled)
@@ -123,11 +109,15 @@ impl TcpConnectionPool {
             if retry_config.enabled {
                 self.get_with_retry(retry_config).await
             } else {
-                self.pool.get().await
+                self.pool
+                    .get()
+                    .await
                     .map_err(|e| anyhow::anyhow!("Failed to get connection from pool: {}", e))
             }
         } else {
-            self.pool.get().await
+            self.pool
+                .get()
+                .await
                 .map_err(|e| anyhow::anyhow!("Failed to get connection from pool: {}", e))
         };
 
@@ -143,13 +133,20 @@ impl TcpConnectionPool {
     }
 
     /// Get connection with retry logic
-    async fn get_with_retry(&self, retry_config: &ConnectionRetryConfig) -> Result<PooledConnection> {
+    async fn get_with_retry(
+        &self,
+        retry_config: &ConnectionRetryConfig,
+    ) -> Result<PooledConnection> {
         let retry_strategy = RetryStrategy::new(retry_config.clone());
 
-        retry_strategy.execute(|| async {
-            self.pool.get().await
-                .map_err(|e| anyhow::anyhow!("Failed to get connection: {}", e))
-        }).await
+        retry_strategy
+            .execute(|| async {
+                self.pool
+                    .get()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to get connection: {}", e))
+            })
+            .await
     }
 
     /// Get pool status information
@@ -203,9 +200,8 @@ impl Manager for TcpStreamManager {
             "Creating new TCP connection"
         );
 
-        let stream = TcpStream::connect(&self.backend_addr)
-            .await
-            .context("Failed to connect to backend")?;
+        let stream =
+            TcpStream::connect(&self.backend_addr).await.context("Failed to connect to backend")?;
 
         debug!(
             backend_addr = %self.backend_addr,
@@ -225,10 +221,7 @@ impl Manager for TcpStreamManager {
         conn: &mut TcpStream,
         _metrics: &deadpool::managed::Metrics,
     ) -> RecycleResult<Self::Error> {
-        debug!(
-            protocol = self.protocol.name(),
-            "Recycling connection"
-        );
+        debug!(protocol = self.protocol.name(), "Recycling connection");
 
         // First, check if connection is still healthy
         match self.protocol.health_check(conn).await {
@@ -289,9 +282,9 @@ mod tests {
             config,
             10,
             Some(2),
-            None,  // circuit_breaker
-            None,  // retry_config
-            true,  // lifo
+            None, // circuit_breaker
+            None, // retry_config
+            true, // lifo
         )
         .unwrap();
         let status = pool.status();

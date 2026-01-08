@@ -120,10 +120,7 @@ mod tests {
     use super::*;
 
     fn make_stmt(query: &str) -> PreparedStatement {
-        PreparedStatement {
-            query: query.to_string(),
-            param_oids: vec![],
-        }
+        PreparedStatement { query: query.to_string(), param_oids: vec![] }
     }
 
     #[test]
@@ -179,12 +176,15 @@ mod tests {
     fn test_pending_execution() {
         let mut cache = PreparedStatementCache::new(10);
 
-        cache.set_pending("".into(), PendingExecution {
-            query: "SELECT 1".into(),
-            params: vec![],
-            params_incomplete: false,
-            started_at: Instant::now(),
-        });
+        cache.set_pending(
+            "".into(),
+            PendingExecution {
+                query: "SELECT 1".into(),
+                params: vec![],
+                params_incomplete: false,
+                started_at: Instant::now(),
+            },
+        );
 
         let pending = cache.take_pending("");
         assert!(pending.is_some());
@@ -198,12 +198,15 @@ mod tests {
     fn test_clear() {
         let mut cache = PreparedStatementCache::new(10);
         cache.insert_statement("s1".into(), make_stmt("SELECT 1"));
-        cache.set_pending("p1".into(), PendingExecution {
-            query: "SELECT 1".into(),
-            params: vec![],
-            params_incomplete: false,
-            started_at: Instant::now(),
-        });
+        cache.set_pending(
+            "p1".into(),
+            PendingExecution {
+                query: "SELECT 1".into(),
+                params: vec![],
+                params_incomplete: false,
+                started_at: Instant::now(),
+            },
+        );
 
         cache.clear();
 

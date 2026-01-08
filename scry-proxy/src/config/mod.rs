@@ -234,9 +234,7 @@ impl Default for Config {
                 metrics_server_address: "127.0.0.1:9090".to_string(),
                 enable_metrics_server: true,
             },
-            protocol: ProtocolConfig {
-                max_prepared_statements: 1000,
-            },
+            protocol: ProtocolConfig { max_prepared_statements: 1000 },
             publisher: PublisherConfig {
                 enabled: true,
                 batch_size: 100,

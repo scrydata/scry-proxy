@@ -6,7 +6,6 @@
 /// 3. GET /debug/pool - Pool internals and utilization
 /// 4. GET /debug/timeline - Query timeline phase breakdown
 /// 5. GET /debug/hotdata - Hot data fingerprints (top-K)
-
 use super::metrics::ProxyMetrics;
 use super::prometheus;
 use axum::{
@@ -31,9 +30,7 @@ pub struct MetricsServerConfig {
 
 impl Default for MetricsServerConfig {
     fn default() -> Self {
-        Self {
-            listen_address: "127.0.0.1:9090".to_string(),
-        }
+        Self { listen_address: "127.0.0.1:9090".to_string() }
     }
 }
 
@@ -85,9 +82,7 @@ async fn metrics_handler(State(metrics): State<Arc<ProxyMetrics>>) -> Response {
 }
 
 /// GET /health - JSON health status
-async fn health_handler(
-    State(metrics): State<Arc<ProxyMetrics>>,
-) -> Json<HealthResponse> {
+async fn health_handler(State(metrics): State<Arc<ProxyMetrics>>) -> Json<HealthResponse> {
     let health_monitor = metrics.health_monitor();
     let status = health_monitor.get_status();
     let warnings = health_monitor.get_warnings();
@@ -103,9 +98,7 @@ async fn health_handler(
 }
 
 /// GET /debug/pool - Pool internals
-async fn pool_handler(
-    State(metrics): State<Arc<ProxyMetrics>>,
-) -> Json<PoolResponse> {
+async fn pool_handler(State(metrics): State<Arc<ProxyMetrics>>) -> Json<PoolResponse> {
     let pool_status = metrics.pool_metrics().get_status();
 
     Json(PoolResponse {
@@ -118,9 +111,7 @@ async fn pool_handler(
 }
 
 /// GET /debug/timeline - Query timeline breakdown
-async fn timeline_handler(
-    State(metrics): State<Arc<ProxyMetrics>>,
-) -> Json<TimelineResponse> {
+async fn timeline_handler(State(metrics): State<Arc<ProxyMetrics>>) -> Json<TimelineResponse> {
     let query_metrics = metrics.query_metrics();
 
     // Get percentiles for each phase
@@ -158,9 +149,7 @@ async fn timeline_handler(
 }
 
 /// GET /debug/hotdata - Hot data fingerprints
-async fn hotdata_handler(
-    State(metrics): State<Arc<ProxyMetrics>>,
-) -> Json<HotDataResponse> {
+async fn hotdata_handler(State(metrics): State<Arc<ProxyMetrics>>) -> Json<HotDataResponse> {
     let hot_data = metrics.hot_data();
     let top_k = hot_data.get_top_k();
     let unique = hot_data.unique_fingerprints();
@@ -297,12 +286,8 @@ mod tests {
         let response = metrics_handler(State(metrics)).await;
 
         // Extract body bytes
-        let body_bytes = response
-            .into_body()
-            .collect()
-            .await
-            .expect("Failed to collect body")
-            .to_bytes();
+        let body_bytes =
+            response.into_body().collect().await.expect("Failed to collect body").to_bytes();
         let body = String::from_utf8_lossy(&body_bytes);
 
         // Verify Prometheus format

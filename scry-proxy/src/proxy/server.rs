@@ -21,7 +21,11 @@ pub struct ProxyServer {
 
 impl ProxyServer {
     /// Create a new proxy server with the given configuration
-    pub async fn new(config: Config, batcher: EventBatcher, metrics: Arc<ProxyMetrics>) -> Result<Self> {
+    pub async fn new(
+        config: Config,
+        batcher: EventBatcher,
+        metrics: Arc<ProxyMetrics>,
+    ) -> Result<Self> {
         let listener = TcpListener::bind(&config.proxy.listen_address)
             .await
             .context("Failed to bind proxy listener")?;
@@ -60,9 +64,8 @@ impl ProxyServer {
             ));
 
             tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(
-                    healthcheck_config.interval_secs,
-                ));
+                let mut interval =
+                    tokio::time::interval(Duration::from_secs(healthcheck_config.interval_secs));
 
                 loop {
                     interval.tick().await;
@@ -159,13 +162,7 @@ impl ProxyServer {
             None
         };
 
-        Ok(Self {
-            config: Arc::new(config),
-            listener,
-            batcher: Arc::new(batcher),
-            pool,
-            metrics,
-        })
+        Ok(Self { config: Arc::new(config), listener, batcher: Arc::new(batcher), pool, metrics })
     }
 
     /// Get the local address the server is listening on

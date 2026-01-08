@@ -4,7 +4,6 @@
 /// - Exponential backoff
 /// - Random jitter to prevent thundering herd
 /// - Configurable max attempts and backoff caps
-
 use crate::config::ConnectionRetryConfig;
 use std::future::Future;
 use std::time::Duration;
@@ -44,10 +43,7 @@ impl RetryStrategy {
             match operation().await {
                 Ok(result) => {
                     if attempt > 1 {
-                        debug!(
-                            attempt = attempt,
-                            "Operation succeeded after retries"
-                        );
+                        debug!(attempt = attempt, "Operation succeeded after retries");
                     }
                     return Ok(result);
                 }

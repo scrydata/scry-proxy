@@ -9,7 +9,6 @@
 /// - Open → HalfOpen: After open_timeout_secs elapsed
 /// - HalfOpen → Closed: consecutive_successes >= success_threshold
 /// - HalfOpen → Open: Any failure in half-open state
-
 use crate::config::CircuitBreakerConfig;
 use crate::observability::health::{HealthMonitor, HealthStatus};
 use crate::resilience::errors::CircuitBreakerError;
@@ -91,14 +90,8 @@ pub struct CircuitBreaker {
 
 impl CircuitBreaker {
     /// Create a new circuit breaker
-    pub fn new(
-        config: CircuitBreakerConfig,
-        health_monitor: Option<Arc<HealthMonitor>>,
-    ) -> Self {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+    pub fn new(config: CircuitBreakerConfig, health_monitor: Option<Arc<HealthMonitor>>) -> Self {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
 
         info!(
             enabled = config.enabled,
@@ -141,10 +134,7 @@ impl CircuitBreaker {
 
             CircuitState::Open => {
                 // Check if enough time has passed to try half-open
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs();
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
                 let open_ts = self.open_timestamp.load(Ordering::Relaxed);
 
                 if now - open_ts >= self.config.open_timeout_secs {
@@ -300,10 +290,7 @@ impl CircuitBreaker {
         info!("Circuit breaker transitioning to OPEN");
         self.state.store(CircuitState::Open as u8, Ordering::Relaxed);
 
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         self.open_timestamp.store(now, Ordering::Relaxed);
         self.last_state_change.store(now, Ordering::Relaxed);
 
@@ -314,10 +301,7 @@ impl CircuitBreaker {
         info!("Circuit breaker transitioning to CLOSED");
         self.state.store(CircuitState::Closed as u8, Ordering::Relaxed);
 
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         self.last_state_change.store(now, Ordering::Relaxed);
 
         self.consecutive_failures.store(0, Ordering::Relaxed);
@@ -335,10 +319,7 @@ impl CircuitBreaker {
 
         if result.is_ok() {
             info!("Circuit breaker transitioning to HALF-OPEN");
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
             self.last_state_change.store(now, Ordering::Relaxed);
             self.consecutive_successes.store(0, Ordering::Relaxed);
             true
@@ -348,10 +329,7 @@ impl CircuitBreaker {
     }
 
     fn reset_window_if_needed(&self) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let window_start = self.window_start.load(Ordering::Relaxed);
 
         if now - window_start >= self.config.window_secs {

@@ -55,7 +55,7 @@ impl Default for PoolManagerConfig {
         Self {
             lifo: true,
             queue_depth: 100,
-            idle_unpin_secs: 300, // 5 minutes
+            idle_unpin_secs: 300,    // 5 minutes
             wait_timeout_ms: 30_000, // 30 seconds
         }
     }
@@ -74,11 +74,7 @@ pub struct StickyConnectionInfo {
 
 impl StickyConnectionInfo {
     fn new(pin_reasons: Vec<PinReason>, binding_id: u64) -> Self {
-        Self {
-            pin_reasons,
-            last_used: Instant::now(),
-            binding_id,
-        }
+        Self { pin_reasons, last_used: Instant::now(), binding_id }
     }
 
     fn touch(&mut self) {
@@ -225,10 +221,7 @@ impl PoolManager {
                         "Pinned connection not found in sticky map - recovering by adding entry"
                     );
                     let binding_id = self.next_binding_id.fetch_add(1, Ordering::Relaxed);
-                    map.insert(
-                        client_id,
-                        (pooled, StickyConnectionInfo::new(vec![], binding_id)),
-                    );
+                    map.insert(client_id, (pooled, StickyConnectionInfo::new(vec![], binding_id)));
                 }
             }
             trace!(client_id, "Released pinned connection back to sticky map");
@@ -443,9 +436,7 @@ mod tests {
 
         Arc::new(
             TcpConnectionPool::new(
-                protocol,
-                config,
-                10,   // max_size
+                protocol, config, 10,   // max_size
                 None, // min_idle
                 None, // circuit_breaker
                 None, // retry_config

@@ -42,14 +42,12 @@ pub fn decode_params(
     params_raw
         .iter()
         .enumerate()
-        .map(|(i, raw)| {
-            match raw {
-                None => ParamValue::Null,
-                Some(data) => {
-                    let oid = param_oids.get(i).copied().unwrap_or(0);
-                    let format = get_format_code(format_codes, i);
-                    decode_param(data, oid, format)
-                }
+        .map(|(i, raw)| match raw {
+            None => ParamValue::Null,
+            Some(data) => {
+                let oid = param_oids.get(i).copied().unwrap_or(0);
+                let format = get_format_code(format_codes, i);
+                decode_param(data, oid, format)
             }
         })
         .collect()
@@ -85,38 +83,31 @@ fn decode_text_param(data: &[u8], oid: u32) -> ParamValue {
     };
 
     match oid {
-        oid::BOOL => {
-            match text {
-                "t" | "true" | "TRUE" | "1" => ParamValue::Bool(true),
-                "f" | "false" | "FALSE" | "0" => ParamValue::Bool(false),
-                _ => ParamValue::Text(text.to_string()),
-            }
-        }
-        oid::INT2 => {
-            text.parse::<i16>()
-                .map(ParamValue::Int16)
-                .unwrap_or_else(|_| ParamValue::Text(text.to_string()))
-        }
-        oid::INT4 | oid::OID => {
-            text.parse::<i32>()
-                .map(ParamValue::Int32)
-                .unwrap_or_else(|_| ParamValue::Text(text.to_string()))
-        }
-        oid::INT8 => {
-            text.parse::<i64>()
-                .map(ParamValue::Int64)
-                .unwrap_or_else(|_| ParamValue::Text(text.to_string()))
-        }
-        oid::FLOAT4 => {
-            text.parse::<f32>()
-                .map(ParamValue::Float32)
-                .unwrap_or_else(|_| ParamValue::Text(text.to_string()))
-        }
-        oid::FLOAT8 => {
-            text.parse::<f64>()
-                .map(ParamValue::Float64)
-                .unwrap_or_else(|_| ParamValue::Text(text.to_string()))
-        }
+        oid::BOOL => match text {
+            "t" | "true" | "TRUE" | "1" => ParamValue::Bool(true),
+            "f" | "false" | "FALSE" | "0" => ParamValue::Bool(false),
+            _ => ParamValue::Text(text.to_string()),
+        },
+        oid::INT2 => text
+            .parse::<i16>()
+            .map(ParamValue::Int16)
+            .unwrap_or_else(|_| ParamValue::Text(text.to_string())),
+        oid::INT4 | oid::OID => text
+            .parse::<i32>()
+            .map(ParamValue::Int32)
+            .unwrap_or_else(|_| ParamValue::Text(text.to_string())),
+        oid::INT8 => text
+            .parse::<i64>()
+            .map(ParamValue::Int64)
+            .unwrap_or_else(|_| ParamValue::Text(text.to_string())),
+        oid::FLOAT4 => text
+            .parse::<f32>()
+            .map(ParamValue::Float32)
+            .unwrap_or_else(|_| ParamValue::Text(text.to_string())),
+        oid::FLOAT8 => text
+            .parse::<f64>()
+            .map(ParamValue::Float64)
+            .unwrap_or_else(|_| ParamValue::Text(text.to_string())),
         oid::NUMERIC => ParamValue::Numeric(text.to_string()),
         oid::TEXT | oid::VARCHAR => ParamValue::Text(text.to_string()),
         oid::JSON | oid::JSONB => ParamValue::Json(text.to_string()),
@@ -181,8 +172,7 @@ fn decode_binary_param(data: &[u8], oid: u32) -> ParamValue {
         oid::INT8 => {
             if data.len() == 8 {
                 ParamValue::Int64(i64::from_be_bytes([
-                    data[0], data[1], data[2], data[3],
-                    data[4], data[5], data[6], data[7],
+                    data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
                 ]))
             } else {
                 ParamValue::Unknown { oid, data: data.to_vec() }
@@ -198,8 +188,7 @@ fn decode_binary_param(data: &[u8], oid: u32) -> ParamValue {
         oid::FLOAT8 => {
             if data.len() == 8 {
                 ParamValue::Float64(f64::from_be_bytes([
-                    data[0], data[1], data[2], data[3],
-                    data[4], data[5], data[6], data[7],
+                    data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
                 ]))
             } else {
                 ParamValue::Unknown { oid, data: data.to_vec() }
@@ -214,19 +203,13 @@ fn decode_binary_param(data: &[u8], oid: u32) -> ParamValue {
                 ParamValue::Unknown { oid, data: data.to_vec() }
             }
         }
-        oid::TEXT | oid::VARCHAR => {
-            String::from_utf8(data.to_vec())
-                .map(ParamValue::Text)
-                .unwrap_or_else(|_| ParamValue::Bytes(data.to_vec()))
-        }
+        oid::TEXT | oid::VARCHAR => String::from_utf8(data.to_vec())
+            .map(ParamValue::Text)
+            .unwrap_or_else(|_| ParamValue::Bytes(data.to_vec())),
         oid::BYTEA => ParamValue::Bytes(data.to_vec()),
         oid::JSON | oid::JSONB => {
             // JSONB has 1-byte version prefix in binary
-            let json_data = if oid == oid::JSONB && !data.is_empty() {
-                &data[1..]
-            } else {
-                data
-            };
+            let json_data = if oid == oid::JSONB && !data.is_empty() { &data[1..] } else { data };
             String::from_utf8(json_data.to_vec())
                 .map(ParamValue::Json)
                 .unwrap_or_else(|_| ParamValue::Unknown { oid, data: data.to_vec() })
@@ -264,11 +247,7 @@ mod tests {
 
     #[test]
     fn test_decode_null() {
-        let params = decode_params(
-            &[None],
-            &[0],
-            &[oid::INT4],
-        );
+        let params = decode_params(&[None], &[0], &[oid::INT4]);
         assert_eq!(params, vec![ParamValue::Null]);
     }
 

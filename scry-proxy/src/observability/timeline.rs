@@ -6,7 +6,6 @@
 /// 3. Backend execution - Time spent executing on the backend database
 ///
 /// This enables the /debug/timeline endpoint to show phase-by-phase breakdowns.
-
 use std::time::{Duration, Instant};
 
 /// Timeline tracking for a single query execution
@@ -83,9 +82,7 @@ impl QueryTimeline {
 
     /// Calculate total time from request received to completion
     pub fn total_time(&self) -> Duration {
-        self.backend_end
-            .unwrap_or_else(Instant::now)
-            .duration_since(self.received_at)
+        self.backend_end.unwrap_or_else(Instant::now).duration_since(self.received_at)
     }
 
     /// Get all phase durations in microseconds (for histogram recording)

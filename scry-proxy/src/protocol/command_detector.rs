@@ -82,9 +82,7 @@ impl CommandDetector {
 
         // pg_advisory_lock
         if sql_upper.contains("PG_ADVISORY_LOCK") && !sql_upper.contains("PG_ADVISORY_UNLOCK") {
-            return Some(DetectedCommand::AdvisoryLock {
-                key: Self::extract_lock_key(&sql_upper),
-            });
+            return Some(DetectedCommand::AdvisoryLock { key: Self::extract_lock_key(&sql_upper) });
         }
 
         // pg_advisory_unlock
@@ -124,9 +122,7 @@ impl CommandDetector {
         if rest.eq_ignore_ascii_case("ALL") {
             Some(DetectedCommand::ResetAll)
         } else {
-            Some(DetectedCommand::Reset {
-                name: rest.to_lowercase(),
-            })
+            Some(DetectedCommand::Reset { name: rest.to_lowercase() })
         }
     }
 
@@ -153,11 +149,8 @@ impl CommandDetector {
         };
 
         // Handle IF EXISTS
-        let rest = if rest.to_uppercase().starts_with("IF EXISTS") {
-            rest[9..].trim()
-        } else {
-            rest
-        };
+        let rest =
+            if rest.to_uppercase().starts_with("IF EXISTS") { rest[9..].trim() } else { rest };
 
         let name = rest.split_whitespace().next()?.to_string();
 
@@ -200,18 +193,13 @@ impl CommandDetector {
         };
 
         // Handle optional PREPARE keyword
-        let rest = if rest.to_uppercase().starts_with("PREPARE ") {
-            rest[8..].trim()
-        } else {
-            rest
-        };
+        let rest =
+            if rest.to_uppercase().starts_with("PREPARE ") { rest[8..].trim() } else { rest };
 
         if rest.eq_ignore_ascii_case("ALL") {
             Some(DetectedCommand::DeallocateAll)
         } else {
-            Some(DetectedCommand::Deallocate {
-                name: rest.split_whitespace().next()?.to_string(),
-            })
+            Some(DetectedCommand::Deallocate { name: rest.split_whitespace().next()?.to_string() })
         }
     }
 

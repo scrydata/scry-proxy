@@ -2,7 +2,6 @@
 ///
 /// Provides periodic active healthchecks to the backend database.
 /// Complements the passive healthchecks that happen during connection recycling.
-
 use crate::config::HealthcheckConfig;
 use crate::protocol::{Protocol, ProtocolConfig};
 use anyhow::Result;

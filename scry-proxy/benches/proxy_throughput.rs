@@ -1,5 +1,10 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use scry::{config::*, observability::{HealthConfig, ProxyMetrics}, proxy::*, publisher::*};
+use scry::{
+    config::*,
+    observability::{HealthConfig, ProxyMetrics},
+    proxy::*,
+    publisher::*,
+};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use testcontainers::{clients::Cli, RunnableImage};
@@ -29,9 +34,7 @@ struct CountingPublisher {
 
 impl CountingPublisher {
     fn new() -> Self {
-        Self {
-            count: Arc::new(Mutex::new(0)),
-        }
+        Self { count: Arc::new(Mutex::new(0)) }
     }
 
     fn count(&self) -> usize {
@@ -75,9 +78,7 @@ fn create_test_config(backend_host: String, backend_port: u16) -> Config {
             metrics_server_address: "127.0.0.1:0".to_string(),
             enable_metrics_server: false,
         },
-        protocol: ProtocolConfig {
-            max_prepared_statements: 1000,
-        },
+        protocol: ProtocolConfig { max_prepared_statements: 1000 },
         publisher: PublisherConfig {
             enabled: true,
             batch_size: 100,
@@ -170,9 +171,8 @@ fn benchmark_proxy_latency(c: &mut Criterion) {
 
     // Start proxy with no-op publisher for minimal overhead
     let publisher = Arc::new(NoOpPublisher);
-    let proxy_port = rt
-        .block_on(start_test_proxy(config.clone(), publisher))
-        .expect("Failed to start proxy");
+    let proxy_port =
+        rt.block_on(start_test_proxy(config.clone(), publisher)).expect("Failed to start proxy");
 
     std::thread::sleep(Duration::from_millis(200));
 
@@ -239,9 +239,8 @@ fn benchmark_query_types(c: &mut Criterion) {
 
     let config = create_test_config("127.0.0.1".to_string(), postgres_port);
     let publisher = Arc::new(NoOpPublisher);
-    let proxy_port = rt
-        .block_on(start_test_proxy(config.clone(), publisher))
-        .expect("Failed to start proxy");
+    let proxy_port =
+        rt.block_on(start_test_proxy(config.clone(), publisher)).expect("Failed to start proxy");
 
     std::thread::sleep(Duration::from_millis(200));
 
@@ -472,10 +471,7 @@ fn benchmark_anonymization_overhead(c: &mut Criterion) {
         b.to_async(&rt).iter(|| async {
             black_box(
                 client
-                    .execute(
-                        "SELECT 1, 2, 3, 'hello', 'world', 42 WHERE 1 = 1 AND 2 = 2",
-                        &[],
-                    )
+                    .execute("SELECT 1, 2, 3, 'hello', 'world', 42 WHERE 1 = 1 AND 2 = 2", &[])
                     .await
                     .unwrap(),
             );

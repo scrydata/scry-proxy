@@ -122,9 +122,7 @@ mod tests {
         let result = enforcer.validate("SET search_path TO public", false);
 
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("not supported in transaction pooling mode"));
+        assert!(result.unwrap_err().contains("not supported in transaction pooling mode"));
     }
 
     #[test]
@@ -205,9 +203,7 @@ mod tests {
         let enforcer = ModeEnforcer::new(PoolingMode::Transaction);
 
         assert!(enforcer.validate("SELECT * FROM users", false).is_ok());
-        assert!(enforcer
-            .validate("INSERT INTO users (name) VALUES ('test')", false)
-            .is_ok());
+        assert!(enforcer.validate("INSERT INTO users (name) VALUES ('test')", false).is_ok());
         assert!(enforcer.validate("UPDATE users SET name = 'foo'", false).is_ok());
         assert!(enforcer.validate("DELETE FROM users WHERE id = 1", false).is_ok());
         assert!(enforcer.validate("BEGIN", false).is_ok());
@@ -220,15 +216,9 @@ mod tests {
         let enforcer = ModeEnforcer::new(PoolingMode::Hybrid);
 
         assert!(enforcer.validate("SET search_path TO public", false).is_ok());
-        assert!(enforcer
-            .validate("CREATE TEMP TABLE tmp (id int)", false)
-            .is_ok());
-        assert!(enforcer
-            .validate("SELECT pg_advisory_lock(123)", false)
-            .is_ok());
-        assert!(enforcer
-            .validate("DECLARE c CURSOR WITH HOLD FOR SELECT 1", false)
-            .is_ok());
+        assert!(enforcer.validate("CREATE TEMP TABLE tmp (id int)", false).is_ok());
+        assert!(enforcer.validate("SELECT pg_advisory_lock(123)", false).is_ok());
+        assert!(enforcer.validate("DECLARE c CURSOR WITH HOLD FOR SELECT 1", false).is_ok());
     }
 
     #[test]
@@ -236,15 +226,9 @@ mod tests {
         let enforcer = ModeEnforcer::new(PoolingMode::Session);
 
         assert!(enforcer.validate("SET search_path TO public", false).is_ok());
-        assert!(enforcer
-            .validate("CREATE TEMP TABLE tmp (id int)", false)
-            .is_ok());
-        assert!(enforcer
-            .validate("SELECT pg_advisory_lock(123)", false)
-            .is_ok());
-        assert!(enforcer
-            .validate("DECLARE c CURSOR WITH HOLD FOR SELECT 1", false)
-            .is_ok());
+        assert!(enforcer.validate("CREATE TEMP TABLE tmp (id int)", false).is_ok());
+        assert!(enforcer.validate("SELECT pg_advisory_lock(123)", false).is_ok());
+        assert!(enforcer.validate("DECLARE c CURSOR WITH HOLD FOR SELECT 1", false).is_ok());
     }
 
     #[test]
@@ -277,7 +261,8 @@ mod tests {
         // Parse the message to verify structure
         assert_eq!(response[0], b'E'); // Type
 
-        let length = i32::from_be_bytes([response[1], response[2], response[3], response[4]]) as usize;
+        let length =
+            i32::from_be_bytes([response[1], response[2], response[3], response[4]]) as usize;
         let body = &response[5..5 + length - 4]; // Body without length bytes
 
         // Should have fields: S (severity), C (code), M (message), and terminator

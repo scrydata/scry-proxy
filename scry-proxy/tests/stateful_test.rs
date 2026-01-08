@@ -3,7 +3,6 @@
 /// Tests transaction management, cursors, session variables, and other
 /// connection-scoped state to ensure the proxy correctly maintains state
 /// across multiple queries on the same connection.
-
 use scry::{config::*, observability::*, proxy::*, publisher::*};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -19,9 +18,7 @@ struct TestPublisher {
 
 impl TestPublisher {
     fn new() -> Self {
-        Self {
-            events: Arc::new(Mutex::new(Vec::new())),
-        }
+        Self { events: Arc::new(Mutex::new(Vec::new())) }
     }
 
     fn events(&self) -> Vec<QueryEvent> {
@@ -71,9 +68,7 @@ fn create_test_config(backend_host: String, backend_port: u16) -> Config {
             enable_metrics_server: false,
             metrics_server_address: "127.0.0.1:9090".to_string(),
         },
-        protocol: ProtocolConfig {
-            max_prepared_statements: 1000,
-        },
+        protocol: ProtocolConfig { max_prepared_statements: 1000 },
         publisher: PublisherConfig {
             enabled: true,
             batch_size: 10,
@@ -170,9 +165,8 @@ async fn test_transaction_commit() {
     let test_publisher = TestPublisher::new();
     let publisher = Arc::new(test_publisher.clone());
 
-    let proxy_port = start_test_proxy(config.clone(), publisher)
-        .await
-        .expect("Failed to start proxy");
+    let proxy_port =
+        start_test_proxy(config.clone(), publisher).await.expect("Failed to start proxy");
 
     sleep(Duration::from_millis(100)).await;
 
@@ -203,24 +197,15 @@ async fn test_transaction_commit() {
     client.execute("BEGIN", &[]).await.expect("BEGIN failed");
 
     // Insert data
-    client
-        .execute("INSERT INTO tx_test VALUES (1, 'first')", &[])
-        .await
-        .expect("INSERT failed");
+    client.execute("INSERT INTO tx_test VALUES (1, 'first')", &[]).await.expect("INSERT failed");
 
-    client
-        .execute("INSERT INTO tx_test VALUES (2, 'second')", &[])
-        .await
-        .expect("INSERT failed");
+    client.execute("INSERT INTO tx_test VALUES (2, 'second')", &[]).await.expect("INSERT failed");
 
     // Commit transaction
     client.execute("COMMIT", &[]).await.expect("COMMIT failed");
 
     // Verify data persisted
-    let rows = client
-        .query("SELECT COUNT(*) FROM tx_test", &[])
-        .await
-        .expect("SELECT failed");
+    let rows = client.query("SELECT COUNT(*) FROM tx_test", &[]).await.expect("SELECT failed");
 
     let count: i64 = rows[0].get(0);
     assert_eq!(count, 2, "Expected 2 rows after COMMIT");
@@ -243,9 +228,8 @@ async fn test_transaction_rollback() {
     let test_publisher = TestPublisher::new();
     let publisher = Arc::new(test_publisher.clone());
 
-    let proxy_port = start_test_proxy(config.clone(), publisher)
-        .await
-        .expect("Failed to start proxy");
+    let proxy_port =
+        start_test_proxy(config.clone(), publisher).await.expect("Failed to start proxy");
 
     sleep(Duration::from_millis(100)).await;
 
@@ -275,24 +259,15 @@ async fn test_transaction_rollback() {
     client.execute("BEGIN", &[]).await.expect("BEGIN failed");
 
     // Insert data
-    client
-        .execute("INSERT INTO tx_test VALUES (1, 'first')", &[])
-        .await
-        .expect("INSERT failed");
+    client.execute("INSERT INTO tx_test VALUES (1, 'first')", &[]).await.expect("INSERT failed");
 
-    client
-        .execute("INSERT INTO tx_test VALUES (2, 'second')", &[])
-        .await
-        .expect("INSERT failed");
+    client.execute("INSERT INTO tx_test VALUES (2, 'second')", &[]).await.expect("INSERT failed");
 
     // Rollback transaction
     client.execute("ROLLBACK", &[]).await.expect("ROLLBACK failed");
 
     // Verify data was NOT persisted
-    let rows = client
-        .query("SELECT COUNT(*) FROM tx_test", &[])
-        .await
-        .expect("SELECT failed");
+    let rows = client.query("SELECT COUNT(*) FROM tx_test", &[]).await.expect("SELECT failed");
 
     let count: i64 = rows[0].get(0);
     assert_eq!(count, 0, "Expected 0 rows after ROLLBACK");
@@ -315,9 +290,8 @@ async fn test_transaction_with_savepoints() {
     let test_publisher = TestPublisher::new();
     let publisher = Arc::new(test_publisher.clone());
 
-    let proxy_port = start_test_proxy(config.clone(), publisher)
-        .await
-        .expect("Failed to start proxy");
+    let proxy_port =
+        start_test_proxy(config.clone(), publisher).await.expect("Failed to start proxy");
 
     sleep(Duration::from_millis(100)).await;
 
@@ -347,43 +321,29 @@ async fn test_transaction_with_savepoints() {
     client.execute("BEGIN", &[]).await.expect("BEGIN failed");
 
     // Insert first row
-    client
-        .execute("INSERT INTO tx_test VALUES (1, 'first')", &[])
-        .await
-        .expect("INSERT failed");
+    client.execute("INSERT INTO tx_test VALUES (1, 'first')", &[]).await.expect("INSERT failed");
 
     // Create savepoint
     client.execute("SAVEPOINT sp1", &[]).await.expect("SAVEPOINT failed");
 
     // Insert second row
-    client
-        .execute("INSERT INTO tx_test VALUES (2, 'second')", &[])
-        .await
-        .expect("INSERT failed");
+    client.execute("INSERT INTO tx_test VALUES (2, 'second')", &[]).await.expect("INSERT failed");
 
     // Create another savepoint
     client.execute("SAVEPOINT sp2", &[]).await.expect("SAVEPOINT failed");
 
     // Insert third row
-    client
-        .execute("INSERT INTO tx_test VALUES (3, 'third')", &[])
-        .await
-        .expect("INSERT failed");
+    client.execute("INSERT INTO tx_test VALUES (3, 'third')", &[]).await.expect("INSERT failed");
 
     // Rollback to sp2 (removes third row)
-    client
-        .execute("ROLLBACK TO SAVEPOINT sp2", &[])
-        .await
-        .expect("ROLLBACK TO SAVEPOINT failed");
+    client.execute("ROLLBACK TO SAVEPOINT sp2", &[]).await.expect("ROLLBACK TO SAVEPOINT failed");
 
     // Commit transaction
     client.execute("COMMIT", &[]).await.expect("COMMIT failed");
 
     // Verify we have exactly 2 rows (first and second)
-    let rows = client
-        .query("SELECT id FROM tx_test ORDER BY id", &[])
-        .await
-        .expect("SELECT failed");
+    let rows =
+        client.query("SELECT id FROM tx_test ORDER BY id", &[]).await.expect("SELECT failed");
 
     assert_eq!(rows.len(), 2, "Expected 2 rows after partial rollback");
     let id1: i32 = rows[0].get(0);
@@ -409,9 +369,8 @@ async fn test_transaction_isolation_levels() {
     let test_publisher = TestPublisher::new();
     let publisher = Arc::new(test_publisher.clone());
 
-    let proxy_port = start_test_proxy(config.clone(), publisher)
-        .await
-        .expect("Failed to start proxy");
+    let proxy_port =
+        start_test_proxy(config.clone(), publisher).await.expect("Failed to start proxy");
 
     sleep(Duration::from_millis(100)).await;
 
@@ -432,12 +391,8 @@ async fn test_transaction_isolation_levels() {
     });
 
     // Test different isolation levels
-    let isolation_levels = vec![
-        "READ UNCOMMITTED",
-        "READ COMMITTED",
-        "REPEATABLE READ",
-        "SERIALIZABLE",
-    ];
+    let isolation_levels =
+        vec!["READ UNCOMMITTED", "READ COMMITTED", "REPEATABLE READ", "SERIALIZABLE"];
 
     for level in isolation_levels {
         client.execute("BEGIN", &[]).await.expect("BEGIN failed");
@@ -448,10 +403,7 @@ async fn test_transaction_isolation_levels() {
             .expect(&format!("Failed to set isolation level {}", level));
 
         // Verify we can execute a query in this transaction
-        let rows = client
-            .query("SELECT 1", &[])
-            .await
-            .expect("SELECT failed");
+        let rows = client.query("SELECT 1", &[]).await.expect("SELECT failed");
         assert_eq!(rows.len(), 1);
 
         client.execute("COMMIT", &[]).await.expect("COMMIT failed");
@@ -475,9 +427,8 @@ async fn test_nested_transactions_with_release() {
     let test_publisher = TestPublisher::new();
     let publisher = Arc::new(test_publisher.clone());
 
-    let proxy_port = start_test_proxy(config.clone(), publisher)
-        .await
-        .expect("Failed to start proxy");
+    let proxy_port =
+        start_test_proxy(config.clone(), publisher).await.expect("Failed to start proxy");
 
     sleep(Duration::from_millis(100)).await;
 
@@ -505,31 +456,19 @@ async fn test_nested_transactions_with_release() {
 
     client.execute("BEGIN", &[]).await.expect("BEGIN failed");
 
-    client
-        .execute("INSERT INTO tx_test VALUES (1, 'first')", &[])
-        .await
-        .expect("INSERT failed");
+    client.execute("INSERT INTO tx_test VALUES (1, 'first')", &[]).await.expect("INSERT failed");
 
     client.execute("SAVEPOINT sp1", &[]).await.expect("SAVEPOINT failed");
 
-    client
-        .execute("INSERT INTO tx_test VALUES (2, 'second')", &[])
-        .await
-        .expect("INSERT failed");
+    client.execute("INSERT INTO tx_test VALUES (2, 'second')", &[]).await.expect("INSERT failed");
 
     // Release savepoint (makes changes part of parent transaction)
-    client
-        .execute("RELEASE SAVEPOINT sp1", &[])
-        .await
-        .expect("RELEASE SAVEPOINT failed");
+    client.execute("RELEASE SAVEPOINT sp1", &[]).await.expect("RELEASE SAVEPOINT failed");
 
     // Commit - should include both inserts
     client.execute("COMMIT", &[]).await.expect("COMMIT failed");
 
-    let rows = client
-        .query("SELECT COUNT(*) FROM tx_test", &[])
-        .await
-        .expect("SELECT failed");
+    let rows = client.query("SELECT COUNT(*) FROM tx_test", &[]).await.expect("SELECT failed");
 
     let count: i64 = rows[0].get(0);
     assert_eq!(count, 2, "Expected 2 rows after RELEASE and COMMIT");
@@ -556,9 +495,8 @@ async fn test_cursor_basic_declare_fetch_close() {
     let test_publisher = TestPublisher::new();
     let publisher = Arc::new(test_publisher.clone());
 
-    let proxy_port = start_test_proxy(config.clone(), publisher)
-        .await
-        .expect("Failed to start proxy");
+    let proxy_port =
+        start_test_proxy(config.clone(), publisher).await.expect("Failed to start proxy");
 
     sleep(Duration::from_millis(100)).await;
 
@@ -586,10 +524,7 @@ async fn test_cursor_basic_declare_fetch_close() {
 
     for i in 1..=10 {
         client
-            .execute(
-                "INSERT INTO cursor_test VALUES ($1, $2)",
-                &[&i, &format!("value_{}", i)],
-            )
+            .execute("INSERT INTO cursor_test VALUES ($1, $2)", &[&i, &format!("value_{}", i)])
             .await
             .expect("INSERT failed");
     }
@@ -599,15 +534,15 @@ async fn test_cursor_basic_declare_fetch_close() {
 
     // Declare cursor
     client
-        .execute("DECLARE test_cursor CURSOR FOR SELECT id, value FROM cursor_test ORDER BY id", &[])
+        .execute(
+            "DECLARE test_cursor CURSOR FOR SELECT id, value FROM cursor_test ORDER BY id",
+            &[],
+        )
         .await
         .expect("DECLARE CURSOR failed");
 
     // Fetch first 3 rows
-    let rows = client
-        .query("FETCH 3 FROM test_cursor", &[])
-        .await
-        .expect("FETCH failed");
+    let rows = client.query("FETCH 3 FROM test_cursor", &[]).await.expect("FETCH failed");
 
     assert_eq!(rows.len(), 3, "Expected 3 rows from FETCH");
     let id1: i32 = rows[0].get(0);
@@ -618,20 +553,14 @@ async fn test_cursor_basic_declare_fetch_close() {
     assert_eq!(id3, 3);
 
     // Fetch next 3 rows
-    let rows = client
-        .query("FETCH 3 FROM test_cursor", &[])
-        .await
-        .expect("FETCH failed");
+    let rows = client.query("FETCH 3 FROM test_cursor", &[]).await.expect("FETCH failed");
 
     assert_eq!(rows.len(), 3, "Expected 3 rows from second FETCH");
     let id4: i32 = rows[0].get(0);
     assert_eq!(id4, 4);
 
     // Close cursor
-    client
-        .execute("CLOSE test_cursor", &[])
-        .await
-        .expect("CLOSE failed");
+    client.execute("CLOSE test_cursor", &[]).await.expect("CLOSE failed");
 
     // Commit transaction
     client.execute("COMMIT", &[]).await.expect("COMMIT failed");
@@ -654,9 +583,8 @@ async fn test_cursor_fetch_directions() {
     let test_publisher = TestPublisher::new();
     let publisher = Arc::new(test_publisher.clone());
 
-    let proxy_port = start_test_proxy(config.clone(), publisher)
-        .await
-        .expect("Failed to start proxy");
+    let proxy_port =
+        start_test_proxy(config.clone(), publisher).await.expect("Failed to start proxy");
 
     sleep(Duration::from_millis(100)).await;
 
@@ -683,25 +611,23 @@ async fn test_cursor_fetch_directions() {
         .expect("Failed to create table");
 
     for i in 1..=10 {
-        client
-            .execute("INSERT INTO cursor_test VALUES ($1)", &[&i])
-            .await
-            .expect("INSERT failed");
+        client.execute("INSERT INTO cursor_test VALUES ($1)", &[&i]).await.expect("INSERT failed");
     }
 
     client.execute("BEGIN", &[]).await.expect("BEGIN failed");
 
     // Declare scrollable cursor
     client
-        .execute("DECLARE test_cursor SCROLL CURSOR FOR SELECT id FROM cursor_test ORDER BY id", &[])
+        .execute(
+            "DECLARE test_cursor SCROLL CURSOR FOR SELECT id FROM cursor_test ORDER BY id",
+            &[],
+        )
         .await
         .expect("DECLARE CURSOR failed");
 
     // Fetch forward
-    let rows = client
-        .query("FETCH FORWARD 3 FROM test_cursor", &[])
-        .await
-        .expect("FETCH FORWARD failed");
+    let rows =
+        client.query("FETCH FORWARD 3 FROM test_cursor", &[]).await.expect("FETCH FORWARD failed");
     assert_eq!(rows.len(), 3);
     let id: i32 = rows[2].get(0);
     assert_eq!(id, 3);
@@ -754,9 +680,8 @@ async fn test_cursor_rollback_invalidates() {
     let test_publisher = TestPublisher::new();
     let publisher = Arc::new(test_publisher.clone());
 
-    let proxy_port = start_test_proxy(config.clone(), publisher)
-        .await
-        .expect("Failed to start proxy");
+    let proxy_port =
+        start_test_proxy(config.clone(), publisher).await.expect("Failed to start proxy");
 
     sleep(Duration::from_millis(100)).await;
 
@@ -783,10 +708,7 @@ async fn test_cursor_rollback_invalidates() {
         .expect("Failed to create table");
 
     for i in 1..=5 {
-        client
-            .execute("INSERT INTO cursor_test VALUES ($1)", &[&i])
-            .await
-            .expect("INSERT failed");
+        client.execute("INSERT INTO cursor_test VALUES ($1)", &[&i]).await.expect("INSERT failed");
     }
 
     client.execute("BEGIN", &[]).await.expect("BEGIN failed");
@@ -797,10 +719,7 @@ async fn test_cursor_rollback_invalidates() {
         .expect("DECLARE CURSOR failed");
 
     // Fetch some data
-    let rows = client
-        .query("FETCH 2 FROM test_cursor", &[])
-        .await
-        .expect("FETCH failed");
+    let rows = client.query("FETCH 2 FROM test_cursor", &[]).await.expect("FETCH failed");
     assert_eq!(rows.len(), 2);
 
     // Rollback transaction
@@ -808,10 +727,7 @@ async fn test_cursor_rollback_invalidates() {
 
     // Cursor should now be invalid - attempting to fetch should fail
     let result = client.query("FETCH 1 FROM test_cursor", &[]).await;
-    assert!(
-        result.is_err(),
-        "Expected cursor to be invalid after ROLLBACK"
-    );
+    assert!(result.is_err(), "Expected cursor to be invalid after ROLLBACK");
 
     sleep(Duration::from_millis(200)).await;
 }
@@ -831,9 +747,8 @@ async fn test_multiple_concurrent_cursors() {
     let test_publisher = TestPublisher::new();
     let publisher = Arc::new(test_publisher.clone());
 
-    let proxy_port = start_test_proxy(config.clone(), publisher)
-        .await
-        .expect("Failed to start proxy");
+    let proxy_port =
+        start_test_proxy(config.clone(), publisher).await.expect("Failed to start proxy");
 
     sleep(Duration::from_millis(100)).await;
 
@@ -865,10 +780,7 @@ async fn test_multiple_concurrent_cursors() {
         .expect("Failed to create table2");
 
     for i in 1..=5 {
-        client
-            .execute("INSERT INTO table1 VALUES ($1)", &[&i])
-            .await
-            .expect("INSERT failed");
+        client.execute("INSERT INTO table1 VALUES ($1)", &[&i]).await.expect("INSERT failed");
         client
             .execute("INSERT INTO table2 VALUES ($1)", &[&(i * 10)])
             .await
@@ -889,26 +801,17 @@ async fn test_multiple_concurrent_cursors() {
         .expect("DECLARE cursor2 failed");
 
     // Interleave fetches from both cursors
-    let rows1 = client
-        .query("FETCH 2 FROM cursor1", &[])
-        .await
-        .expect("FETCH from cursor1 failed");
+    let rows1 = client.query("FETCH 2 FROM cursor1", &[]).await.expect("FETCH from cursor1 failed");
     assert_eq!(rows1.len(), 2);
     let id: i32 = rows1[0].get(0);
     assert_eq!(id, 1);
 
-    let rows2 = client
-        .query("FETCH 2 FROM cursor2", &[])
-        .await
-        .expect("FETCH from cursor2 failed");
+    let rows2 = client.query("FETCH 2 FROM cursor2", &[]).await.expect("FETCH from cursor2 failed");
     assert_eq!(rows2.len(), 2);
     let id: i32 = rows2[0].get(0);
     assert_eq!(id, 10);
 
-    let rows1 = client
-        .query("FETCH 2 FROM cursor1", &[])
-        .await
-        .expect("FETCH from cursor1 failed");
+    let rows1 = client.query("FETCH 2 FROM cursor1", &[]).await.expect("FETCH from cursor1 failed");
     assert_eq!(rows1.len(), 2);
     let id: i32 = rows1[0].get(0);
     assert_eq!(id, 3);
@@ -937,9 +840,8 @@ async fn test_cursor_with_hold() {
     let test_publisher = TestPublisher::new();
     let publisher = Arc::new(test_publisher.clone());
 
-    let proxy_port = start_test_proxy(config.clone(), publisher)
-        .await
-        .expect("Failed to start proxy");
+    let proxy_port =
+        start_test_proxy(config.clone(), publisher).await.expect("Failed to start proxy");
 
     sleep(Duration::from_millis(100)).await;
 
@@ -966,35 +868,30 @@ async fn test_cursor_with_hold() {
         .expect("Failed to create table");
 
     for i in 1..=5 {
-        client
-            .execute("INSERT INTO cursor_test VALUES ($1)", &[&i])
-            .await
-            .expect("INSERT failed");
+        client.execute("INSERT INTO cursor_test VALUES ($1)", &[&i]).await.expect("INSERT failed");
     }
 
     client.execute("BEGIN", &[]).await.expect("BEGIN failed");
 
     // Declare cursor WITH HOLD - survives transaction commit
     client
-        .execute("DECLARE test_cursor CURSOR WITH HOLD FOR SELECT id FROM cursor_test ORDER BY id", &[])
+        .execute(
+            "DECLARE test_cursor CURSOR WITH HOLD FOR SELECT id FROM cursor_test ORDER BY id",
+            &[],
+        )
         .await
         .expect("DECLARE CURSOR WITH HOLD failed");
 
     // Fetch some rows
-    let rows = client
-        .query("FETCH 2 FROM test_cursor", &[])
-        .await
-        .expect("FETCH failed");
+    let rows = client.query("FETCH 2 FROM test_cursor", &[]).await.expect("FETCH failed");
     assert_eq!(rows.len(), 2);
 
     // Commit transaction
     client.execute("COMMIT", &[]).await.expect("COMMIT failed");
 
     // Cursor should still be valid and positioned correctly
-    let rows = client
-        .query("FETCH 2 FROM test_cursor", &[])
-        .await
-        .expect("FETCH after COMMIT failed");
+    let rows =
+        client.query("FETCH 2 FROM test_cursor", &[]).await.expect("FETCH after COMMIT failed");
     assert_eq!(rows.len(), 2);
     let id: i32 = rows[0].get(0);
     assert_eq!(id, 3, "Cursor should continue from position 3");
@@ -1024,9 +921,8 @@ async fn test_session_variables_persist() {
     let test_publisher = TestPublisher::new();
     let publisher = Arc::new(test_publisher.clone());
 
-    let proxy_port = start_test_proxy(config.clone(), publisher)
-        .await
-        .expect("Failed to start proxy");
+    let proxy_port =
+        start_test_proxy(config.clone(), publisher).await.expect("Failed to start proxy");
 
     sleep(Duration::from_millis(100)).await;
 
@@ -1053,10 +949,8 @@ async fn test_session_variables_persist() {
         .expect("SET application_name failed");
 
     // Verify it persists
-    let rows = client
-        .query("SHOW application_name", &[])
-        .await
-        .expect("SHOW application_name failed");
+    let rows =
+        client.query("SHOW application_name", &[]).await.expect("SHOW application_name failed");
     let app_name: String = rows[0].get(0);
     assert_eq!(app_name, "scry_test_app");
 
@@ -1066,10 +960,8 @@ async fn test_session_variables_persist() {
         .await
         .expect("SET statement_timeout failed");
 
-    let rows = client
-        .query("SHOW statement_timeout", &[])
-        .await
-        .expect("SHOW statement_timeout failed");
+    let rows =
+        client.query("SHOW statement_timeout", &[]).await.expect("SHOW statement_timeout failed");
     let timeout: String = rows[0].get(0);
     assert_eq!(timeout, "5s");
 
@@ -1079,10 +971,7 @@ async fn test_session_variables_persist() {
         .await
         .expect("SET search_path failed");
 
-    let rows = client
-        .query("SHOW search_path", &[])
-        .await
-        .expect("SHOW search_path failed");
+    let rows = client.query("SHOW search_path", &[]).await.expect("SHOW search_path failed");
     let search_path: String = rows[0].get(0);
     assert!(search_path.contains("public"));
 
@@ -1104,9 +993,8 @@ async fn test_multiple_session_variables() {
     let test_publisher = TestPublisher::new();
     let publisher = Arc::new(test_publisher.clone());
 
-    let proxy_port = start_test_proxy(config.clone(), publisher)
-        .await
-        .expect("Failed to start proxy");
+    let proxy_port =
+        start_test_proxy(config.clone(), publisher).await.expect("Failed to start proxy");
 
     sleep(Duration::from_millis(100)).await;
 
@@ -1127,24 +1015,12 @@ async fn test_multiple_session_variables() {
     });
 
     // Set multiple variables
-    client
-        .execute("SET application_name = 'test1'", &[])
-        .await
-        .expect("SET failed");
-    client
-        .execute("SET work_mem = '16MB'", &[])
-        .await
-        .expect("SET failed");
-    client
-        .execute("SET timezone = 'UTC'", &[])
-        .await
-        .expect("SET failed");
+    client.execute("SET application_name = 'test1'", &[]).await.expect("SET failed");
+    client.execute("SET work_mem = '16MB'", &[]).await.expect("SET failed");
+    client.execute("SET timezone = 'UTC'", &[]).await.expect("SET failed");
 
     // Execute some queries
-    client
-        .query("SELECT 1", &[])
-        .await
-        .expect("SELECT failed");
+    client.query("SELECT 1", &[]).await.expect("SELECT failed");
 
     // Verify all variables still set
     let rows = client.query("SHOW application_name", &[]).await.unwrap();
@@ -1177,9 +1053,8 @@ async fn test_session_variable_in_transaction() {
     let test_publisher = TestPublisher::new();
     let publisher = Arc::new(test_publisher.clone());
 
-    let proxy_port = start_test_proxy(config.clone(), publisher)
-        .await
-        .expect("Failed to start proxy");
+    let proxy_port =
+        start_test_proxy(config.clone(), publisher).await.expect("Failed to start proxy");
 
     sleep(Duration::from_millis(100)).await;
 
@@ -1200,19 +1075,13 @@ async fn test_session_variable_in_transaction() {
     });
 
     // Set variable outside transaction
-    client
-        .execute("SET application_name = 'before_tx'", &[])
-        .await
-        .expect("SET failed");
+    client.execute("SET application_name = 'before_tx'", &[]).await.expect("SET failed");
 
     // Begin transaction
     client.execute("BEGIN", &[]).await.expect("BEGIN failed");
 
     // Set LOCAL variable (transaction-scoped)
-    client
-        .execute("SET LOCAL application_name = 'in_tx'", &[])
-        .await
-        .expect("SET LOCAL failed");
+    client.execute("SET LOCAL application_name = 'in_tx'", &[]).await.expect("SET LOCAL failed");
 
     let rows = client.query("SHOW application_name", &[]).await.unwrap();
     let val: String = rows[0].get(0);
@@ -1248,9 +1117,8 @@ async fn test_temp_table_lifecycle() {
     let test_publisher = TestPublisher::new();
     let publisher = Arc::new(test_publisher.clone());
 
-    let proxy_port = start_test_proxy(config.clone(), publisher)
-        .await
-        .expect("Failed to start proxy");
+    let proxy_port =
+        start_test_proxy(config.clone(), publisher).await.expect("Failed to start proxy");
 
     sleep(Duration::from_millis(100)).await;
 
@@ -1277,16 +1145,10 @@ async fn test_temp_table_lifecycle() {
         .expect("CREATE TEMP TABLE failed");
 
     // Insert data
-    client
-        .execute("INSERT INTO my_temp VALUES (1, 'test')", &[])
-        .await
-        .expect("INSERT failed");
+    client.execute("INSERT INTO my_temp VALUES (1, 'test')", &[]).await.expect("INSERT failed");
 
     // Query in another statement (verifies table persists)
-    let rows = client
-        .query("SELECT * FROM my_temp", &[])
-        .await
-        .expect("SELECT failed");
+    let rows = client.query("SELECT * FROM my_temp", &[]).await.expect("SELECT failed");
     assert_eq!(rows.len(), 1);
 
     // Update data
@@ -1295,18 +1157,13 @@ async fn test_temp_table_lifecycle() {
         .await
         .expect("UPDATE failed");
 
-    let rows = client
-        .query("SELECT data FROM my_temp WHERE id = 1", &[])
-        .await
-        .expect("SELECT failed");
+    let rows =
+        client.query("SELECT data FROM my_temp WHERE id = 1", &[]).await.expect("SELECT failed");
     let data: String = rows[0].get(0);
     assert_eq!(data, "updated");
 
     // Drop temp table
-    client
-        .execute("DROP TABLE my_temp", &[])
-        .await
-        .expect("DROP TABLE failed");
+    client.execute("DROP TABLE my_temp", &[]).await.expect("DROP TABLE failed");
 
     // Verify table no longer exists
     let result = client.query("SELECT * FROM my_temp", &[]).await;
@@ -1330,9 +1187,8 @@ async fn test_temp_table_on_commit_delete_rows() {
     let test_publisher = TestPublisher::new();
     let publisher = Arc::new(test_publisher.clone());
 
-    let proxy_port = start_test_proxy(config.clone(), publisher)
-        .await
-        .expect("Failed to start proxy");
+    let proxy_port =
+        start_test_proxy(config.clone(), publisher).await.expect("Failed to start proxy");
 
     sleep(Duration::from_millis(100)).await;
 
@@ -1354,10 +1210,7 @@ async fn test_temp_table_on_commit_delete_rows() {
 
     // Create temp table with ON COMMIT DELETE ROWS
     client
-        .execute(
-            "CREATE TEMP TABLE my_temp (id INT) ON COMMIT DELETE ROWS",
-            &[],
-        )
+        .execute("CREATE TEMP TABLE my_temp (id INT) ON COMMIT DELETE ROWS", &[])
         .await
         .expect("CREATE TEMP TABLE failed");
 
@@ -1365,15 +1218,9 @@ async fn test_temp_table_on_commit_delete_rows() {
     client.execute("BEGIN", &[]).await.expect("BEGIN failed");
 
     // Insert data
-    client
-        .execute("INSERT INTO my_temp VALUES (1), (2), (3)", &[])
-        .await
-        .expect("INSERT failed");
+    client.execute("INSERT INTO my_temp VALUES (1), (2), (3)", &[]).await.expect("INSERT failed");
 
-    let rows = client
-        .query("SELECT COUNT(*) FROM my_temp", &[])
-        .await
-        .expect("SELECT failed");
+    let rows = client.query("SELECT COUNT(*) FROM my_temp", &[]).await.expect("SELECT failed");
     let count: i64 = rows[0].get(0);
     assert_eq!(count, 3);
 
@@ -1381,10 +1228,7 @@ async fn test_temp_table_on_commit_delete_rows() {
     client.execute("COMMIT", &[]).await.expect("COMMIT failed");
 
     // Verify rows deleted
-    let rows = client
-        .query("SELECT COUNT(*) FROM my_temp", &[])
-        .await
-        .expect("SELECT failed");
+    let rows = client.query("SELECT COUNT(*) FROM my_temp", &[]).await.expect("SELECT failed");
     let count: i64 = rows[0].get(0);
     assert_eq!(count, 0);
 
@@ -1406,9 +1250,8 @@ async fn test_temp_table_on_commit_drop() {
     let test_publisher = TestPublisher::new();
     let publisher = Arc::new(test_publisher.clone());
 
-    let proxy_port = start_test_proxy(config.clone(), publisher)
-        .await
-        .expect("Failed to start proxy");
+    let proxy_port =
+        start_test_proxy(config.clone(), publisher).await.expect("Failed to start proxy");
 
     sleep(Duration::from_millis(100)).await;
 
@@ -1438,10 +1281,7 @@ async fn test_temp_table_on_commit_drop() {
         .expect("CREATE TEMP TABLE failed");
 
     // Insert data
-    client
-        .execute("INSERT INTO my_temp VALUES (1)", &[])
-        .await
-        .expect("INSERT failed");
+    client.execute("INSERT INTO my_temp VALUES (1)", &[]).await.expect("INSERT failed");
 
     // Commit - should drop table
     client.execute("COMMIT", &[]).await.expect("COMMIT failed");
@@ -1472,9 +1312,8 @@ async fn test_advisory_lock_basic() {
     let test_publisher = TestPublisher::new();
     let publisher = Arc::new(test_publisher.clone());
 
-    let proxy_port = start_test_proxy(config.clone(), publisher)
-        .await
-        .expect("Failed to start proxy");
+    let proxy_port =
+        start_test_proxy(config.clone(), publisher).await.expect("Failed to start proxy");
 
     sleep(Duration::from_millis(100)).await;
 
@@ -1495,17 +1334,12 @@ async fn test_advisory_lock_basic() {
     });
 
     // Acquire advisory lock
-    let rows = client
-        .query("SELECT pg_advisory_lock(12345)", &[])
-        .await
-        .expect("pg_advisory_lock failed");
+    let rows =
+        client.query("SELECT pg_advisory_lock(12345)", &[]).await.expect("pg_advisory_lock failed");
     assert_eq!(rows.len(), 1);
 
     // Execute query while holding lock
-    let rows = client
-        .query("SELECT 1", &[])
-        .await
-        .expect("SELECT failed");
+    let rows = client.query("SELECT 1", &[]).await.expect("SELECT failed");
     assert_eq!(rows.len(), 1);
 
     // Unlock
@@ -1525,10 +1359,7 @@ async fn test_advisory_lock_basic() {
     assert!(locked, "Should successfully acquire lock after unlocking");
 
     // Clean up
-    client
-        .query("SELECT pg_advisory_unlock(12345)", &[])
-        .await
-        .expect("pg_advisory_unlock failed");
+    client.query("SELECT pg_advisory_unlock(12345)", &[]).await.expect("pg_advisory_unlock failed");
 
     sleep(Duration::from_millis(200)).await;
 }
@@ -1548,9 +1379,8 @@ async fn test_advisory_lock_conflict() {
     let test_publisher = TestPublisher::new();
     let publisher = Arc::new(test_publisher.clone());
 
-    let proxy_port = start_test_proxy(config.clone(), publisher)
-        .await
-        .expect("Failed to start proxy");
+    let proxy_port =
+        start_test_proxy(config.clone(), publisher).await.expect("Failed to start proxy");
 
     sleep(Duration::from_millis(100)).await;
 
@@ -1588,10 +1418,7 @@ async fn test_advisory_lock_conflict() {
     });
 
     // Client1 acquires lock
-    client1
-        .query("SELECT pg_advisory_lock(99999)", &[])
-        .await
-        .expect("pg_advisory_lock failed");
+    client1.query("SELECT pg_advisory_lock(99999)", &[]).await.expect("pg_advisory_lock failed");
 
     // Client2 tries to acquire same lock (should fail with try variant)
     let rows = client2
@@ -1639,9 +1466,8 @@ async fn test_advisory_lock_transaction_scoped() {
     let test_publisher = TestPublisher::new();
     let publisher = Arc::new(test_publisher.clone());
 
-    let proxy_port = start_test_proxy(config.clone(), publisher)
-        .await
-        .expect("Failed to start proxy");
+    let proxy_port =
+        start_test_proxy(config.clone(), publisher).await.expect("Failed to start proxy");
 
     sleep(Duration::from_millis(100)).await;
 
@@ -1671,10 +1497,7 @@ async fn test_advisory_lock_transaction_scoped() {
         .expect("pg_advisory_xact_lock failed");
 
     // Do some work
-    client
-        .query("SELECT 1", &[])
-        .await
-        .expect("SELECT failed");
+    client.query("SELECT 1", &[]).await.expect("SELECT failed");
 
     // Commit - lock should auto-release
     client.execute("COMMIT", &[]).await.expect("COMMIT failed");
@@ -1715,9 +1538,8 @@ async fn test_listen_notify_commands() {
     let test_publisher = TestPublisher::new();
     let publisher = Arc::new(test_publisher.clone());
 
-    let proxy_port = start_test_proxy(config.clone(), publisher)
-        .await
-        .expect("Failed to start proxy");
+    let proxy_port =
+        start_test_proxy(config.clone(), publisher).await.expect("Failed to start proxy");
 
     sleep(Duration::from_millis(100)).await;
 
@@ -1756,21 +1578,12 @@ async fn test_listen_notify_commands() {
     });
 
     // Test LISTEN command
-    listener_client
-        .execute("LISTEN test_channel", &[])
-        .await
-        .expect("LISTEN command failed");
+    listener_client.execute("LISTEN test_channel", &[]).await.expect("LISTEN command failed");
 
     // Test LISTEN on multiple channels
-    listener_client
-        .execute("LISTEN channel1", &[])
-        .await
-        .expect("LISTEN channel1 failed");
+    listener_client.execute("LISTEN channel1", &[]).await.expect("LISTEN channel1 failed");
 
-    listener_client
-        .execute("LISTEN channel2", &[])
-        .await
-        .expect("LISTEN channel2 failed");
+    listener_client.execute("LISTEN channel2", &[]).await.expect("LISTEN channel2 failed");
 
     // Test NOTIFY command
     notifier_client
@@ -1779,16 +1592,10 @@ async fn test_listen_notify_commands() {
         .expect("NOTIFY failed");
 
     // Test UNLISTEN command
-    listener_client
-        .execute("UNLISTEN test_channel", &[])
-        .await
-        .expect("UNLISTEN failed");
+    listener_client.execute("UNLISTEN test_channel", &[]).await.expect("UNLISTEN failed");
 
     // Test UNLISTEN *
-    listener_client
-        .execute("UNLISTEN *", &[])
-        .await
-        .expect("UNLISTEN * failed");
+    listener_client.execute("UNLISTEN *", &[]).await.expect("UNLISTEN * failed");
 
     sleep(Duration::from_millis(200)).await;
     // If we got here, all LISTEN/NOTIFY commands executed successfully through the proxy

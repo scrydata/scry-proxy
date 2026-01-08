@@ -46,8 +46,7 @@ impl EventBatcher {
         let metrics_clone = Arc::clone(&metrics);
         tokio::spawn(async move {
             if let Err(e) =
-                run_batcher(receiver, publisher, batch_size, flush_interval_ms, metrics_clone)
-                    .await
+                run_batcher(receiver, publisher, batch_size, flush_interval_ms, metrics_clone).await
             {
                 error!(error = %e, "Event batcher task failed");
             }
@@ -221,16 +220,15 @@ mod tests {
         }
 
         let should_block = Arc::new(AtomicBool::new(true));
-        let publisher = Arc::new(SlowPublisher {
-            should_block: Arc::clone(&should_block),
-        });
+        let publisher = Arc::new(SlowPublisher { should_block: Arc::clone(&should_block) });
 
         // Create batcher with very small queue (10 events)
         let batcher = EventBatcher::new(publisher.clone(), 5, 10000, 10);
 
         // Send events until queue is full
         for i in 0..20 {
-            let result = batcher.send_event(QueryEventBuilder::new(format!("SELECT {}", i)).build());
+            let result =
+                batcher.send_event(QueryEventBuilder::new(format!("SELECT {}", i)).build());
             assert!(result.is_ok());
         }
 
@@ -274,9 +272,7 @@ mod tests {
         }
 
         let processed = Arc::new(AtomicU64::new(0));
-        let publisher = Arc::new(TrackingSlowPublisher {
-            processed: Arc::clone(&processed),
-        });
+        let publisher = Arc::new(TrackingSlowPublisher { processed: Arc::clone(&processed) });
 
         // Create batcher with bounded queue
         let batcher = EventBatcher::new(publisher.clone(), 10, 50, 50);

@@ -14,12 +14,14 @@ pub use cache::{PendingExecution, PreparedStatement, PreparedStatementCache};
 pub use connection::ConnectionHandler;
 pub use connection_state::{ConnectionState, PinReason, PreparedStatementInfo, ReplayableState};
 pub use event_batcher::EventBatcher;
-pub use state_replayer::{ReplayError, ReplayResult, StateReplayer};
 pub use mode_enforcer::{ModeEnforcer, PoolingMode};
-pub use pool_manager::{AcquireError, ManagedConnection, PoolManager, PoolManagerConfig, StickyConnectionInfo};
+pub use pool_manager::{
+    AcquireError, ManagedConnection, PoolManager, PoolManagerConfig, StickyConnectionInfo,
+};
 pub use server::ProxyServer;
-pub use tcp_pool::{PoolStatus, TcpConnectionPool};
+pub use state_replayer::{ReplayError, ReplayResult, StateReplayer};
 pub(crate) use tcp_pool::PooledConnection;
+pub use tcp_pool::{PoolStatus, TcpConnectionPool};
 pub use transaction::{TransactionState, TransactionTracker};
 pub use wait_queue::{QueueFullError, WaitQueue, Waiter};
 

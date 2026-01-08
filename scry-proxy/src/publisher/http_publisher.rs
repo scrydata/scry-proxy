@@ -1,8 +1,8 @@
 use super::{EventPublisher, QueryEvent};
-use scry_protocol::FlatBuffersSerializer;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use reqwest::Client;
+use scry_protocol::FlatBuffersSerializer;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -53,17 +53,14 @@ impl HttpPublisher {
         let proxy_id = format!("scry-{}", uuid::Uuid::new_v4());
 
         // Build HTTP client with timeout
-        let mut client_builder = Client::builder()
-            .timeout(Duration::from_millis(timeout_ms))
-            .tcp_nodelay(true); // Disable Nagle's algorithm for lower latency
+        let mut client_builder =
+            Client::builder().timeout(Duration::from_millis(timeout_ms)).tcp_nodelay(true); // Disable Nagle's algorithm for lower latency
 
         if compression {
             client_builder = client_builder.gzip(true);
         }
 
-        let client = client_builder
-            .build()
-            .context("Failed to build HTTP client")?;
+        let client = client_builder.build().context("Failed to build HTTP client")?;
 
         info!(
             endpoint = %endpoint,
@@ -154,10 +151,7 @@ impl HttpPublisher {
             request = request.header("X-Shadow-Id", shadow_id);
         }
 
-        let response = request
-            .send()
-            .await
-            .context("Failed to send HTTP request")?;
+        let response = request.send().await.context("Failed to send HTTP request")?;
 
         let status = response.status();
 
@@ -167,11 +161,7 @@ impl HttpPublisher {
                 .await
                 .unwrap_or_else(|_| "Unable to read response body".to_string());
 
-            anyhow::bail!(
-                "HTTP request failed with status {}: {}",
-                status,
-                error_body
-            );
+            anyhow::bail!("HTTP request failed with status {}: {}", status, error_body);
         }
 
         debug!(status = status.as_u16(), "HTTP request successful");
@@ -187,9 +177,7 @@ impl HttpPublisher {
             successful_publishes: AtomicU64::new(
                 self.metrics.successful_publishes.load(Ordering::Relaxed),
             ),
-            failed_publishes: AtomicU64::new(
-                self.metrics.failed_publishes.load(Ordering::Relaxed),
-            ),
+            failed_publishes: AtomicU64::new(self.metrics.failed_publishes.load(Ordering::Relaxed)),
         }
     }
 }
@@ -270,13 +258,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_serialization() {
-        let events = vec![
-            QueryEventBuilder::new("SELECT 1")
-                .connection_id("conn-1")
-                .database("db1")
-                .duration(StdDuration::from_millis(5))
-                .build(),
-        ];
+        let events = vec![QueryEventBuilder::new("SELECT 1")
+            .connection_id("conn-1")
+            .database("db1")
+            .duration(StdDuration::from_millis(5))
+            .build()];
 
         let payload = FlatBuffersSerializer::serialize_batch(&events, "test-proxy", 0);
         assert!(!payload.is_empty());

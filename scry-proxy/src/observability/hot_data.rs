@@ -7,7 +7,6 @@
 /// 1. Count-Min Sketch: Probabilistic frequency counter with <1% error
 /// 2. Top-K Heap: Maintains the K most frequently accessed fingerprints
 /// 3. Temporal Decay: Recent accesses weighted more heavily than old ones
-
 use ahash::RandomState;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -100,12 +99,7 @@ impl CountMinSketch {
         // Create independent hash functions
         let hash_builders: Vec<RandomState> = (0..depth).map(|_| RandomState::new()).collect();
 
-        Self {
-            width,
-            depth,
-            table,
-            hash_builders,
-        }
+        Self { width, depth, table, hash_builders }
     }
 
     /// Increment count for a fingerprint, return estimated count
@@ -195,10 +189,7 @@ impl TopKHeap {
         } else if self.fingerprint_to_count.len() < self.k {
             // Heap not full yet, just insert
             self.fingerprint_to_count.insert(fingerprint.clone(), count);
-            self.heap.push(Reverse(HotDataEntry {
-                fingerprint,
-                access_count: count,
-            }));
+            self.heap.push(Reverse(HotDataEntry { fingerprint, access_count: count }));
         } else {
             // Heap is full, check if this count beats the minimum
             if let Some(Reverse(min_entry)) = self.heap.peek() {
@@ -210,10 +201,7 @@ impl TopKHeap {
 
                     // Insert new entry
                     self.fingerprint_to_count.insert(fingerprint.clone(), count);
-                    self.heap.push(Reverse(HotDataEntry {
-                        fingerprint,
-                        access_count: count,
-                    }));
+                    self.heap.push(Reverse(HotDataEntry { fingerprint, access_count: count }));
                 }
             }
         }
@@ -235,10 +223,7 @@ impl TopKHeap {
         let mut entries: Vec<HotDataEntry> = self
             .fingerprint_to_count
             .iter()
-            .map(|(fp, count)| HotDataEntry {
-                fingerprint: fp.clone(),
-                access_count: *count,
-            })
+            .map(|(fp, count)| HotDataEntry { fingerprint: fp.clone(), access_count: *count })
             .collect();
 
         // Sort descending by access count

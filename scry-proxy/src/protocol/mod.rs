@@ -1,14 +1,14 @@
-mod extractor;
 mod anonymize;
-mod command_detector;
 pub mod bind;
-pub mod traits;
+mod command_detector;
+mod extractor;
 pub mod postgres;
+pub mod traits;
 
+pub use anonymize::{AnonymizedQuery, QueryAnonymizer};
 pub use bind::decode_params;
-pub use extractor::MessageExtractor;
-pub use anonymize::{QueryAnonymizer, AnonymizedQuery};
 pub use command_detector::{CommandDetector, DetectedCommand};
+pub use extractor::MessageExtractor;
 pub use traits::{Protocol, ProtocolConfig, ProtocolRegistry};
 // Message enum is defined below and doesn't need re-export
 
@@ -36,11 +36,7 @@ pub enum Message {
     Query { query: String },
 
     /// Parse message - extended query protocol (P)
-    Parse {
-        name: String,
-        query: String,
-        param_oids: Vec<u32>,
-    },
+    Parse { name: String, query: String, param_oids: Vec<u32> },
 
     /// Bind message - extended query protocol (B)
     Bind {

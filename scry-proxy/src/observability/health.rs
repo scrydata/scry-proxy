@@ -5,7 +5,6 @@
 ///
 /// Innovation: Most proxies only expose current metrics. This module predicts
 /// problems before they become critical by comparing current behavior to baselines.
-
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -126,10 +125,7 @@ impl HealthMonitor {
         *self.warnings.write() = warnings;
 
         // Update last check timestamp
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         self.last_check.store(now, Ordering::Relaxed);
     }
 
@@ -221,11 +217,11 @@ impl Baseline {
 /// Current health snapshot (input to health monitor)
 #[derive(Debug, Clone)]
 pub struct HealthSnapshot {
-    pub error_rate: f64,        // Errors / total queries
-    pub latency_p99_ms: f64,    // 99th percentile latency in milliseconds
-    pub pool_utilization: f64,  // (pool_size - available) / pool_size
-    pub pool_size: usize,       // Current pool size
-    pub pool_available: usize,  // Available connections
+    pub error_rate: f64,           // Errors / total queries
+    pub latency_p99_ms: f64,       // 99th percentile latency in milliseconds
+    pub pool_utilization: f64,     // (pool_size - available) / pool_size
+    pub pool_size: usize,          // Current pool size
+    pub pool_available: usize,     // Available connections
     pub active_connections: usize, // Active client connections
 }
 
@@ -243,18 +239,10 @@ pub struct BaselineSnapshot {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HealthWarning {
     /// Error rate significantly higher than baseline
-    ErrorRateSpike {
-        current: f64,
-        baseline: f64,
-        factor: f64,
-    },
+    ErrorRateSpike { current: f64, baseline: f64, factor: f64 },
 
     /// P99 latency significantly higher than baseline
-    LatencySpike {
-        current_p99_ms: f64,
-        baseline_p99_ms: f64,
-        factor: f64,
-    },
+    LatencySpike { current_p99_ms: f64, baseline_p99_ms: f64, factor: f64 },
 
     /// Pool utilization above threshold
     PoolSaturation { utilization: f64, threshold: f64 },
@@ -333,10 +321,7 @@ mod tests {
 
     #[test]
     fn test_error_rate_spike_detection() {
-        let config = HealthConfig {
-            error_rate_spike_factor: 3.0,
-            ..Default::default()
-        };
+        let config = HealthConfig { error_rate_spike_factor: 3.0, ..Default::default() };
         let monitor = HealthMonitor::new(config);
 
         // Establish baseline
@@ -375,10 +360,7 @@ mod tests {
 
     #[test]
     fn test_pool_saturation_detection() {
-        let config = HealthConfig {
-            pool_saturation_threshold: 0.95,
-            ..Default::default()
-        };
+        let config = HealthConfig { pool_saturation_threshold: 0.95, ..Default::default() };
         let monitor = HealthMonitor::new(config);
 
         // Pool 96% utilized (above threshold)

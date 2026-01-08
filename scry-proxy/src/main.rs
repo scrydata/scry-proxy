@@ -30,10 +30,8 @@ async fn main() -> Result<()> {
         let metrics_server_config = observability::metrics_server::MetricsServerConfig {
             listen_address: config.observability.metrics_server_address.clone(),
         };
-        let metrics_server = observability::MetricsServer::new(
-            Arc::clone(&metrics),
-            metrics_server_config,
-        );
+        let metrics_server =
+            observability::MetricsServer::new(Arc::clone(&metrics), metrics_server_config);
 
         tokio::spawn(async move {
             if let Err(e) = metrics_server.run().await {

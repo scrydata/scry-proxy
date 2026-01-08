@@ -4,7 +4,6 @@
 /// - State reset via DISCARD ALL
 /// - Health checking
 /// - Query/error extraction (delegating to existing MessageExtractor)
-
 use super::traits::Protocol;
 use super::MessageExtractor;
 use anyhow::{Context, Result};
@@ -20,9 +19,7 @@ pub struct PostgresProtocol {
 
 impl PostgresProtocol {
     pub fn new() -> Self {
-        Self {
-            extractor: MessageExtractor::new(),
-        }
+        Self { extractor: MessageExtractor::new() }
     }
 
     /// Check if response contains CommandComplete message
@@ -86,10 +83,7 @@ impl Protocol for PostgresProtocol {
         message.extend_from_slice(query);
 
         // Send the message
-        stream
-            .write_all(&message)
-            .await
-            .context("Failed to send DISCARD ALL command")?;
+        stream.write_all(&message).await.context("Failed to send DISCARD ALL command")?;
 
         // Read response - expect CommandComplete ('C') and ReadyForQuery ('Z')
         let mut response_buffer = vec![0u8; 1024];
