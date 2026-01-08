@@ -6,6 +6,7 @@ mod mode_enforcer;
 mod server;
 mod tcp_pool;
 mod transaction;
+mod wait_queue;
 
 pub use cache::{PendingExecution, PreparedStatement, PreparedStatementCache};
 pub use connection::ConnectionHandler;
@@ -16,6 +17,7 @@ pub use server::ProxyServer;
 pub use tcp_pool::{PoolStatus, TcpConnectionPool};
 pub(crate) use tcp_pool::PooledConnection;
 pub use transaction::{TransactionState, TransactionTracker};
+pub use wait_queue::{QueueFullError, WaitQueue, Waiter};
 
 use crate::config::Config;
 use crate::observability::ProxyMetrics;
