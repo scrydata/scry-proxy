@@ -1,5 +1,6 @@
 mod extractor;
 mod anonymize;
+mod command_detector;
 pub mod bind;
 pub mod traits;
 pub mod postgres;
@@ -7,6 +8,7 @@ pub mod postgres;
 pub use bind::decode_params;
 pub use extractor::MessageExtractor;
 pub use anonymize::{QueryAnonymizer, AnonymizedQuery};
+pub use command_detector::{CommandDetector, DetectedCommand};
 pub use traits::{Protocol, ProtocolConfig, ProtocolRegistry};
 // Message enum is defined below and doesn't need re-export
 
