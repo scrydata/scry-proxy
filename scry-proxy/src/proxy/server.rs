@@ -148,6 +148,7 @@ impl ProxyServer {
                 Some(config.performance.pool_min_idle),
                 circuit_breaker,
                 retry_config,
+                config.performance.pool_lifo,
             )
             .context("Failed to create TCP connection pool")?;
 

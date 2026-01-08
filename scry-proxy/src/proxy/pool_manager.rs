@@ -216,8 +216,14 @@ impl PoolManager {
                 if let Some((_, ref mut info)) = map.get_mut(&client_id) {
                     info.touch();
                 } else {
-                    // Connection was pinned but not in map (shouldn't happen normally)
-                    // Put it back in the sticky map
+                    // Connection was pinned but not in map - this indicates a logic error
+                    // where is_pinned was set without adding to sticky_map, or the entry
+                    // was removed by another thread. Log a warning and recover by adding
+                    // the connection to the sticky map.
+                    warn!(
+                        client_id,
+                        "Pinned connection not found in sticky map - recovering by adding entry"
+                    );
                     let binding_id = self.next_binding_id.fetch_add(1, Ordering::Relaxed);
                     map.insert(
                         client_id,
@@ -422,6 +428,10 @@ mod tests {
     use crate::protocol::{Protocol, ProtocolConfig};
 
     fn create_test_pool() -> Arc<TcpConnectionPool> {
+        create_test_pool_with_lifo(true)
+    }
+
+    fn create_test_pool_with_lifo(lifo: bool) -> Arc<TcpConnectionPool> {
         let protocol = Arc::new(PostgresProtocol::new()) as Arc<dyn Protocol>;
         let config = ProtocolConfig {
             host: "localhost".to_string(),
@@ -439,6 +449,7 @@ mod tests {
                 None, // min_idle
                 None, // circuit_breaker
                 None, // retry_config
+                lifo, // lifo
             )
             .expect("Failed to create pool"),
         )

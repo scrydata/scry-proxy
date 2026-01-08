@@ -10,7 +10,7 @@ use crate::protocol::{Protocol, ProtocolConfig};
 use crate::resilience::{CircuitBreaker, RetryStrategy};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use deadpool::managed::{Manager, Pool, RecycleResult};
+use deadpool::managed::{Manager, Pool, QueueMode, RecycleResult};
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
@@ -44,6 +44,7 @@ impl TcpConnectionPool {
     /// * `min_idle` - Minimum number of idle connections to maintain
     /// * `circuit_breaker` - Optional circuit breaker for resilience
     /// * `retry_config` - Optional retry configuration
+    /// * `lifo` - Use LIFO (last-in-first-out) connection selection for better cache locality
     pub fn new(
         protocol: Arc<dyn Protocol>,
         config: ProtocolConfig,
@@ -51,7 +52,14 @@ impl TcpConnectionPool {
         min_idle: Option<usize>,
         circuit_breaker: Option<Arc<CircuitBreaker>>,
         retry_config: Option<ConnectionRetryConfig>,
+        lifo: bool,
     ) -> Result<Self> {
+        let queue_mode = if lifo {
+            QueueMode::Lifo
+        } else {
+            QueueMode::Fifo
+        };
+
         info!(
             protocol = protocol.name(),
             backend_addr = %config.backend_addr(),
@@ -59,6 +67,7 @@ impl TcpConnectionPool {
             min_idle = ?min_idle,
             circuit_breaker_enabled = circuit_breaker.is_some(),
             retry_enabled = retry_config.is_some(),
+            lifo = lifo,
             "Creating TCP connection pool"
         );
 
@@ -67,7 +76,9 @@ impl TcpConnectionPool {
             protocol: Arc::clone(&protocol),
         };
 
-        let mut builder = Pool::builder(manager).max_size(max_size);
+        let mut builder = Pool::builder(manager)
+            .max_size(max_size)
+            .queue_mode(queue_mode);
 
         if let Some(min) = min_idle {
             builder = builder.runtime(deadpool::Runtime::Tokio1);
@@ -278,8 +289,9 @@ mod tests {
             config,
             10,
             Some(2),
-            None, // circuit_breaker
-            None, // retry_config
+            None,  // circuit_breaker
+            None,  // retry_config
+            true,  // lifo
         )
         .unwrap();
         let status = pool.status();
