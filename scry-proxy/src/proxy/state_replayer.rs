@@ -6,8 +6,25 @@
 //! to a new backend connection after reconnection.
 
 use crate::proxy::ReplayableState;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::time::timeout;
+
+/// Default timeout for read operations during state replay
+const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Quote a string as a PostgreSQL identifier using double quotes.
+/// Internal double quotes are escaped by doubling them.
+///
+/// # Examples
+/// ```ignore
+/// assert_eq!(quote_identifier("my_table"), "\"my_table\"");
+/// assert_eq!(quote_identifier("has\"quote"), "\"has\"\"quote\"");
+/// ```
+pub fn quote_identifier(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
 
 /// Errors that can occur during state replay
 #[derive(Debug, Clone)]
@@ -123,9 +140,19 @@ impl StateReplayer {
         Ok(!saw_error)
     }
 
-    /// Read response from stream until ReadyForQuery is received
-    /// Returns true if successful, false if error response received
+    /// Read response from stream until ReadyForQuery is received.
+    /// Uses default timeout of 5 seconds.
+    /// Returns true if successful, false if error response received.
     pub async fn read_response(stream: &mut TcpStream) -> Result<bool, anyhow::Error> {
+        Self::read_response_with_timeout(stream, DEFAULT_READ_TIMEOUT).await
+    }
+
+    /// Read response from stream until ReadyForQuery is received with configurable timeout.
+    /// Returns true if successful, false if error response received.
+    pub async fn read_response_with_timeout(
+        stream: &mut TcpStream,
+        read_timeout: Duration,
+    ) -> Result<bool, anyhow::Error> {
         let mut buffer = Vec::new();
         let mut temp = [0u8; 4096];
 
@@ -140,32 +167,53 @@ impl StateReplayer {
                 }
             }
 
-            // Read more data from stream
-            let n = stream.read(&mut temp).await?;
-            if n == 0 {
-                return Err(anyhow::anyhow!("Connection closed before ReadyForQuery"));
+            // Read more data from stream with timeout
+            let read_result = timeout(read_timeout, stream.read(&mut temp)).await;
+            match read_result {
+                Ok(Ok(n)) => {
+                    if n == 0 {
+                        return Err(anyhow::anyhow!("Connection closed before ReadyForQuery"));
+                    }
+                    buffer.extend_from_slice(&temp[..n]);
+                }
+                Ok(Err(e)) => {
+                    return Err(anyhow::anyhow!("Read error: {}", e));
+                }
+                Err(_) => {
+                    return Err(anyhow::anyhow!(
+                        "Timeout waiting for response ({}s)",
+                        read_timeout.as_secs()
+                    ));
+                }
             }
-            buffer.extend_from_slice(&temp[..n]);
         }
     }
 
     /// Build SQL for preparing a statement
     /// Uses PostgreSQL's PREPARE syntax: PREPARE name AS query
+    /// The name is quoted as an identifier to prevent SQL injection.
     pub fn build_prepare_sql(name: &str, query: &str) -> String {
-        format!("PREPARE {} AS {}", name, query)
+        let safe_name = quote_identifier(name);
+        format!("PREPARE {} AS {}", safe_name, query)
     }
 
     /// Build SQL for setting a session variable
-    /// Handles special cases like search_path and quoted values
+    /// Handles special cases like search_path and quoted values.
+    /// Variable names are quoted as identifiers to prevent SQL injection.
     pub fn build_set_sql(name: &str, value: &str) -> String {
-        // Special case: search_path uses TO syntax without quotes
+        // Special case: search_path uses TO syntax with each schema quoted
         if name.eq_ignore_ascii_case("search_path") {
-            return format!("SET search_path TO {}", value);
+            let schemas: Vec<String> = value
+                .split(',')
+                .map(|s| quote_identifier(s.trim()))
+                .collect();
+            return format!("SET search_path TO {}", schemas.join(", "));
         }
 
-        // Escape single quotes by doubling them
+        // Quote the variable name and escape single quotes in value by doubling them
+        let safe_name = quote_identifier(name);
         let escaped_value = value.replace('\'', "''");
-        format!("SET {} = '{}'", name, escaped_value)
+        format!("SET {} = '{}'", safe_name, escaped_value)
     }
 
     /// Replay state to a connection
@@ -352,7 +400,7 @@ mod tests {
     #[test]
     fn test_build_prepare_sql_simple() {
         let sql = StateReplayer::build_prepare_sql("my_stmt", "SELECT $1");
-        assert_eq!(sql, "PREPARE my_stmt AS SELECT $1");
+        assert_eq!(sql, "PREPARE \"my_stmt\" AS SELECT $1");
     }
 
     #[test]
@@ -363,34 +411,89 @@ mod tests {
         );
         assert_eq!(
             sql,
-            "PREPARE insert_user AS INSERT INTO users (name, email) VALUES ($1, $2)"
+            "PREPARE \"insert_user\" AS INSERT INTO users (name, email) VALUES ($1, $2)"
         );
+    }
+
+    #[test]
+    fn test_build_prepare_sql_with_injection_attempt() {
+        // Test SQL injection prevention in statement name
+        let sql = StateReplayer::build_prepare_sql(
+            "bad\"; DROP TABLE users; --",
+            "SELECT $1",
+        );
+        // The name should be safely quoted
+        assert_eq!(sql, "PREPARE \"bad\"\"; DROP TABLE users; --\" AS SELECT $1");
+    }
+
+    #[test]
+    fn test_build_prepare_sql_with_double_quotes() {
+        // Test that double quotes in name are escaped
+        let sql = StateReplayer::build_prepare_sql("stmt\"with\"quotes", "SELECT 1");
+        assert_eq!(sql, "PREPARE \"stmt\"\"with\"\"quotes\" AS SELECT 1");
     }
 
     #[test]
     fn test_build_set_sql_simple_value() {
         let sql = StateReplayer::build_set_sql("timezone", "UTC");
-        assert_eq!(sql, "SET timezone = 'UTC'");
+        assert_eq!(sql, "SET \"timezone\" = 'UTC'");
     }
 
     #[test]
     fn test_build_set_sql_search_path() {
-        // search_path uses TO syntax without quotes for schema names
+        // search_path uses TO syntax with each schema name quoted
         let sql = StateReplayer::build_set_sql("search_path", "public, myschema");
-        assert_eq!(sql, "SET search_path TO public, myschema");
+        assert_eq!(sql, "SET search_path TO \"public\", \"myschema\"");
+    }
+
+    #[test]
+    fn test_build_set_sql_search_path_with_injection() {
+        // Test SQL injection prevention in search_path schema names
+        let sql = StateReplayer::build_set_sql("search_path", "public\"; DROP TABLE users; --");
+        assert_eq!(sql, "SET search_path TO \"public\"\"; DROP TABLE users; --\"");
     }
 
     #[test]
     fn test_build_set_sql_with_quotes_in_value() {
         // Values with quotes should be escaped
         let sql = StateReplayer::build_set_sql("my_setting", "it's a test");
-        assert_eq!(sql, "SET my_setting = 'it''s a test'");
+        assert_eq!(sql, "SET \"my_setting\" = 'it''s a test'");
     }
 
     #[test]
     fn test_build_set_sql_numeric_value() {
         let sql = StateReplayer::build_set_sql("statement_timeout", "5000");
-        assert_eq!(sql, "SET statement_timeout = '5000'");
+        assert_eq!(sql, "SET \"statement_timeout\" = '5000'");
+    }
+
+    #[test]
+    fn test_build_set_sql_with_injection_attempt() {
+        // Test SQL injection prevention in variable name
+        let sql = StateReplayer::build_set_sql("x = 'evil'; DROP TABLE users; --", "value");
+        assert_eq!(sql, "SET \"x = 'evil'; DROP TABLE users; --\" = 'value'");
+    }
+
+    #[test]
+    fn test_quote_identifier() {
+        use super::quote_identifier;
+
+        // Simple name
+        assert_eq!(quote_identifier("my_table"), "\"my_table\"");
+
+        // Name with double quotes (should be escaped)
+        assert_eq!(quote_identifier("has\"quote"), "\"has\"\"quote\"");
+
+        // Name with multiple double quotes
+        assert_eq!(quote_identifier("a\"b\"c"), "\"a\"\"b\"\"c\"");
+
+        // Empty string
+        assert_eq!(quote_identifier(""), "\"\"");
+
+        // SQL injection attempt
+        assert_eq!(
+            quote_identifier("evil\"; DROP TABLE users; --"),
+            "\"evil\"\"; DROP TABLE users; --\""
+        );
     }
 
     #[tokio::test]
