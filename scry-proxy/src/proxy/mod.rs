@@ -3,6 +3,7 @@ mod connection;
 mod event_batcher;
 mod server;
 mod tcp_pool;
+mod transaction;
 
 pub use cache::{PreparedStatementCache, PreparedStatement, PendingExecution};
 pub use connection::ConnectionHandler;
@@ -10,6 +11,7 @@ pub use event_batcher::EventBatcher;
 pub use server::ProxyServer;
 pub use tcp_pool::{TcpConnectionPool, PoolStatus};
 pub(crate) use tcp_pool::PooledConnection;
+pub use transaction::{TransactionState, TransactionTracker};
 
 use crate::config::Config;
 use crate::observability::ProxyMetrics;
