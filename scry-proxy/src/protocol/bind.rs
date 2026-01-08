@@ -128,8 +128,7 @@ fn decode_text_param(data: &[u8], oid: u32) -> ParamValue {
         }
         oid::BYTEA => {
             // Text format bytea is hex encoded with \x prefix
-            if text.starts_with("\\x") {
-                let hex = &text[2..];
+            if let Some(hex) = text.strip_prefix("\\x") {
                 let bytes: Result<Vec<u8>, _> = (0..hex.len())
                     .step_by(2)
                     .map(|i| u8::from_str_radix(&hex[i..i + 2], 16))

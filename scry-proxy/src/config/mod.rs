@@ -370,12 +370,10 @@ mod tests {
     #[test]
     fn test_pooling_strategy_variants() {
         // Verify all pooling strategy variants exist and are distinct
-        let strategies = vec![
-            PoolingStrategy::Disabled,
+        let strategies = [PoolingStrategy::Disabled,
             PoolingStrategy::Session,
             PoolingStrategy::Transaction,
-            PoolingStrategy::Hybrid,
-        ];
+            PoolingStrategy::Hybrid];
         assert_eq!(strategies.len(), 4);
         assert_ne!(PoolingStrategy::Disabled, PoolingStrategy::Session);
         assert_ne!(PoolingStrategy::Session, PoolingStrategy::Transaction);

@@ -219,7 +219,8 @@ mod tests {
         // Verify structure
         assert_eq!(response.0.status, super::super::health::HealthStatus::Healthy);
         assert!(response.0.warnings.is_empty());
-        assert!(response.0.uptime_seconds >= 0);
+        // uptime_seconds is u64, just verify it exists (always >= 0)
+        let _ = response.0.uptime_seconds;
         assert!(!response.0.version.is_empty());
     }
 
@@ -273,7 +274,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_metrics_endpoint() {
-        use axum::body::Body;
+        
         use http_body_util::BodyExt;
 
         let metrics = Arc::new(ProxyMetrics::new(100, HealthConfig::default()));

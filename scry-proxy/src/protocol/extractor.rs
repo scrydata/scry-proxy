@@ -500,7 +500,7 @@ mod tests {
 
     #[test]
     fn test_extract_simple_query() {
-        let mut extractor = MessageExtractor::new();
+        let extractor = MessageExtractor::new();
 
         // Construct a Query message: 'Q' + length + "SELECT 1" + null
         let query = b"SELECT 1";
@@ -540,7 +540,7 @@ mod tests {
 
     #[test]
     fn test_incomplete_message() {
-        let mut extractor = MessageExtractor::new();
+        let extractor = MessageExtractor::new();
 
         // Incomplete message (just type byte)
         let msg = vec![MSG_QUERY];

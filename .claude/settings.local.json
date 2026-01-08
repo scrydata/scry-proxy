@@ -6,7 +6,22 @@
       "Bash(dir:*)",
       "Bash(cargo test:*)",
       "Bash(cargo bench:*)",
-      "Bash(just test:*)"
+      "Bash(just test:*)",
+      "Skill(superpowers:brainstorming)",
+      "Bash(mkdir:*)",
+      "Bash(git add:*)",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\ndocs: add transaction pooling design for PgBouncer replacement\n\nDesign covers:\n- Transaction mode \\(strict, PgBouncer-compatible\\)\n- Hybrid mode \\(smart pinning, default\\)\n- Transparent prepared statement re-preparation\n- PgBouncer INI and env var compatibility\n- Comprehensive test matrix for all edge cases\nEOF\n\\)\")",
+      "Skill(superpowers:writing-plans)",
+      "Skill(superpowers:subagent-driven-development)",
+      "Bash(git rev-parse:*)",
+      "Bash(git commit:*)",
+      "Bash(cargo clippy:*)",
+      "Bash(docker info:*)",
+      "Skill(superpowers:using-superpowers)",
+      "Skill(superpowers:test-driven-development)",
+      "Skill(superpowers:verification-before-completion)",
+      "Bash(cargo fmt:*)",
+      "Skill(superpowers:systematic-debugging)"
     ],
     "deny": [],
     "ask": []

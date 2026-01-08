@@ -128,20 +128,17 @@ impl Visitor for ValueCollector {
     type Break = ();
 
     fn pre_visit_expr(&mut self, expr: &Expr) -> std::ops::ControlFlow<Self::Break> {
-        match expr {
-            Expr::Value(value) => {
-                let value_str = match value {
-                    Value::Number(n, _) => n.clone(),
-                    Value::SingleQuotedString(s) => s.clone(),
-                    Value::DoubleQuotedString(s) => s.clone(),
-                    Value::Boolean(b) => b.to_string(),
-                    Value::Null => "NULL".to_string(),
-                    _ => return std::ops::ControlFlow::Continue(()),
-                };
-                let fingerprint = self.hash_value(&value_str);
-                self.fingerprints.push(fingerprint);
-            }
-            _ => {}
+        if let Expr::Value(value) = expr {
+            let value_str = match value {
+                Value::Number(n, _) => n.clone(),
+                Value::SingleQuotedString(s) => s.clone(),
+                Value::DoubleQuotedString(s) => s.clone(),
+                Value::Boolean(b) => b.to_string(),
+                Value::Null => "NULL".to_string(),
+                _ => return std::ops::ControlFlow::Continue(()),
+            };
+            let fingerprint = self.hash_value(&value_str);
+            self.fingerprints.push(fingerprint);
         }
         std::ops::ControlFlow::Continue(())
     }
@@ -240,10 +237,11 @@ impl ValueReplacer {
                 sqlparser::ast::FunctionArguments::Subquery(_) => {}
                 sqlparser::ast::FunctionArguments::List(arg_list) => {
                     for arg in &mut arg_list.args {
-                        if let sqlparser::ast::FunctionArg::Unnamed(arg_expr) = arg {
-                            if let sqlparser::ast::FunctionArgExpr::Expr(e) = arg_expr {
-                                self.visit_expr(e);
-                            }
+                        if let sqlparser::ast::FunctionArg::Unnamed(
+                            sqlparser::ast::FunctionArgExpr::Expr(e),
+                        ) = arg
+                        {
+                            self.visit_expr(e);
                         }
                     }
                 }

@@ -12,7 +12,6 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
-use std::hash::{BuildHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Hot data tracker combining Count-Min Sketch and Top-K heap
@@ -151,9 +150,9 @@ impl CountMinSketch {
 
     /// Hash a fingerprint with the i-th hash function
     fn hash(&self, fingerprint: &str, hash_index: usize) -> u64 {
-        let mut hasher = self.hash_builders[hash_index].build_hasher();
-        fingerprint.hash(&mut hasher);
-        hasher.finish()
+        
+        
+        self.hash_builders[hash_index].hash_one(fingerprint)
     }
 }
 
@@ -295,7 +294,7 @@ mod tests {
 
         // Each should have count ~1 (may have collisions but should be close)
         let estimate = sketch.estimate("blake3:fp42");
-        assert!(estimate >= 1 && estimate <= 5, "Estimate should be close to 1");
+        assert!((1..=5).contains(&estimate), "Estimate should be close to 1");
     }
 
     #[test]

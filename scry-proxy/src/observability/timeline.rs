@@ -150,7 +150,7 @@ mod tests {
 
         // Total should be approximately sum of phases
         let sum = queue + pool + backend;
-        let diff = if total > sum { total - sum } else { sum - total };
+        let diff = total.abs_diff(sum);
         assert!(diff.as_millis() < 5, "Total time should approximate sum of phases");
     }
 

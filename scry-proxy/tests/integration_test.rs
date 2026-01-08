@@ -29,6 +29,7 @@ impl TestPublisher {
         self.events.lock().unwrap().len()
     }
 
+    #[allow(dead_code)]
     fn clear(&self) {
         self.events.lock().unwrap().clear();
     }
@@ -389,7 +390,7 @@ async fn test_syntax_error_captured() {
     assert!(error_event.is_some(), "Expected to find error event");
 
     let error_event = error_event.unwrap();
-    assert_eq!(error_event.success, false);
+    assert!(!error_event.success);
     assert!(error_event.error.is_some(), "Expected error message");
 
     let error_msg = error_event.error.as_ref().unwrap();

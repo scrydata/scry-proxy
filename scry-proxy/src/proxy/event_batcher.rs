@@ -68,7 +68,7 @@ impl EventBatcher {
                 // Queue is full - drop the event (ring buffer semantics)
                 let dropped = self.metrics.events_dropped.fetch_add(1, Ordering::Relaxed) + 1;
 
-                if dropped % 100 == 0 {
+                if dropped.is_multiple_of(100) {
                     warn!(
                         dropped_total = dropped,
                         "Event queue full, dropping events (publisher may be slow or down)"

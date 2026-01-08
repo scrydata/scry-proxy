@@ -21,10 +21,12 @@ impl TestPublisher {
         Self { events: Arc::new(Mutex::new(Vec::new())) }
     }
 
+    #[allow(dead_code)]
     fn events(&self) -> Vec<QueryEvent> {
         self.events.lock().unwrap().clone()
     }
 
+    #[allow(dead_code)]
     fn clear(&self) {
         self.events.lock().unwrap().clear();
     }
@@ -400,7 +402,7 @@ async fn test_transaction_isolation_levels() {
         client
             .execute(&format!("SET TRANSACTION ISOLATION LEVEL {}", level), &[])
             .await
-            .expect(&format!("Failed to set isolation level {}", level));
+            .unwrap_or_else(|_| panic!("Failed to set isolation level {}", level));
 
         // Verify we can execute a query in this transaction
         let rows = client.query("SELECT 1", &[]).await.expect("SELECT failed");

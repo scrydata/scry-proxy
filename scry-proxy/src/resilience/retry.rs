@@ -227,7 +227,7 @@ mod tests {
         };
 
         // Backoff progression: 50, 100, 200, 400, 500 (capped)
-        let expected_backoffs = vec![50, 100, 200, 400, 500];
+        let expected_backoffs = [50, 100, 200, 400, 500];
 
         let mut backoff = config.initial_backoff_ms;
         for (i, expected) in expected_backoffs.iter().enumerate() {
