@@ -114,7 +114,9 @@ pub enum PoolingStrategy {
     Disabled,
     /// Session pooling - connection assigned for entire client session
     Session,
-    /// Hybrid pooling - dynamic pinning with automatic state tracking
+    /// Transaction pooling - connection released after each transaction (strict mode)
+    Transaction,
+    /// Hybrid pooling - dynamic pinning with automatic state tracking (default)
     Hybrid,
 }
 
@@ -128,6 +130,12 @@ pub struct PerformanceConfig {
     pub pool_recycle_secs: u64,
     pub pool_aggressive_unpinning: bool,
     pub buffer_size: usize,
+    /// Maximum clients waiting for a connection (0 = unlimited)
+    pub pool_queue_depth: usize,
+    /// Idle timeout before unpinning in hybrid mode (seconds)
+    pub pool_idle_unpin_secs: u64,
+    /// Use LIFO connection selection (true) or FIFO (false)
+    pub pool_lifo: bool,
 }
 
 /// Resilience configuration - circuit breaking, retries, healthchecks
@@ -242,13 +250,16 @@ impl Default for Config {
             },
             performance: PerformanceConfig {
                 target_latency_ms: 1,
-                connection_pooling: PoolingStrategy::Disabled,
+                connection_pooling: PoolingStrategy::Hybrid,
                 pool_size: 100,
                 pool_min_idle: 10,
                 pool_timeout_secs: 30,
                 pool_recycle_secs: 3600,
                 pool_aggressive_unpinning: false,
                 buffer_size: 8192,
+                pool_queue_depth: 50,
+                pool_idle_unpin_secs: 60,
+                pool_lifo: true,
             },
             resilience: ResilienceConfig {
                 circuit_breaker: CircuitBreakerConfig {
@@ -324,5 +335,49 @@ impl Config {
         let loaded: Config = config.try_deserialize()?;
 
         Ok(loaded)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pooling_strategy_default_is_hybrid() {
+        let config = Config::default();
+        assert_eq!(config.performance.connection_pooling, PoolingStrategy::Hybrid);
+    }
+
+    #[test]
+    fn test_pool_queue_depth_default() {
+        let config = Config::default();
+        assert_eq!(config.performance.pool_queue_depth, 50);
+    }
+
+    #[test]
+    fn test_pool_idle_unpin_secs_default() {
+        let config = Config::default();
+        assert_eq!(config.performance.pool_idle_unpin_secs, 60);
+    }
+
+    #[test]
+    fn test_pool_lifo_default() {
+        let config = Config::default();
+        assert!(config.performance.pool_lifo);
+    }
+
+    #[test]
+    fn test_pooling_strategy_variants() {
+        // Verify all pooling strategy variants exist and are distinct
+        let strategies = vec![
+            PoolingStrategy::Disabled,
+            PoolingStrategy::Session,
+            PoolingStrategy::Transaction,
+            PoolingStrategy::Hybrid,
+        ];
+        assert_eq!(strategies.len(), 4);
+        assert_ne!(PoolingStrategy::Disabled, PoolingStrategy::Session);
+        assert_ne!(PoolingStrategy::Session, PoolingStrategy::Transaction);
+        assert_ne!(PoolingStrategy::Transaction, PoolingStrategy::Hybrid);
     }
 }

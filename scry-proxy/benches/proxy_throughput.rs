@@ -75,6 +75,9 @@ fn create_test_config(backend_host: String, backend_port: u16) -> Config {
             metrics_server_address: "127.0.0.1:0".to_string(),
             enable_metrics_server: false,
         },
+        protocol: ProtocolConfig {
+            max_prepared_statements: 1000,
+        },
         publisher: PublisherConfig {
             enabled: true,
             batch_size: 100,
@@ -87,6 +90,7 @@ fn create_test_config(backend_host: String, backend_port: u16) -> Config {
             http_max_retries: 2,
             http_api_key: None,
             http_compression: true,
+            shadow_id: None,
         },
         performance: PerformanceConfig {
             target_latency_ms: 1,
@@ -97,6 +101,9 @@ fn create_test_config(backend_host: String, backend_port: u16) -> Config {
             pool_recycle_secs: 3600,
             pool_aggressive_unpinning: false,
             buffer_size: 8192,
+            pool_queue_depth: 50,
+            pool_idle_unpin_secs: 60,
+            pool_lifo: true,
         },
         resilience: ResilienceConfig {
             circuit_breaker: CircuitBreakerConfig {
