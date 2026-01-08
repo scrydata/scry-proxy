@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+pub mod pgbouncer;
+pub use pgbouncer::PgBouncerConfig;
+
 /// Supported database protocols
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
