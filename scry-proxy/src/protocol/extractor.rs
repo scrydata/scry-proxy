@@ -447,6 +447,48 @@ impl MessageExtractor {
         }
         String::from_utf8(data[start..end].to_vec()).ok()
     }
+
+    /// Extract ReadyForQuery status from backend response stream
+    ///
+    /// Scans through the message stream looking for ReadyForQuery ('Z') message
+    /// and returns the transaction status byte: 'I' (idle), 'T' (in transaction), 'E' (error)
+    ///
+    /// This is a streaming scan - no buffering required.
+    pub fn extract_ready_for_query(&self, data: &[u8]) -> Option<u8> {
+        let mut offset = 0;
+
+        while offset + 5 <= data.len() {
+            let msg_type = data[offset];
+
+            if msg_type == MSG_READY_FOR_QUERY {
+                // ReadyForQuery is always 6 bytes: type(1) + length(4) + status(1)
+                // Length is always 5 (includes itself but not type byte)
+                if offset + 6 <= data.len() {
+                    let status = data[offset + 5];
+                    return Some(status);
+                }
+            }
+
+            // Skip to next message
+            if offset + 5 <= data.len() {
+                let length = i32::from_be_bytes([
+                    data[offset + 1],
+                    data[offset + 2],
+                    data[offset + 3],
+                    data[offset + 4],
+                ]) as usize;
+
+                if length < 4 || offset + 1 + length > data.len() {
+                    break; // Invalid or incomplete message
+                }
+                offset += 1 + length;
+            } else {
+                break;
+            }
+        }
+
+        None
+    }
 }
 
 impl Default for MessageExtractor {
@@ -669,5 +711,62 @@ mod tests {
         } else {
             panic!("Expected Bind message");
         }
+    }
+
+    #[test]
+    fn test_extract_ready_for_query_idle() {
+        let extractor = MessageExtractor::new();
+        // ReadyForQuery: 'Z' + length(5) + status('I')
+        let msg = vec![MSG_READY_FOR_QUERY, 0, 0, 0, 5, b'I'];
+
+        let result = extractor.extract_ready_for_query(&msg);
+        assert_eq!(result, Some(b'I'));
+    }
+
+    #[test]
+    fn test_extract_ready_for_query_in_transaction() {
+        let extractor = MessageExtractor::new();
+        let msg = vec![MSG_READY_FOR_QUERY, 0, 0, 0, 5, b'T'];
+
+        let result = extractor.extract_ready_for_query(&msg);
+        assert_eq!(result, Some(b'T'));
+    }
+
+    #[test]
+    fn test_extract_ready_for_query_error() {
+        let extractor = MessageExtractor::new();
+        let msg = vec![MSG_READY_FOR_QUERY, 0, 0, 0, 5, b'E'];
+
+        let result = extractor.extract_ready_for_query(&msg);
+        assert_eq!(result, Some(b'E'));
+    }
+
+    #[test]
+    fn test_extract_ready_for_query_in_stream() {
+        let extractor = MessageExtractor::new();
+        // DataRow + CommandComplete + ReadyForQuery
+        let mut msg = vec![];
+        // DataRow: 'D' + length + data
+        msg.extend_from_slice(&[MSG_DATA_ROW, 0, 0, 0, 11]);
+        msg.extend_from_slice(&[0, 1, 0, 0, 0, 1, b'1']); // 1 column, value "1"
+        // CommandComplete: 'C' + length + "SELECT 1\0"
+        msg.extend_from_slice(&[MSG_COMMAND_COMPLETE, 0, 0, 0, 13]);
+        msg.extend_from_slice(b"SELECT 1\0");
+        // ReadyForQuery
+        msg.extend_from_slice(&[MSG_READY_FOR_QUERY, 0, 0, 0, 5, b'I']);
+
+        let result = extractor.extract_ready_for_query(&msg);
+        assert_eq!(result, Some(b'I'));
+    }
+
+    #[test]
+    fn test_no_ready_for_query() {
+        let extractor = MessageExtractor::new();
+        // Just a DataRow, no ReadyForQuery
+        let mut msg = vec![MSG_DATA_ROW, 0, 0, 0, 11];
+        msg.extend_from_slice(&[0, 1, 0, 0, 0, 1, b'1']);
+
+        let result = extractor.extract_ready_for_query(&msg);
+        assert_eq!(result, None);
     }
 }
