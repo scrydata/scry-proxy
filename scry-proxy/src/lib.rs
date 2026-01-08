@@ -5,3 +5,4 @@ pub mod protocol;
 pub mod proxy;
 pub mod publisher;
 pub mod resilience;
+pub mod tls;
