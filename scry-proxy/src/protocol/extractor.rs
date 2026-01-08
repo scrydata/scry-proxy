@@ -453,9 +453,14 @@ impl MessageExtractor {
     /// Scans through the message stream looking for ReadyForQuery ('Z') message
     /// and returns the transaction status byte: 'I' (idle), 'T' (in transaction), 'E' (error)
     ///
+    /// For pipelined commands, a single buffer may contain multiple ReadyForQuery messages.
+    /// This function returns the LAST ReadyForQuery status, which represents the final
+    /// transaction state after all commands in the pipeline have completed.
+    ///
     /// This is a streaming scan - no buffering required.
     pub fn extract_ready_for_query(&self, data: &[u8]) -> Option<u8> {
         let mut offset = 0;
+        let mut last_status: Option<u8> = None;
 
         while offset + 5 <= data.len() {
             let msg_type = data[offset];
@@ -464,8 +469,7 @@ impl MessageExtractor {
                 // ReadyForQuery is always 6 bytes: type(1) + length(4) + status(1)
                 // Length is always 5 (includes itself but not type byte)
                 if offset + 6 <= data.len() {
-                    let status = data[offset + 5];
-                    return Some(status);
+                    last_status = Some(data[offset + 5]);
                 }
             }
 
@@ -487,7 +491,7 @@ impl MessageExtractor {
             }
         }
 
-        None
+        last_status
     }
 }
 
@@ -768,5 +772,44 @@ mod tests {
 
         let result = extractor.extract_ready_for_query(&msg);
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_extract_ready_for_query_pipelined_returns_last() {
+        let extractor = MessageExtractor::new();
+        // Simulate pipelined response: BEGIN (T) + COMMIT (I)
+        // First: ReadyForQuery with T (in transaction)
+        // Second: ReadyForQuery with I (idle - after commit)
+        let mut msg = vec![];
+        // CommandComplete: BEGIN
+        msg.extend_from_slice(&[MSG_COMMAND_COMPLETE, 0, 0, 0, 10]);
+        msg.extend_from_slice(b"BEGIN\0");
+        // ReadyForQuery: T (in transaction)
+        msg.extend_from_slice(&[MSG_READY_FOR_QUERY, 0, 0, 0, 5, b'T']);
+        // CommandComplete: COMMIT
+        msg.extend_from_slice(&[MSG_COMMAND_COMPLETE, 0, 0, 0, 11]);
+        msg.extend_from_slice(b"COMMIT\0");
+        // ReadyForQuery: I (idle - final state)
+        msg.extend_from_slice(&[MSG_READY_FOR_QUERY, 0, 0, 0, 5, b'I']);
+
+        let result = extractor.extract_ready_for_query(&msg);
+        // Should return 'I' (the LAST ReadyForQuery), not 'T' (the first)
+        assert_eq!(result, Some(b'I'));
+    }
+
+    #[test]
+    fn test_extract_ready_for_query_multiple_in_error() {
+        let extractor = MessageExtractor::new();
+        // Simulate: command fails in transaction -> error state
+        let mut msg = vec![];
+        // ReadyForQuery: T (in transaction before error)
+        msg.extend_from_slice(&[MSG_READY_FOR_QUERY, 0, 0, 0, 5, b'T']);
+        // Some ErrorResponse would be here in real data
+        // ReadyForQuery: E (in error state - final)
+        msg.extend_from_slice(&[MSG_READY_FOR_QUERY, 0, 0, 0, 5, b'E']);
+
+        let result = extractor.extract_ready_for_query(&msg);
+        // Should return 'E' (the LAST), not 'T'
+        assert_eq!(result, Some(b'E'));
     }
 }

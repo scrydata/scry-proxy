@@ -177,6 +177,15 @@ impl ConnectionHandler {
                                         });
 
                                         // Track prepared statement in connection state (for pinning)
+                                        //
+                                        // KNOWN LIMITATION: State tracking happens before backend confirmation.
+                                        // If Parse fails at the backend, we'll incorrectly think we have a prepared
+                                        // statement that doesn't exist. This is safe but suboptimal - the connection
+                                        // stays pinned when it doesn't need to be. The prepared statement will be
+                                        // re-prepared on the next attempt, and the phantom entry doesn't cause issues.
+                                        // A full fix would require tracking "pending" state changes and only applying
+                                        // them when ParseComplete is received, but the complexity isn't justified
+                                        // given the minimal practical impact.
                                         conn_state.add_prepared_statement(
                                             name.clone(),
                                             query.clone(),
@@ -230,6 +239,15 @@ impl ConnectionHandler {
                                         });
 
                                         // Update connection state based on detected command
+                                        //
+                                        // KNOWN LIMITATION: State tracking happens before backend confirmation.
+                                        // If a SET/CREATE TEMP TABLE/etc. command fails at the backend, we'll
+                                        // incorrectly track state that doesn't exist. This results in conservative
+                                        // behavior - the connection stays pinned when it might not need to be.
+                                        // This is safe (no data corruption or incorrect behavior) but suboptimal.
+                                        // A full fix would require tracking "pending" state and only applying
+                                        // changes on CommandComplete, discarding on ErrorResponse. Given the
+                                        // minimal practical impact, we accept this limitation.
                                         Self::update_connection_state(&mut conn_state, query);
                                     }
                                     Message::Close { kind, ref name } => {
