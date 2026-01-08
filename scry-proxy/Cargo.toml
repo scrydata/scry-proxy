@@ -71,6 +71,12 @@ tower-http = { workspace = true }
 ahash = { workspace = true }
 indexmap = "2.7"
 
+# TLS support
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+webpki-roots = { workspace = true }
+
 [dev-dependencies]
 # Integration testing
 testcontainers = { workspace = true }
