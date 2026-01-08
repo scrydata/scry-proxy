@@ -740,15 +740,24 @@ async fn test_transaction_mode_rejects_set_outside_transaction() {
 
     // Verify the error message indicates the restriction
     if let Err(e) = result {
-        let error_msg = e.to_string().to_lowercase();
-        assert!(
-            error_msg.contains("transaction")
-                || error_msg.contains("not supported")
-                || error_msg.contains("not allowed")
-                || error_msg.contains("pooling"),
-            "Error should mention transaction pooling restriction, got: {}",
-            e
-        );
+        // Use as_db_error() to get the actual database error message
+        // tokio_postgres::Error::to_string() may not include the full message
+        if let Some(db_err) = e.as_db_error() {
+            let error_msg = db_err.message().to_lowercase();
+            assert!(
+                error_msg.contains("transaction")
+                    || error_msg.contains("not supported")
+                    || error_msg.contains("not allowed")
+                    || error_msg.contains("pooling"),
+                "Error should mention transaction pooling restriction, got: {}",
+                db_err.message()
+            );
+        } else {
+            panic!(
+                "Expected a database error (DbError) but got a different error type: {}",
+                e
+            );
+        }
     }
 }
 
