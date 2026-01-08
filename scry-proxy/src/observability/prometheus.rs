@@ -12,14 +12,13 @@
 /// scry_query_latency_seconds_sum 15.234
 /// scry_query_latency_seconds_count 1000
 /// ```
-
 use super::metrics::ProxyMetrics;
 use std::fmt::Write;
 use std::sync::atomic::Ordering;
 
 /// Export all metrics in Prometheus text format
 pub fn export_metrics(metrics: &ProxyMetrics) -> String {
-    let mut output = String::with_capacity(4096);
+    let mut output = String::with_capacity(8192);
 
     // Export query counters
     export_query_counters(&mut output, metrics);
@@ -32,6 +31,9 @@ pub fn export_metrics(metrics: &ProxyMetrics) -> String {
 
     // Export pool metrics
     export_pool_metrics(&mut output, metrics);
+
+    // Export pooling metrics (transaction pooling)
+    export_pooling_metrics(&mut output, metrics);
 
     // Export active connections
     export_connection_metrics(&mut output, metrics);
@@ -51,29 +53,17 @@ fn export_query_counters(output: &mut String, metrics: &ProxyMetrics) {
     let errors = query_metrics.total_errors.load(Ordering::Relaxed);
 
     // Total queries
-    writeln!(
-        output,
-        "# HELP scry_queries_total Total number of queries processed"
-    )
-    .unwrap();
+    writeln!(output, "# HELP scry_queries_total Total number of queries processed").unwrap();
     writeln!(output, "# TYPE scry_queries_total counter").unwrap();
     writeln!(output, "scry_queries_total {}", total).unwrap();
 
     // Total errors
-    writeln!(
-        output,
-        "# HELP scry_query_errors_total Total number of query errors"
-    )
-    .unwrap();
+    writeln!(output, "# HELP scry_query_errors_total Total number of query errors").unwrap();
     writeln!(output, "# TYPE scry_query_errors_total counter").unwrap();
     writeln!(output, "scry_query_errors_total {}", errors).unwrap();
 
     // Error rate
-    let error_rate = if total > 0 {
-        errors as f64 / total as f64
-    } else {
-        0.0
-    };
+    let error_rate = if total > 0 { errors as f64 / total as f64 } else { 0.0 };
     writeln!(output, "# HELP scry_query_error_rate Query error rate").unwrap();
     writeln!(output, "# TYPE scry_query_error_rate gauge").unwrap();
     writeln!(output, "scry_query_error_rate {:.6}", error_rate).unwrap();
@@ -83,11 +73,7 @@ fn export_latency_metrics(output: &mut String, metrics: &ProxyMetrics) {
     let query_metrics = metrics.query_metrics();
     let percentiles = query_metrics.get_latency_percentiles();
 
-    writeln!(
-        output,
-        "# HELP scry_query_latency_seconds Query latency in seconds"
-    )
-    .unwrap();
+    writeln!(output, "# HELP scry_query_latency_seconds Query latency in seconds").unwrap();
     writeln!(output, "# TYPE scry_query_latency_seconds summary").unwrap();
 
     // Export quantiles
@@ -149,20 +135,13 @@ fn export_timeline_metrics(output: &mut String, metrics: &ProxyMetrics) {
         "# HELP scry_query_pool_acquire_seconds Time spent acquiring connection from pool"
     )
     .unwrap();
-    writeln!(
-        output,
-        "# TYPE scry_query_pool_acquire_seconds summary"
-    )
-    .unwrap();
+    writeln!(output, "# TYPE scry_query_pool_acquire_seconds summary").unwrap();
     export_quantiles(output, "scry_query_pool_acquire_seconds", &pool_percentiles);
 
     // Backend execution time
     let backend_percentiles = query_metrics.get_backend_percentiles();
-    writeln!(
-        output,
-        "# HELP scry_query_backend_seconds Time spent executing on backend database"
-    )
-    .unwrap();
+    writeln!(output, "# HELP scry_query_backend_seconds Time spent executing on backend database")
+        .unwrap();
     writeln!(output, "# TYPE scry_query_backend_seconds summary").unwrap();
     export_quantiles(output, "scry_query_backend_seconds", &backend_percentiles);
 }
@@ -171,55 +150,128 @@ fn export_pool_metrics(output: &mut String, metrics: &ProxyMetrics) {
     let pool_status = metrics.pool_metrics().get_status();
 
     // Pool size
-    writeln!(
-        output,
-        "# HELP scry_pool_connections_total Current pool size (total connections)"
-    )
-    .unwrap();
+    writeln!(output, "# HELP scry_pool_connections_total Current pool size (total connections)")
+        .unwrap();
     writeln!(output, "# TYPE scry_pool_connections_total gauge").unwrap();
     writeln!(output, "scry_pool_connections_total {}", pool_status.size).unwrap();
 
     // Available connections
-    writeln!(
-        output,
-        "# HELP scry_pool_connections_available Available connections in pool"
-    )
-    .unwrap();
+    writeln!(output, "# HELP scry_pool_connections_available Available connections in pool")
+        .unwrap();
     writeln!(output, "# TYPE scry_pool_connections_available gauge").unwrap();
-    writeln!(
-        output,
-        "scry_pool_connections_available {}",
-        pool_status.available
-    )
-    .unwrap();
+    writeln!(output, "scry_pool_connections_available {}", pool_status.available).unwrap();
 
     // Max pool size
-    writeln!(
-        output,
-        "# HELP scry_pool_connections_max Maximum pool size"
-    )
-    .unwrap();
+    writeln!(output, "# HELP scry_pool_connections_max Maximum pool size").unwrap();
     writeln!(output, "# TYPE scry_pool_connections_max gauge").unwrap();
     writeln!(output, "scry_pool_connections_max {}", pool_status.max_size).unwrap();
 
     // Pool utilization
-    writeln!(
-        output,
-        "# HELP scry_pool_utilization Pool utilization (0.0 to 1.0)"
-    )
-    .unwrap();
+    writeln!(output, "# HELP scry_pool_utilization Pool utilization (0.0 to 1.0)").unwrap();
     writeln!(output, "# TYPE scry_pool_utilization gauge").unwrap();
     writeln!(output, "scry_pool_utilization {:.4}", pool_status.utilization()).unwrap();
+}
+
+fn export_pooling_metrics(output: &mut String, metrics: &ProxyMetrics) {
+    let pool_metrics = metrics.pool_metrics();
+
+    // Pinned connections gauge
+    writeln!(output, "# HELP scry_pool_connections_pinned Number of connections currently pinned")
+        .unwrap();
+    writeln!(output, "# TYPE scry_pool_connections_pinned gauge").unwrap();
+    writeln!(output, "scry_pool_connections_pinned {}", pool_metrics.get_pinned_count()).unwrap();
+
+    // Pin reason counters
+    let pin_counts = pool_metrics.get_pin_reason_counts();
+    writeln!(output, "# HELP scry_pool_pin_reason_total Pin events by reason").unwrap();
+    writeln!(output, "# TYPE scry_pool_pin_reason_total counter").unwrap();
+    writeln!(
+        output,
+        "scry_pool_pin_reason_total{{reason=\"prepared_statement\"}} {}",
+        pin_counts.prepared_statement
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "scry_pool_pin_reason_total{{reason=\"session_variable\"}} {}",
+        pin_counts.session_variable
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "scry_pool_pin_reason_total{{reason=\"temp_table\"}} {}",
+        pin_counts.temp_table
+    )
+    .unwrap();
+    writeln!(output, "scry_pool_pin_reason_total{{reason=\"cursor\"}} {}", pin_counts.cursor)
+        .unwrap();
+    writeln!(
+        output,
+        "scry_pool_pin_reason_total{{reason=\"advisory_lock\"}} {}",
+        pin_counts.advisory_lock
+    )
+    .unwrap();
+
+    // Queue depth gauge
+    writeln!(output, "# HELP scry_pool_queue_depth Current wait queue depth").unwrap();
+    writeln!(output, "# TYPE scry_pool_queue_depth gauge").unwrap();
+    writeln!(output, "scry_pool_queue_depth {}", pool_metrics.get_queue_depth()).unwrap();
+
+    // Queue rejected counter
+    writeln!(
+        output,
+        "# HELP scry_pool_queue_rejected_total Total requests rejected due to full queue"
+    )
+    .unwrap();
+    writeln!(output, "# TYPE scry_pool_queue_rejected_total counter").unwrap();
+    writeln!(output, "scry_pool_queue_rejected_total {}", pool_metrics.get_queue_rejected_total())
+        .unwrap();
+
+    // Wait time histogram (as summary with quantiles)
+    let wait_percentiles = pool_metrics.get_wait_percentiles();
+    let wait_count = pool_metrics.get_wait_count();
+    writeln!(output, "# HELP scry_pool_wait_seconds Time spent waiting for connection").unwrap();
+    writeln!(output, "# TYPE scry_pool_wait_seconds summary").unwrap();
+    writeln!(
+        output,
+        "scry_pool_wait_seconds{{quantile=\"0.5\"}} {:.9}",
+        wait_percentiles.p50_micros as f64 / 1_000_000.0
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "scry_pool_wait_seconds{{quantile=\"0.9\"}} {:.9}",
+        wait_percentiles.p90_micros as f64 / 1_000_000.0
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "scry_pool_wait_seconds{{quantile=\"0.95\"}} {:.9}",
+        wait_percentiles.p95_micros as f64 / 1_000_000.0
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "scry_pool_wait_seconds{{quantile=\"0.99\"}} {:.9}",
+        wait_percentiles.p99_micros as f64 / 1_000_000.0
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "scry_pool_wait_seconds{{quantile=\"0.999\"}} {:.9}",
+        wait_percentiles.p999_micros as f64 / 1_000_000.0
+    )
+    .unwrap();
+    let sum_seconds = wait_percentiles.mean_micros / 1_000_000.0 * wait_count as f64;
+    writeln!(output, "scry_pool_wait_seconds_sum {:.9}", sum_seconds).unwrap();
+    writeln!(output, "scry_pool_wait_seconds_count {}", wait_count).unwrap();
 }
 
 fn export_connection_metrics(output: &mut String, metrics: &ProxyMetrics) {
     let active = metrics.get_active_connections();
 
-    writeln!(
-        output,
-        "# HELP scry_active_connections Current number of active client connections"
-    )
-    .unwrap();
+    writeln!(output, "# HELP scry_active_connections Current number of active client connections")
+        .unwrap();
     writeln!(output, "# TYPE scry_active_connections gauge").unwrap();
     writeln!(output, "scry_active_connections {}", active).unwrap();
 }
@@ -397,7 +449,9 @@ mod tests {
         // Check for Prometheus format conventions
         assert!(output.contains("# HELP"));
         assert!(output.contains("# TYPE"));
-        assert!(output.contains("counter") || output.contains("gauge") || output.contains("summary"));
+        assert!(
+            output.contains("counter") || output.contains("gauge") || output.contains("summary")
+        );
 
         // Check for valid quantile labels
         assert!(output.contains("quantile=\"0.5\""));
@@ -416,5 +470,102 @@ mod tests {
         assert!(output.contains("scry_pool_connections_available 5"));
         assert!(output.contains("scry_pool_connections_max 10"));
         assert!(output.contains("scry_pool_utilization 0.5"));
+    }
+
+    #[test]
+    fn test_pooling_metrics_export_pinned() {
+        let metrics = ProxyMetrics::new(100, HealthConfig::default());
+
+        metrics.pool_metrics().set_pinned_count(5);
+
+        let output = export_metrics(&metrics);
+
+        assert!(output.contains("# HELP scry_pool_connections_pinned"));
+        assert!(output.contains("# TYPE scry_pool_connections_pinned gauge"));
+        assert!(output.contains("scry_pool_connections_pinned 5"));
+    }
+
+    #[test]
+    fn test_pooling_metrics_export_pin_reasons() {
+        use crate::proxy::PinReason;
+
+        let metrics = ProxyMetrics::new(100, HealthConfig::default());
+
+        metrics.pool_metrics().record_pin(PinReason::PreparedStatement);
+        metrics.pool_metrics().record_pin(PinReason::PreparedStatement);
+        metrics.pool_metrics().record_pin(PinReason::SessionVariable);
+        metrics.pool_metrics().record_pin(PinReason::TempTable);
+        metrics.pool_metrics().record_pin(PinReason::Cursor);
+        metrics.pool_metrics().record_pin(PinReason::AdvisoryLock);
+
+        let output = export_metrics(&metrics);
+
+        assert!(output.contains("# HELP scry_pool_pin_reason_total"));
+        assert!(output.contains("# TYPE scry_pool_pin_reason_total counter"));
+        assert!(output.contains("scry_pool_pin_reason_total{reason=\"prepared_statement\"} 2"));
+        assert!(output.contains("scry_pool_pin_reason_total{reason=\"session_variable\"} 1"));
+        assert!(output.contains("scry_pool_pin_reason_total{reason=\"temp_table\"} 1"));
+        assert!(output.contains("scry_pool_pin_reason_total{reason=\"cursor\"} 1"));
+        assert!(output.contains("scry_pool_pin_reason_total{reason=\"advisory_lock\"} 1"));
+    }
+
+    #[test]
+    fn test_pooling_metrics_export_queue_depth() {
+        let metrics = ProxyMetrics::new(100, HealthConfig::default());
+
+        metrics.pool_metrics().set_queue_depth(10);
+
+        let output = export_metrics(&metrics);
+
+        assert!(output.contains("# HELP scry_pool_queue_depth"));
+        assert!(output.contains("# TYPE scry_pool_queue_depth gauge"));
+        assert!(output.contains("scry_pool_queue_depth 10"));
+    }
+
+    #[test]
+    fn test_pooling_metrics_export_queue_rejected() {
+        let metrics = ProxyMetrics::new(100, HealthConfig::default());
+
+        metrics.pool_metrics().record_queue_rejected();
+        metrics.pool_metrics().record_queue_rejected();
+        metrics.pool_metrics().record_queue_rejected();
+
+        let output = export_metrics(&metrics);
+
+        assert!(output.contains("# HELP scry_pool_queue_rejected_total"));
+        assert!(output.contains("# TYPE scry_pool_queue_rejected_total counter"));
+        assert!(output.contains("scry_pool_queue_rejected_total 3"));
+    }
+
+    #[test]
+    fn test_pooling_metrics_export_wait_seconds() {
+        let metrics = ProxyMetrics::new(100, HealthConfig::default());
+
+        // Record some wait times (100us, 200us, 300us)
+        metrics.pool_metrics().record_queue_wait(std::time::Duration::from_micros(100));
+        metrics.pool_metrics().record_queue_wait(std::time::Duration::from_micros(200));
+        metrics.pool_metrics().record_queue_wait(std::time::Duration::from_micros(300));
+
+        let output = export_metrics(&metrics);
+
+        assert!(output.contains("# HELP scry_pool_wait_seconds"));
+        assert!(output.contains("# TYPE scry_pool_wait_seconds summary"));
+        assert!(output.contains("scry_pool_wait_seconds{quantile=\"0.5\"}"));
+        assert!(output.contains("scry_pool_wait_seconds{quantile=\"0.99\"}"));
+        assert!(output.contains("scry_pool_wait_seconds_count 3"));
+    }
+
+    #[test]
+    fn test_pooling_metrics_export_empty() {
+        let metrics = ProxyMetrics::new(100, HealthConfig::default());
+
+        let output = export_metrics(&metrics);
+
+        // All new pooling metrics should be present even when empty
+        assert!(output.contains("scry_pool_connections_pinned 0"));
+        assert!(output.contains("scry_pool_pin_reason_total{reason=\"prepared_statement\"} 0"));
+        assert!(output.contains("scry_pool_queue_depth 0"));
+        assert!(output.contains("scry_pool_queue_rejected_total 0"));
+        assert!(output.contains("scry_pool_wait_seconds_count 0"));
     }
 }

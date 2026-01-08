@@ -9,7 +9,9 @@ pub mod timeline;
 // Re-exports for convenience
 pub use health::{HealthConfig, HealthMonitor, HealthSnapshot, HealthStatus, HealthWarning};
 pub use hot_data::{HotDataEntry, HotDataTracker};
-pub use metrics::{LatencyPercentiles, LatencyPercentilesMs, PoolStatus, ProxyMetrics};
+pub use metrics::{
+    LatencyPercentiles, LatencyPercentilesMs, PinReasonCounts, PoolStatus, ProxyMetrics,
+};
 pub use metrics_server::MetricsServer;
 pub use timeline::{QueryTimeline, TimelinePhases};
 
@@ -44,9 +46,7 @@ pub fn init(config: &ObservabilityConfig) -> Result<()> {
             let tracer = opentelemetry_otlp::new_pipeline()
                 .tracing()
                 .with_exporter(
-                    opentelemetry_otlp::new_exporter()
-                        .tonic()
-                        .with_endpoint(otlp_endpoint),
+                    opentelemetry_otlp::new_exporter().tonic().with_endpoint(otlp_endpoint),
                 )
                 .with_trace_config(sdktrace::config().with_resource(Resource::new(vec![
                     KeyValue::new("service.name", config.service_name.clone()),
@@ -62,15 +62,11 @@ pub fn init(config: &ObservabilityConfig) -> Result<()> {
                 .init();
         } else {
             // No OTLP endpoint configured, use default tracing only
-            registry
-                .with(tracing_subscriber::fmt::layer().with_target(true))
-                .init();
+            registry.with(tracing_subscriber::fmt::layer().with_target(true)).init();
         }
     } else {
         // Tracing disabled, use basic logging only
-        registry
-            .with(tracing_subscriber::fmt::layer().with_target(true))
-            .init();
+        registry.with(tracing_subscriber::fmt::layer().with_target(true)).init();
     }
 
     tracing::info!("Observability initialized");

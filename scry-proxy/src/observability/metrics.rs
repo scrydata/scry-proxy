@@ -10,7 +10,6 @@
 /// - <300ns overhead per query
 /// - ~150KB memory footprint
 /// - Lock-free counters, read-write locks only for histograms
-
 use super::health::{HealthConfig, HealthMonitor, HealthSnapshot};
 use super::hot_data::HotDataTracker;
 use super::timeline::{QueryTimeline, TimelinePhases};
@@ -164,10 +163,7 @@ impl ProxyMetrics {
 
     /// Get circuit breaker metrics if circuit breaker is enabled
     pub fn circuit_breaker_metrics(&self) -> Option<crate::resilience::CircuitBreakerMetrics> {
-        self.circuit_breaker
-            .read()
-            .as_ref()
-            .map(|cb| cb.get_metrics())
+        self.circuit_breaker.read().as_ref().map(|cb| cb.get_metrics())
     }
 }
 
@@ -295,11 +291,29 @@ impl QueryMetrics {
     }
 }
 
-/// Pool metrics
+/// Pool metrics including transaction pooling metrics
 pub struct PoolMetrics {
+    // Existing fields
     size: AtomicUsize,
     available: AtomicUsize,
     max_size: AtomicUsize,
+
+    // New pooling metrics - gauges
+    pinned: AtomicUsize,
+    queue_depth: AtomicUsize,
+
+    // New pooling metrics - counters
+    queue_rejected_total: AtomicU64,
+
+    // Pin reason counters
+    pin_prepared_statement: AtomicU64,
+    pin_session_variable: AtomicU64,
+    pin_temp_table: AtomicU64,
+    pin_cursor: AtomicU64,
+    pin_advisory_lock: AtomicU64,
+
+    // Wait time histogram (microseconds)
+    wait_histogram: RwLock<Histogram<u64>>,
 }
 
 impl PoolMetrics {
@@ -308,6 +322,18 @@ impl PoolMetrics {
             size: AtomicUsize::new(0),
             available: AtomicUsize::new(0),
             max_size: AtomicUsize::new(0),
+            pinned: AtomicUsize::new(0),
+            queue_depth: AtomicUsize::new(0),
+            queue_rejected_total: AtomicU64::new(0),
+            pin_prepared_statement: AtomicU64::new(0),
+            pin_session_variable: AtomicU64::new(0),
+            pin_temp_table: AtomicU64::new(0),
+            pin_cursor: AtomicU64::new(0),
+            pin_advisory_lock: AtomicU64::new(0),
+            // HDR histogram: 3 significant figures, up to 1 hour in microseconds
+            wait_histogram: RwLock::new(
+                Histogram::<u64>::new_with_bounds(1, 3_600_000_000, 3).unwrap(),
+            ),
         }
     }
 
@@ -323,6 +349,96 @@ impl PoolMetrics {
             available: self.available.load(Ordering::Relaxed),
             max_size: self.max_size.load(Ordering::Relaxed),
         }
+    }
+
+    /// Record a connection pin event by reason
+    pub fn record_pin(&self, reason: crate::proxy::PinReason) {
+        use crate::proxy::PinReason;
+        match reason {
+            PinReason::PreparedStatement => {
+                self.pin_prepared_statement.fetch_add(1, Ordering::Relaxed);
+            }
+            PinReason::SessionVariable => {
+                self.pin_session_variable.fetch_add(1, Ordering::Relaxed);
+            }
+            PinReason::TempTable => {
+                self.pin_temp_table.fetch_add(1, Ordering::Relaxed);
+            }
+            PinReason::Cursor => {
+                self.pin_cursor.fetch_add(1, Ordering::Relaxed);
+            }
+            PinReason::AdvisoryLock => {
+                self.pin_advisory_lock.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Set the current number of pinned connections
+    pub fn set_pinned_count(&self, count: usize) {
+        self.pinned.store(count, Ordering::Relaxed);
+    }
+
+    /// Get the current number of pinned connections
+    pub fn get_pinned_count(&self) -> usize {
+        self.pinned.load(Ordering::Relaxed)
+    }
+
+    /// Record time spent waiting for a connection from the pool
+    pub fn record_queue_wait(&self, duration: Duration) {
+        let micros = duration.as_micros() as u64;
+        // Clamp to histogram max to avoid errors
+        let clamped = micros.min(3_600_000_000);
+        let _ = self.wait_histogram.write().record(clamped.max(1));
+    }
+
+    /// Record a queue rejection (request rejected due to full queue)
+    pub fn record_queue_rejected(&self) {
+        self.queue_rejected_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Set the current queue depth
+    pub fn set_queue_depth(&self, depth: usize) {
+        self.queue_depth.store(depth, Ordering::Relaxed);
+    }
+
+    /// Get current queue depth
+    pub fn get_queue_depth(&self) -> usize {
+        self.queue_depth.load(Ordering::Relaxed)
+    }
+
+    /// Get pin reason counts
+    pub fn get_pin_reason_counts(&self) -> PinReasonCounts {
+        PinReasonCounts {
+            prepared_statement: self.pin_prepared_statement.load(Ordering::Relaxed),
+            session_variable: self.pin_session_variable.load(Ordering::Relaxed),
+            temp_table: self.pin_temp_table.load(Ordering::Relaxed),
+            cursor: self.pin_cursor.load(Ordering::Relaxed),
+            advisory_lock: self.pin_advisory_lock.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Get queue rejected total
+    pub fn get_queue_rejected_total(&self) -> u64 {
+        self.queue_rejected_total.load(Ordering::Relaxed)
+    }
+
+    /// Get wait time percentiles
+    pub fn get_wait_percentiles(&self) -> LatencyPercentiles {
+        let hist = self.wait_histogram.read();
+        LatencyPercentiles {
+            p50_micros: hist.value_at_quantile(0.50),
+            p90_micros: hist.value_at_quantile(0.90),
+            p95_micros: hist.value_at_quantile(0.95),
+            p99_micros: hist.value_at_quantile(0.99),
+            p999_micros: hist.value_at_quantile(0.999),
+            max_micros: hist.max(),
+            mean_micros: hist.mean(),
+        }
+    }
+
+    /// Get wait histogram count (total waits recorded)
+    pub fn get_wait_count(&self) -> u64 {
+        self.wait_histogram.read().len()
     }
 }
 
@@ -381,6 +497,16 @@ impl PoolStatus {
             (self.size - self.available) as f64 / self.max_size as f64
         }
     }
+}
+
+/// Pin reason counts for metrics export
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct PinReasonCounts {
+    pub prepared_statement: u64,
+    pub session_variable: u64,
+    pub temp_table: u64,
+    pub cursor: u64,
+    pub advisory_lock: u64,
 }
 
 /// Histogram snapshots for Prometheus export
@@ -506,5 +632,96 @@ mod tests {
         let abc_entry = top_k.iter().find(|e| e.fingerprint == "blake3:abc123");
         assert!(abc_entry.is_some());
         assert!(abc_entry.unwrap().access_count >= 2);
+    }
+
+    #[test]
+    fn test_pool_metrics_pinned_count() {
+        let metrics = ProxyMetrics::new(100, HealthConfig::default());
+
+        // Initially no pinned connections
+        assert_eq!(metrics.pool_metrics().get_pinned_count(), 0);
+
+        // Set pinned count
+        metrics.pool_metrics().set_pinned_count(5);
+        assert_eq!(metrics.pool_metrics().get_pinned_count(), 5);
+
+        // Update pinned count
+        metrics.pool_metrics().set_pinned_count(3);
+        assert_eq!(metrics.pool_metrics().get_pinned_count(), 3);
+    }
+
+    #[test]
+    fn test_pool_metrics_pin_reasons() {
+        use crate::proxy::PinReason;
+
+        let metrics = ProxyMetrics::new(100, HealthConfig::default());
+
+        // Record various pin reasons
+        metrics.pool_metrics().record_pin(PinReason::PreparedStatement);
+        metrics.pool_metrics().record_pin(PinReason::PreparedStatement);
+        metrics.pool_metrics().record_pin(PinReason::SessionVariable);
+        metrics.pool_metrics().record_pin(PinReason::TempTable);
+        metrics.pool_metrics().record_pin(PinReason::Cursor);
+        metrics.pool_metrics().record_pin(PinReason::AdvisoryLock);
+
+        let counts = metrics.pool_metrics().get_pin_reason_counts();
+        assert_eq!(counts.prepared_statement, 2);
+        assert_eq!(counts.session_variable, 1);
+        assert_eq!(counts.temp_table, 1);
+        assert_eq!(counts.cursor, 1);
+        assert_eq!(counts.advisory_lock, 1);
+    }
+
+    #[test]
+    fn test_pool_metrics_queue_depth() {
+        let metrics = ProxyMetrics::new(100, HealthConfig::default());
+
+        assert_eq!(metrics.pool_metrics().get_queue_depth(), 0);
+
+        metrics.pool_metrics().set_queue_depth(10);
+        assert_eq!(metrics.pool_metrics().get_queue_depth(), 10);
+
+        metrics.pool_metrics().set_queue_depth(5);
+        assert_eq!(metrics.pool_metrics().get_queue_depth(), 5);
+    }
+
+    #[test]
+    fn test_pool_metrics_queue_rejected() {
+        let metrics = ProxyMetrics::new(100, HealthConfig::default());
+
+        assert_eq!(metrics.pool_metrics().get_queue_rejected_total(), 0);
+
+        metrics.pool_metrics().record_queue_rejected();
+        metrics.pool_metrics().record_queue_rejected();
+        metrics.pool_metrics().record_queue_rejected();
+
+        assert_eq!(metrics.pool_metrics().get_queue_rejected_total(), 3);
+    }
+
+    #[test]
+    fn test_pool_metrics_queue_wait() {
+        let metrics = ProxyMetrics::new(100, HealthConfig::default());
+
+        // Record some wait times
+        metrics.pool_metrics().record_queue_wait(StdDuration::from_micros(100));
+        metrics.pool_metrics().record_queue_wait(StdDuration::from_micros(200));
+        metrics.pool_metrics().record_queue_wait(StdDuration::from_micros(300));
+
+        let percentiles = metrics.pool_metrics().get_wait_percentiles();
+        assert!(percentiles.p50_micros > 0);
+        assert!(percentiles.max_micros >= 300);
+
+        assert_eq!(metrics.pool_metrics().get_wait_count(), 3);
+    }
+
+    #[test]
+    fn test_pool_metrics_queue_wait_clamps_large_values() {
+        let metrics = ProxyMetrics::new(100, HealthConfig::default());
+
+        // Record an extremely large wait time (should be clamped)
+        metrics.pool_metrics().record_queue_wait(StdDuration::from_secs(5000));
+
+        // Should not panic and should record successfully
+        assert_eq!(metrics.pool_metrics().get_wait_count(), 1);
     }
 }
