@@ -99,10 +99,8 @@ impl CommandDetector {
 
     fn parse_set(sql: &str) -> Option<DetectedCommand> {
         // SET name = value or SET name TO value
-        let rest = sql
-            .strip_prefix("SET")
-            .or_else(|| sql.strip_prefix("set"))?
-            .trim();
+        // We know sql starts with "SET " (case-insensitive) from detect(), so skip 3 chars for "SET"
+        let rest = sql.get(3..)?.trim();
 
         let (name, value) = if let Some(eq_pos) = rest.find('=') {
             let name = rest[..eq_pos].trim().to_lowercase();
@@ -120,10 +118,8 @@ impl CommandDetector {
     }
 
     fn parse_reset(sql: &str) -> Option<DetectedCommand> {
-        let rest = sql
-            .strip_prefix("RESET")
-            .or_else(|| sql.strip_prefix("reset"))?
-            .trim();
+        // We know sql starts with "RESET " (case-insensitive) from detect(), so skip 5 chars for "RESET"
+        let rest = sql.get(5..)?.trim();
 
         if rest.eq_ignore_ascii_case("ALL") {
             Some(DetectedCommand::ResetAll)
@@ -333,6 +329,26 @@ mod tests {
         // This returns DropTable which caller must check against known temps
         assert!(matches!(result, Some(DetectedCommand::DropTable { name })
             if name == "tmp_users"));
+    }
+
+    #[test]
+    fn test_mixed_case_set_and_reset() {
+        // Test mixed-case SET commands
+        let result = CommandDetector::detect("Set timezone = 'UTC'");
+        assert!(matches!(result, Some(DetectedCommand::Set { name, value })
+            if name == "timezone" && value == "UTC"));
+
+        let result = CommandDetector::detect("sEt search_path TO public");
+        assert!(matches!(result, Some(DetectedCommand::Set { name, value })
+            if name == "search_path" && value == "public"));
+
+        // Test mixed-case RESET commands
+        let result = CommandDetector::detect("Reset search_path");
+        assert!(matches!(result, Some(DetectedCommand::Reset { name })
+            if name == "search_path"));
+
+        let result = CommandDetector::detect("rEsEt ALL");
+        assert!(matches!(result, Some(DetectedCommand::ResetAll)));
     }
 
     #[test]
