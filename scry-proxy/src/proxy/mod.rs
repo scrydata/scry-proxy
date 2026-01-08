@@ -1,15 +1,17 @@
 mod cache;
 mod connection;
+mod connection_state;
 mod event_batcher;
 mod server;
 mod tcp_pool;
 mod transaction;
 
-pub use cache::{PreparedStatementCache, PreparedStatement, PendingExecution};
+pub use cache::{PendingExecution, PreparedStatement, PreparedStatementCache};
 pub use connection::ConnectionHandler;
+pub use connection_state::{ConnectionState, PinReason, PreparedStatementInfo, ReplayableState};
 pub use event_batcher::EventBatcher;
 pub use server::ProxyServer;
-pub use tcp_pool::{TcpConnectionPool, PoolStatus};
+pub use tcp_pool::{PoolStatus, TcpConnectionPool};
 pub(crate) use tcp_pool::PooledConnection;
 pub use transaction::{TransactionState, TransactionTracker};
 
