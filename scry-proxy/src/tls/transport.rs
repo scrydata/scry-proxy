@@ -1,0 +1,71 @@
+use pin_project::pin_project;
+use std::io;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::TcpStream;
+use tokio_rustls::server::TlsStream;
+
+/// A client transport that can be either plain TCP or TLS-encrypted
+#[pin_project(project = ClientTransportProj)]
+pub enum ClientTransport {
+    /// Plain unencrypted TCP connection
+    Plain(#[pin] TcpStream),
+    /// TLS-encrypted connection (boxed to reduce enum size variance)
+    Tls(#[pin] Box<TlsStream<TcpStream>>),
+}
+
+impl ClientTransport {
+    /// Check if the transport is encrypted
+    pub fn is_encrypted(&self) -> bool {
+        matches!(self, ClientTransport::Tls(_))
+    }
+
+    /// Get the peer address
+    pub fn peer_addr(&self) -> io::Result<std::net::SocketAddr> {
+        match self {
+            ClientTransport::Plain(stream) => stream.peer_addr(),
+            ClientTransport::Tls(stream) => stream.get_ref().0.peer_addr(),
+        }
+    }
+}
+
+impl AsyncRead for ClientTransport {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.project() {
+            ClientTransportProj::Plain(stream) => stream.poll_read(cx, buf),
+            ClientTransportProj::Tls(stream) => stream.poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for ClientTransport {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.project() {
+            ClientTransportProj::Plain(stream) => stream.poll_write(cx, buf),
+            ClientTransportProj::Tls(stream) => stream.poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.project() {
+            ClientTransportProj::Plain(stream) => stream.poll_flush(cx),
+            ClientTransportProj::Tls(stream) => stream.poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.project() {
+            ClientTransportProj::Plain(stream) => stream.poll_shutdown(cx),
+            ClientTransportProj::Tls(stream) => stream.poll_shutdown(cx),
+        }
+    }
+}
