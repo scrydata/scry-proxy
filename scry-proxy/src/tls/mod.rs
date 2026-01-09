@@ -1,7 +1,9 @@
+mod backend;
 mod config;
 pub mod startup;
 mod transport;
 
+pub use backend::upgrade_backend_to_tls;
 pub use config::{load_client_tls_config, load_server_tls_config, TlsError};
 pub use startup::{handle_ssl_startup, SslStartupResult};
 pub use transport::{BackendTransport, ClientTransport};
