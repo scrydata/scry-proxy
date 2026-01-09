@@ -4,7 +4,7 @@ mod transport;
 
 pub use config::{load_client_tls_config, load_server_tls_config, TlsError};
 pub use startup::{handle_ssl_startup, SslStartupResult};
-pub use transport::ClientTransport;
+pub use transport::{BackendTransport, ClientTransport};
 
 #[cfg(test)]
 mod tests {
@@ -57,5 +57,19 @@ mod tests {
         // Not an SSL request (regular startup)
         let startup: [u8; 8] = [0, 0, 0, 8, 0, 3, 0, 0];
         assert!(!is_ssl_request(&startup));
+    }
+
+    #[tokio::test]
+    async fn test_backend_transport_plain_tcp() {
+        use super::transport::BackendTransport;
+        use tokio::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = TcpStream::connect(addr).await.unwrap();
+        let transport = BackendTransport::Plain(client);
+
+        assert!(!transport.is_encrypted());
     }
 }

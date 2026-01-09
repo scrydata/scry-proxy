@@ -4,6 +4,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
+use tokio_rustls::client::TlsStream as ClientTlsStream;
 use tokio_rustls::server::TlsStream;
 
 /// A client transport that can be either plain TCP or TLS-encrypted
@@ -66,6 +67,71 @@ impl AsyncWrite for ClientTransport {
         match self.project() {
             ClientTransportProj::Plain(stream) => stream.poll_shutdown(cx),
             ClientTransportProj::Tls(stream) => stream.poll_shutdown(cx),
+        }
+    }
+}
+
+/// A backend transport that can be either plain TCP or TLS-encrypted
+/// Used for connections from proxy to PostgreSQL backend
+#[pin_project(project = BackendTransportProj)]
+pub enum BackendTransport {
+    /// Plain unencrypted TCP connection
+    Plain(#[pin] TcpStream),
+    /// TLS-encrypted connection (client-side TLS, boxed to reduce enum size variance)
+    Tls(#[pin] Box<ClientTlsStream<TcpStream>>),
+}
+
+impl BackendTransport {
+    /// Check if the transport is encrypted
+    pub fn is_encrypted(&self) -> bool {
+        matches!(self, BackendTransport::Tls(_))
+    }
+
+    /// Get the peer address
+    pub fn peer_addr(&self) -> io::Result<std::net::SocketAddr> {
+        match self {
+            BackendTransport::Plain(stream) => stream.peer_addr(),
+            BackendTransport::Tls(stream) => stream.get_ref().0.peer_addr(),
+        }
+    }
+}
+
+impl AsyncRead for BackendTransport {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.project() {
+            BackendTransportProj::Plain(stream) => stream.poll_read(cx, buf),
+            BackendTransportProj::Tls(stream) => stream.poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for BackendTransport {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.project() {
+            BackendTransportProj::Plain(stream) => stream.poll_write(cx, buf),
+            BackendTransportProj::Tls(stream) => stream.poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.project() {
+            BackendTransportProj::Plain(stream) => stream.poll_flush(cx),
+            BackendTransportProj::Tls(stream) => stream.poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.project() {
+            BackendTransportProj::Plain(stream) => stream.poll_shutdown(cx),
+            BackendTransportProj::Tls(stream) => stream.poll_shutdown(cx),
         }
     }
 }
