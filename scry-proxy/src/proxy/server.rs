@@ -3,12 +3,14 @@ use crate::config::{Config, PoolingStrategy};
 use crate::observability::ProxyMetrics;
 use crate::protocol::{Protocol, ProtocolConfig, ProtocolRegistry};
 use crate::resilience::{ActiveHealthcheck, CircuitBreaker};
+use crate::tls::{handle_ssl_startup, load_client_tls_config, ClientTransport, SslStartupResult};
 use anyhow::{Context, Result};
+use rustls::ServerConfig;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// The main proxy server that accepts client connections
 pub struct ProxyServer {
@@ -17,6 +19,7 @@ pub struct ProxyServer {
     batcher: Arc<EventBatcher>,
     pool: Option<Arc<TcpConnectionPool>>,
     metrics: Arc<ProxyMetrics>,
+    tls_config: Option<Arc<ServerConfig>>,
 }
 
 impl ProxyServer {
@@ -162,7 +165,27 @@ impl ProxyServer {
             None
         };
 
-        Ok(Self { config: Arc::new(config), listener, batcher: Arc::new(batcher), pool, metrics })
+        // Load TLS configuration for client connections
+        let tls_config = load_client_tls_config(&config.tls)
+            .context("Failed to load TLS configuration")?;
+
+        if tls_config.is_some() {
+            info!(
+                sslmode = ?config.tls.client_tls_sslmode,
+                "Client TLS enabled"
+            );
+        } else {
+            info!("Client TLS disabled");
+        }
+
+        Ok(Self {
+            config: Arc::new(config),
+            listener,
+            batcher: Arc::new(batcher),
+            pool,
+            metrics,
+            tls_config,
+        })
     }
 
     /// Get the local address the server is listening on
@@ -223,17 +246,56 @@ impl ProxyServer {
                             let batcher = Arc::clone(&self.batcher);
                             let pool = self.pool.clone();
                             let metrics = Arc::clone(&self.metrics);
+                            let tls_config = self.tls_config.clone();
 
                             // Spawn a task to handle this connection and track it
                             connection_tasks.spawn(async move {
-                                let handler = ConnectionHandler::new(
+                                // Handle SSL startup handshake
+                                let (transport, startup_data) = match handle_ssl_startup(
                                     client_stream,
+                                    &config.tls.client_tls_sslmode,
+                                    tls_config,
+                                ).await {
+                                    Ok(SslStartupResult::Upgraded(transport)) => {
+                                        info!(
+                                            connection_id = conn_id,
+                                            "Connection upgraded to TLS"
+                                        );
+                                        (transport, Vec::new())
+                                    }
+                                    Ok(SslStartupResult::Declined(stream, startup_data)) => {
+                                        debug!(
+                                            connection_id = conn_id,
+                                            "SSL declined, continuing with plain TCP"
+                                        );
+                                        (ClientTransport::Plain(stream), startup_data)
+                                    }
+                                    Ok(SslStartupResult::NoSslRequest(stream, startup_data)) => {
+                                        debug!(
+                                            connection_id = conn_id,
+                                            "No SSL request, continuing with plain TCP"
+                                        );
+                                        (ClientTransport::Plain(stream), startup_data)
+                                    }
+                                    Err(e) => {
+                                        error!(
+                                            connection_id = conn_id,
+                                            error = %e,
+                                            "SSL startup failed"
+                                        );
+                                        return;
+                                    }
+                                };
+
+                                let handler = ConnectionHandler::new(
+                                    transport,
                                     client_addr,
                                     conn_id,
                                     config,
                                     batcher,
                                     pool,
                                     metrics,
+                                    startup_data,
                                 );
 
                                 if let Err(e) = handler.handle().await {

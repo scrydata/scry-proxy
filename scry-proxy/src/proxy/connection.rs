@@ -8,6 +8,7 @@ use crate::protocol::{
     decode_params, CommandDetector, DetectedCommand, Message, MessageExtractor, QueryAnonymizer,
 };
 use crate::publisher::QueryEventBuilder;
+use crate::tls::ClientTransport;
 use anyhow::{Context, Result};
 use scry_protocol::ParamValue;
 use std::net::SocketAddr;
@@ -20,26 +21,28 @@ use tracing::{debug, error, info, instrument, warn};
 
 /// Handles a single client connection, forwarding messages to/from the backend
 pub struct ConnectionHandler {
-    client_stream: TcpStream,
+    client_stream: ClientTransport,
     client_addr: SocketAddr,
     connection_id: u64,
     config: Arc<Config>,
     batcher: Arc<EventBatcher>,
     pool: Option<Arc<TcpConnectionPool>>,
     metrics: Arc<ProxyMetrics>,
+    startup_data: Vec<u8>,
 }
 
 impl ConnectionHandler {
     pub fn new(
-        client_stream: TcpStream,
+        client_stream: ClientTransport,
         client_addr: SocketAddr,
         connection_id: u64,
         config: Arc<Config>,
         batcher: Arc<EventBatcher>,
         pool: Option<Arc<TcpConnectionPool>>,
         metrics: Arc<ProxyMetrics>,
+        startup_data: Vec<u8>,
     ) -> Self {
-        Self { client_stream, client_addr, connection_id, config, batcher, pool, metrics }
+        Self { client_stream, client_addr, connection_id, config, batcher, pool, metrics, startup_data }
     }
 
     /// Convert PoolingStrategy from config to PoolingMode for enforcement
@@ -134,6 +137,19 @@ impl ConnectionHandler {
 
         let mut client_buffer = vec![0u8; self.config.performance.buffer_size];
         let mut backend_buffer = vec![0u8; self.config.performance.buffer_size];
+
+        // Forward any buffered startup data from SSL handshake
+        if !self.startup_data.is_empty() {
+            debug!(
+                connection_id = connection_id,
+                bytes = self.startup_data.len(),
+                "Forwarding buffered startup data"
+            );
+            backend_conn
+                .write_all(&self.startup_data)
+                .await
+                .context("Failed to forward startup data")?;
+        }
 
         loop {
             tokio::select! {
@@ -437,9 +453,22 @@ impl ConnectionHandler {
     }
 
     /// Handle connection with an owned backend TCP stream
-    async fn handle_with_owned_backend(mut self, mut backend_stream: TcpStream) -> Result<()> {
-        // For owned connections, we can use split() as before
-        let (mut client_read, mut client_write) = self.client_stream.split();
+    async fn handle_with_owned_backend(self, mut backend_stream: TcpStream) -> Result<()> {
+        // Forward any buffered startup data from SSL handshake first
+        if !self.startup_data.is_empty() {
+            debug!(
+                connection_id = self.connection_id,
+                bytes = self.startup_data.len(),
+                "Forwarding buffered startup data"
+            );
+            backend_stream
+                .write_all(&self.startup_data)
+                .await
+                .context("Failed to forward startup data")?;
+        }
+
+        // For owned connections, we can use split() - works with ClientTransport via tokio::io::split
+        let (mut client_read, mut client_write) = tokio::io::split(self.client_stream);
         let (mut backend_read, mut backend_write) = backend_stream.split();
 
         let connection_id = self.connection_id;
