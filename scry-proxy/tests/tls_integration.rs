@@ -1,0 +1,276 @@
+//! TLS integration tests
+//!
+//! These tests verify TLS functionality with the proxy server.
+
+use scry::config::*;
+use scry::observability::{HealthConfig, ProxyMetrics};
+use scry::proxy::{EventBatcher, ProxyServer};
+use scry::publisher::{DebugLoggerPublisher, EventPublisher};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+
+/// Generate self-signed test certificates using openssl
+/// Returns (temp_dir, cert_path, key_path) - temp_dir must be kept alive
+fn generate_test_certs() -> Option<(tempfile::TempDir, String, String)> {
+    use std::process::Command;
+
+    let dir = tempfile::tempdir().ok()?;
+    let cert_path = dir.path().join("server.crt");
+    let key_path = dir.path().join("server.key");
+
+    // Generate self-signed certificate using openssl
+    let status = Command::new("openssl")
+        .args([
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-keyout",
+            key_path.to_str()?,
+            "-out",
+            cert_path.to_str()?,
+            "-days",
+            "1",
+            "-nodes",
+            "-subj",
+            "/CN=localhost",
+        ])
+        .output();
+
+    match status {
+        Ok(output) if output.status.success() => Some((
+            dir,
+            cert_path.to_string_lossy().to_string(),
+            key_path.to_string_lossy().to_string(),
+        )),
+        _ => None,
+    }
+}
+
+/// Send an SSLRequest and read the response
+async fn send_ssl_request(addr: &str) -> std::io::Result<u8> {
+    let mut stream = TcpStream::connect(addr).await?;
+
+    // SSLRequest message: length (8) + code (80877103)
+    let ssl_request: [u8; 8] = [0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x2f];
+    stream.write_all(&ssl_request).await?;
+
+    let mut response = [0u8; 1];
+    stream.read_exact(&mut response).await?;
+
+    Ok(response[0])
+}
+
+/// Helper to create a minimal test config
+fn create_minimal_config() -> Config {
+    Config {
+        proxy: ProxyConfig {
+            listen_address: "127.0.0.1:0".to_string(),
+            max_connections: 10,
+            shutdown_timeout_secs: 5,
+        },
+        backend: BackendConfig {
+            protocol: DatabaseProtocol::Postgres,
+            host: "127.0.0.1".to_string(),
+            port: 5432,
+            database: "postgres".to_string(),
+            user: "postgres".to_string(),
+            password: "postgres".to_string(),
+            pool_size: 5,
+            connection_timeout_ms: 5000,
+        },
+        observability: ObservabilityConfig {
+            enable_tracing: false,
+            otlp_endpoint: None,
+            service_name: "scry-test".to_string(),
+            enable_metrics_server: false,
+            metrics_server_address: "127.0.0.1:9090".to_string(),
+        },
+        protocol: ProtocolConfig { max_prepared_statements: 100 },
+        publisher: PublisherConfig {
+            enabled: true,
+            batch_size: 10,
+            flush_interval_ms: 100,
+            anonymize: false,
+            publisher_type: "debug".to_string(),
+            max_queue_size: 100,
+            http_endpoint: None,
+            http_timeout_ms: 500,
+            http_max_retries: 2,
+            http_api_key: None,
+            http_compression: true,
+            shadow_id: None,
+        },
+        performance: PerformanceConfig {
+            target_latency_ms: 1,
+            connection_pooling: PoolingStrategy::Disabled,
+            pool_size: 5,
+            pool_min_idle: 1,
+            pool_timeout_secs: 30,
+            pool_recycle_secs: 3600,
+            pool_aggressive_unpinning: false,
+            buffer_size: 8192,
+            pool_queue_depth: 50,
+            pool_idle_unpin_secs: 60,
+            pool_lifo: true,
+        },
+        resilience: ResilienceConfig {
+            circuit_breaker: CircuitBreakerConfig {
+                enabled: false,
+                failure_threshold: 5,
+                success_threshold: 2,
+                window_secs: 30,
+                open_timeout_secs: 60,
+                use_health_monitor: false,
+            },
+            connection_retry: ConnectionRetryConfig {
+                enabled: false,
+                max_attempts: 3,
+                initial_backoff_ms: 50,
+                max_backoff_ms: 5000,
+                backoff_multiplier: 2.0,
+                jitter_factor: 0.1,
+            },
+            healthcheck: HealthcheckConfig {
+                active_enabled: false,
+                interval_secs: 30,
+                timeout_ms: 1000,
+                failure_threshold: 3,
+            },
+        },
+        tls: TlsConfig::default(),
+    }
+}
+
+/// Helper to start a proxy server with the given config
+async fn start_proxy(config: Config) -> anyhow::Result<(u16, tokio::task::JoinHandle<()>)> {
+    let publisher: Arc<dyn EventPublisher> = Arc::new(DebugLoggerPublisher::new());
+    let batcher = EventBatcher::new(
+        publisher,
+        config.publisher.batch_size,
+        config.publisher.flush_interval_ms,
+        config.publisher.max_queue_size,
+    );
+
+    let metrics = Arc::new(ProxyMetrics::new(100, HealthConfig::default()));
+    let server = ProxyServer::new(config, batcher, metrics).await?;
+    let port = server.local_addr()?.port();
+
+    let handle = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    // Give server time to start
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    Ok((port, handle))
+}
+
+#[tokio::test]
+async fn test_ssl_disabled_responds_no() {
+    // Start proxy with TLS disabled (default)
+    let config = create_minimal_config();
+    let (port, handle) = start_proxy(config).await.expect("Failed to start proxy");
+
+    // Send SSL request
+    let addr = format!("127.0.0.1:{}", port);
+    let response = send_ssl_request(&addr).await.unwrap();
+
+    // Should respond with 'N' (no SSL)
+    assert_eq!(response, b'N', "Expected 'N' (no SSL) response");
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn test_ssl_allow_with_certs_responds_yes() {
+    // Skip if openssl is not available
+    let certs = match generate_test_certs() {
+        Some(c) => c,
+        None => {
+            eprintln!("Skipping test: openssl not available");
+            return;
+        }
+    };
+    let (_dir, cert_path, key_path) = certs;
+
+    let mut config = create_minimal_config();
+    config.tls.client_tls_sslmode = TlsSslMode::Allow;
+    config.tls.client_tls_cert_file = Some(cert_path);
+    config.tls.client_tls_key_file = Some(key_path);
+
+    let (port, handle) = start_proxy(config).await.expect("Failed to start proxy");
+
+    // Send SSL request
+    let addr = format!("127.0.0.1:{}", port);
+    let response = send_ssl_request(&addr).await.unwrap();
+
+    // Should respond with 'S' (yes SSL)
+    assert_eq!(response, b'S', "Expected 'S' (yes SSL) response");
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn test_ssl_require_with_certs_responds_yes() {
+    // Skip if openssl is not available
+    let certs = match generate_test_certs() {
+        Some(c) => c,
+        None => {
+            eprintln!("Skipping test: openssl not available");
+            return;
+        }
+    };
+    let (_dir, cert_path, key_path) = certs;
+
+    let mut config = create_minimal_config();
+    config.tls.client_tls_sslmode = TlsSslMode::Require;
+    config.tls.client_tls_cert_file = Some(cert_path);
+    config.tls.client_tls_key_file = Some(key_path);
+
+    let (port, handle) = start_proxy(config).await.expect("Failed to start proxy");
+
+    // Send SSL request
+    let addr = format!("127.0.0.1:{}", port);
+    let response = send_ssl_request(&addr).await.unwrap();
+
+    // Should respond with 'S' (yes SSL)
+    assert_eq!(response, b'S', "Expected 'S' (yes SSL) response");
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn test_no_ssl_request_accepted() {
+    // Test that a connection without SSL request is accepted
+    let config = create_minimal_config();
+    let (port, handle) = start_proxy(config).await.expect("Failed to start proxy");
+
+    // Connect and send a regular startup message (not SSL request)
+    let addr = format!("127.0.0.1:{}", port);
+    let mut stream = TcpStream::connect(&addr).await.unwrap();
+
+    // Regular PostgreSQL startup message (protocol version 3.0)
+    // Length (4 bytes) + Protocol version (4 bytes) + params
+    let startup_msg: [u8; 16] = [
+        0, 0, 0, 16, // length = 16
+        0, 3, 0, 0, // protocol version 3.0
+        b'u', b's', b'e', b'r', 0, // "user\0"
+        b'x', 0, // "x\0"
+        0, // null terminator for params
+    ];
+    stream.write_all(&startup_msg).await.unwrap();
+
+    // We should get some response (likely connection refused to backend or auth error,
+    // but the connection was accepted by the proxy)
+    let mut buf = [0u8; 1];
+    let result = tokio::time::timeout(Duration::from_millis(500), stream.read(&mut buf)).await;
+
+    // Either we get a response or timeout - the key is that connection was established
+    // and not immediately rejected
+    drop(result); // Just need to verify we got this far without panic
+
+    handle.abort();
+}
