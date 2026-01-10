@@ -1,4 +1,6 @@
-use super::{ConnectionHandler, EventBatcher, TcpConnectionPool};
+use super::{
+    ConnectionHandler, EventBatcher, PoolManager, PoolManagerConfig, TcpConnectionPool, WaitQueue,
+};
 use crate::config::{Config, PoolingStrategy, TlsSslMode};
 use crate::observability::ProxyMetrics;
 use crate::protocol::{Protocol, ProtocolConfig, ProtocolRegistry};
@@ -18,6 +20,7 @@ pub struct ProxyServer {
     listener: TcpListener,
     batcher: Arc<EventBatcher>,
     pool: Option<Arc<TcpConnectionPool>>,
+    pool_manager: Option<Arc<PoolManager>>,
     metrics: Arc<ProxyMetrics>,
     tls_config: Option<Arc<ServerConfig>>,
 }
@@ -173,6 +176,26 @@ impl ProxyServer {
             None
         };
 
+        // Create PoolManager if pooling is enabled
+        let pool_manager = if let Some(ref pool) = pool {
+            let wait_queue = WaitQueue::new(config.performance.pool_queue_depth);
+            let pm_config = PoolManagerConfig {
+                lifo: config.performance.pool_lifo,
+                queue_depth: config.performance.pool_queue_depth,
+                idle_unpin_secs: config.performance.pool_idle_unpin_secs,
+                wait_timeout_ms: config.performance.pool_timeout_secs * 1000,
+            };
+            info!(
+                lifo = pm_config.lifo,
+                queue_depth = pm_config.queue_depth,
+                idle_unpin_secs = pm_config.idle_unpin_secs,
+                "Creating PoolManager"
+            );
+            Some(PoolManager::new(Arc::clone(pool), wait_queue, pm_config))
+        } else {
+            None
+        };
+
         // Load TLS configuration for client connections
         let tls_config =
             load_client_tls_config(&config.tls).context("Failed to load TLS configuration")?;
@@ -191,6 +214,7 @@ impl ProxyServer {
             listener,
             batcher: Arc::new(batcher),
             pool,
+            pool_manager,
             metrics,
             tls_config,
         })
@@ -200,6 +224,11 @@ impl ProxyServer {
     /// Useful for tests when binding to port 0 (OS-assigned port)
     pub fn local_addr(&self) -> Result<std::net::SocketAddr> {
         self.listener.local_addr().context("Failed to get local address")
+    }
+
+    /// Get the pool manager, if pooling is enabled
+    pub fn pool_manager(&self) -> Option<&Arc<PoolManager>> {
+        self.pool_manager.as_ref()
     }
 
     /// Run the proxy server, accepting connections until shutdown signal
@@ -397,5 +426,52 @@ impl ProxyServer {
                 warn!("Forcefully closed remaining connections");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::observability::{HealthConfig, ProxyMetrics};
+    use crate::proxy::EventBatcher;
+    use crate::publisher::DebugLoggerPublisher;
+
+    fn create_test_config() -> Config {
+        let mut config = Config::default();
+        // Use port 0 to get an available port from the OS
+        config.proxy.listen_address = "127.0.0.1:0".to_string();
+        // Disable active healthchecks for tests
+        config.resilience.healthcheck.active_enabled = false;
+        config
+    }
+
+    #[tokio::test]
+    async fn test_server_creates_pool_manager() {
+        // This test verifies PoolManager is created and accessible
+        let config = create_test_config();
+        let publisher = Arc::new(DebugLoggerPublisher::new());
+        let metrics = Arc::new(ProxyMetrics::new(100, HealthConfig::default()));
+
+        let server = ProxyServer::new(config, EventBatcher::new(publisher, 10, 100, 1000), metrics)
+            .await
+            .unwrap();
+
+        // Server should expose pool_manager for testing
+        assert!(server.pool_manager().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_server_no_pool_manager_when_pooling_disabled() {
+        let mut config = create_test_config();
+        config.performance.connection_pooling = PoolingStrategy::Disabled;
+        let publisher = Arc::new(DebugLoggerPublisher::new());
+        let metrics = Arc::new(ProxyMetrics::new(100, HealthConfig::default()));
+
+        let server = ProxyServer::new(config, EventBatcher::new(publisher, 10, 100, 1000), metrics)
+            .await
+            .unwrap();
+
+        assert!(server.pool_manager().is_none());
     }
 }
