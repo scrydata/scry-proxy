@@ -64,6 +64,23 @@ impl ConnectionHandler {
         }
     }
 
+    /// Determine if connection should be released after transaction
+    ///
+    /// Returns true if the connection should be released back to the pool,
+    /// allowing other clients to use it. The decision depends on:
+    /// - Pooling strategy (transaction mode always releases, session mode never does)
+    /// - Connection state (pinned connections with unsafe state are not released)
+    fn should_release_connection(strategy: &PoolingStrategy, conn_state: &ConnectionState) -> bool {
+        match strategy {
+            // Disabled or Session mode: never release until client disconnects
+            PoolingStrategy::Disabled | PoolingStrategy::Session => false,
+            // Transaction mode: always release after transaction (strict mode)
+            PoolingStrategy::Transaction => true,
+            // Hybrid mode: release only if connection is not pinned
+            PoolingStrategy::Hybrid => !conn_state.is_pinned(),
+        }
+    }
+
     /// Build a QueryEventBuilder with anonymization if enabled
     /// Returns (builder, value_fingerprints) for hot data tracking
     fn build_query_event(
@@ -138,9 +155,8 @@ impl ConnectionHandler {
     /// This method integrates with the PoolManager for proper connection lifecycle:
     /// - Tracks transaction state for connection release decisions
     /// - Handles sticky connections for clients with pinned state
-    /// - Releases connections back to the pool on transaction boundaries
-    ///
-    /// TODO(Task 1.4): Full implementation with transaction-based release
+    /// - Releases connections back to the pool on transaction boundaries (transaction mode)
+    /// - Re-acquires connections when needed for subsequent queries
     async fn handle_with_managed_connection(
         mut self,
         mut managed_conn: super::ManagedConnection,
@@ -157,7 +173,8 @@ impl ConnectionHandler {
             PreparedStatementCache::new(self.config.protocol.max_prepared_statements);
 
         // Transaction pooling tracking components
-        let pooling_mode = Self::pooling_mode(&self.config.performance.connection_pooling);
+        let pooling_strategy = self.config.performance.connection_pooling.clone();
+        let pooling_mode = Self::pooling_mode(&pooling_strategy);
         let mode_enforcer = ModeEnforcer::new(pooling_mode);
         let mut txn_tracker = TransactionTracker::new();
         let mut conn_state = ConnectionState::new(self.config.protocol.max_prepared_statements);
@@ -364,15 +381,48 @@ impl ConnectionHandler {
                                 let was_in_transaction = txn_tracker.is_in_transaction();
                                 txn_tracker.update_from_ready_for_query(status);
 
-                                // Log transaction boundary for debugging
-                                // TODO(Task 1.4): Implement actual connection release here
+                                // Check if transaction just completed and we should release connection
                                 if was_in_transaction && txn_tracker.is_idle() {
-                                    debug!(
-                                        connection_id = connection_id,
-                                        is_pinned = conn_state.is_pinned(),
-                                        has_unsafe_state = conn_state.has_unsafe_state(),
-                                        "Transaction ended - connection could be released"
-                                    );
+                                    if Self::should_release_connection(&pooling_strategy, &conn_state) {
+                                        debug!(
+                                            connection_id = connection_id,
+                                            is_pinned = conn_state.is_pinned(),
+                                            "Transaction complete, releasing connection to pool"
+                                        );
+
+                                        // Forward to client BEFORE releasing connection
+                                        // This ensures client receives the ReadyForQuery
+                                        self.client_stream.write_all(data).await.context("Failed to write to client")?;
+
+                                        // Release current connection back to pool
+                                        pool_manager.release(managed_conn);
+
+                                        // Re-acquire connection lazily - spawn a brief yield to allow
+                                        // the released connection to return to the pool
+                                        tokio::task::yield_now().await;
+
+                                        // Now re-acquire connection for next query
+                                        managed_conn = pool_manager
+                                            .acquire(connection_id, conn_state.is_pinned())
+                                            .await
+                                            .context("Failed to re-acquire connection from pool")?;
+
+                                        debug!(
+                                            connection_id = connection_id,
+                                            new_is_pinned = managed_conn.is_pinned(),
+                                            "Re-acquired connection from pool"
+                                        );
+
+                                        // Continue to next iteration (data already sent to client)
+                                        continue;
+                                    } else {
+                                        debug!(
+                                            connection_id = connection_id,
+                                            is_pinned = conn_state.is_pinned(),
+                                            has_unsafe_state = conn_state.has_unsafe_state(),
+                                            "Transaction ended but connection NOT released (session/pinned)"
+                                        );
+                                    }
                                 }
                             }
 
@@ -751,6 +801,92 @@ mod tests {
     fn test_pooling_mode_conversion_hybrid() {
         let mode = ConnectionHandler::pooling_mode(&PoolingStrategy::Hybrid);
         assert_eq!(mode, PoolingMode::Hybrid);
+    }
+
+    // Tests for should_release_connection()
+
+    #[test]
+    fn test_should_release_connection_disabled_mode() {
+        let conn_state = ConnectionState::new(100);
+        // Disabled mode should never release
+        assert!(!ConnectionHandler::should_release_connection(
+            &PoolingStrategy::Disabled,
+            &conn_state
+        ));
+    }
+
+    #[test]
+    fn test_should_release_connection_session_mode() {
+        let conn_state = ConnectionState::new(100);
+        // Session mode should never release
+        assert!(!ConnectionHandler::should_release_connection(
+            &PoolingStrategy::Session,
+            &conn_state
+        ));
+    }
+
+    #[test]
+    fn test_should_release_connection_transaction_mode() {
+        let conn_state = ConnectionState::new(100);
+        // Transaction mode should always release
+        assert!(ConnectionHandler::should_release_connection(
+            &PoolingStrategy::Transaction,
+            &conn_state
+        ));
+    }
+
+    #[test]
+    fn test_should_release_connection_transaction_mode_with_pinned_state() {
+        let mut conn_state = ConnectionState::new(100);
+        conn_state.add_prepared_statement("stmt1".to_string(), "SELECT 1".to_string(), vec![]);
+        // Transaction mode should still release even with pinned state (strict mode)
+        assert!(ConnectionHandler::should_release_connection(
+            &PoolingStrategy::Transaction,
+            &conn_state
+        ));
+    }
+
+    #[test]
+    fn test_should_release_connection_hybrid_mode_unpinned() {
+        let conn_state = ConnectionState::new(100);
+        // Hybrid mode should release when not pinned
+        assert!(ConnectionHandler::should_release_connection(
+            &PoolingStrategy::Hybrid,
+            &conn_state
+        ));
+    }
+
+    #[test]
+    fn test_should_release_connection_hybrid_mode_pinned() {
+        let mut conn_state = ConnectionState::new(100);
+        conn_state.add_prepared_statement("stmt1".to_string(), "SELECT 1".to_string(), vec![]);
+        // Hybrid mode should NOT release when pinned
+        assert!(!ConnectionHandler::should_release_connection(
+            &PoolingStrategy::Hybrid,
+            &conn_state
+        ));
+    }
+
+    #[test]
+    fn test_should_release_connection_hybrid_mode_with_session_variable() {
+        let mut conn_state = ConnectionState::new(100);
+        conn_state.add_session_variable("timezone".to_string(), "UTC".to_string());
+        // Hybrid mode should NOT release when connection has session variables
+        assert!(!ConnectionHandler::should_release_connection(
+            &PoolingStrategy::Hybrid,
+            &conn_state
+        ));
+    }
+
+    #[test]
+    fn test_should_release_connection_hybrid_mode_with_temp_table() {
+        let mut conn_state = ConnectionState::new(100);
+        conn_state.add_temp_table("tmp_users".to_string());
+        // Hybrid mode should NOT release when connection has temp tables
+        assert!(!ConnectionHandler::should_release_connection(
+            &PoolingStrategy::Hybrid,
+            &conn_state
+        ));
     }
 
     #[test]
