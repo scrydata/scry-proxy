@@ -6,10 +6,11 @@ use scry::config::*;
 use scry::observability::{HealthConfig, ProxyMetrics};
 use scry::proxy::{EventBatcher, ProxyServer};
 use scry::publisher::{DebugLoggerPublisher, EventPublisher};
+use scry::tls::{load_server_tls_config, upgrade_backend_to_tls};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 
 /// Generate self-signed test certificates using openssl
 /// Returns (temp_dir, cert_path, key_path) - temp_dir must be kept alive
@@ -273,4 +274,159 @@ async fn test_no_ssl_request_accepted() {
     drop(result); // Just need to verify we got this far without panic
 
     handle.abort();
+}
+
+// =============================================================================
+// Backend TLS Tests
+// =============================================================================
+
+/// Test that sslmode=require fails when backend doesn't support SSL
+#[tokio::test]
+async fn test_backend_tls_require_fails_without_ssl() {
+    // Create a mock "backend" that declines SSL
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    // Spawn mock backend that responds 'N' to SSLRequest
+    let backend_task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+
+        // Read SSLRequest (8 bytes)
+        let mut buf = [0u8; 8];
+        stream.read_exact(&mut buf).await.unwrap();
+
+        // Respond with 'N' (no SSL)
+        stream.write_all(&[b'N']).await.unwrap();
+    });
+
+    // Try to connect with sslmode=require
+    let stream = TcpStream::connect(addr).await.unwrap();
+
+    let mut tls_config = TlsConfig::default();
+    tls_config.server_tls_sslmode = TlsSslMode::Require;
+
+    let server_tls = load_server_tls_config(&tls_config).unwrap();
+
+    let result = upgrade_backend_to_tls(
+        stream,
+        "localhost",
+        &tls_config.server_tls_sslmode,
+        server_tls,
+    )
+    .await;
+
+    // Should fail because backend declined SSL
+    match result {
+        Err(e) => {
+            let err_msg = e.to_string();
+            assert!(
+                err_msg.contains("does not support SSL"),
+                "Expected 'does not support SSL' in error, got: {}",
+                err_msg
+            );
+        }
+        Ok(_) => panic!("Expected error when backend declines SSL with sslmode=require"),
+    }
+
+    backend_task.await.unwrap();
+}
+
+/// Test that sslmode=allow falls back to plain TCP when backend declines SSL
+#[tokio::test]
+async fn test_backend_tls_allow_fallback() {
+    // Create a mock "backend" that declines SSL
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let backend_task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+
+        // Read SSLRequest (8 bytes)
+        let mut buf = [0u8; 8];
+        stream.read_exact(&mut buf).await.unwrap();
+
+        // Respond with 'N' (no SSL)
+        stream.write_all(&[b'N']).await.unwrap();
+
+        // Keep connection alive briefly so the test can verify transport state
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    });
+
+    let stream = TcpStream::connect(addr).await.unwrap();
+
+    let mut tls_config = TlsConfig::default();
+    tls_config.server_tls_sslmode = TlsSslMode::Allow;
+
+    let server_tls = load_server_tls_config(&tls_config).unwrap();
+
+    let result = upgrade_backend_to_tls(
+        stream,
+        "localhost",
+        &tls_config.server_tls_sslmode,
+        server_tls,
+    )
+    .await;
+
+    // Should succeed with plain TCP fallback
+    match result {
+        Ok(transport) => {
+            assert!(
+                !transport.is_encrypted(),
+                "Expected plain TCP (not encrypted) when backend declines SSL"
+            );
+        }
+        Err(e) => panic!("Expected success with sslmode=allow, got error: {}", e),
+    }
+
+    backend_task.await.unwrap();
+}
+
+/// Test that sslmode=disable skips SSL negotiation entirely
+#[tokio::test]
+async fn test_backend_tls_disable_skips_negotiation() {
+    // Create a mock "backend" - it should NOT receive any SSLRequest
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let backend_task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+
+        // With sslmode=disable, we should NOT receive an SSLRequest
+        // Set a short timeout - if we receive anything, the test should fail
+        let mut buf = [0u8; 8];
+        let result =
+            tokio::time::timeout(Duration::from_millis(100), stream.read(&mut buf)).await;
+
+        // We expect timeout (no data received) because sslmode=disable skips negotiation
+        match result {
+            Err(_) => {} // Timeout is expected - no SSL negotiation
+            Ok(Ok(0)) => {} // Connection closed without sending is also fine
+            Ok(Ok(_)) => panic!("Received unexpected data with sslmode=disable"),
+            Ok(Err(e)) => panic!("Unexpected error: {}", e),
+        }
+    });
+
+    let stream = TcpStream::connect(addr).await.unwrap();
+
+    let tls_config = TlsConfig::default(); // sslmode=disable by default
+
+    let server_tls = load_server_tls_config(&tls_config).unwrap();
+
+    let result = upgrade_backend_to_tls(
+        stream,
+        "localhost",
+        &tls_config.server_tls_sslmode,
+        server_tls,
+    )
+    .await;
+
+    // Should succeed immediately with plain TCP (no negotiation)
+    match result {
+        Ok(transport) => {
+            assert!(!transport.is_encrypted(), "Expected plain TCP with sslmode=disable");
+        }
+        Err(e) => panic!("Expected success with sslmode=disable, got error: {}", e),
+    }
+
+    backend_task.await.unwrap();
 }
