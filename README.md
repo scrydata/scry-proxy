@@ -23,6 +23,7 @@ Scry enhances your database infrastructure with enterprise-grade capabilities:
 - **[Circuit Breaking](docs/circuit-breaker.md)** - Automatic failover with lock-free, three-state circuit breaker to protect your database
 - **[Health Monitoring](docs/health-checks.md)** - Active and passive health checks with predictive anomaly detection using EMA baselines
 - **[Connection Pooling](docs/connection-pooling.md)** - Protocol-agnostic connection pooling with automatic state reset and health validation
+- **[TLS/SSL Support](#tls-configuration)** - Full TLS support for client and backend connections with configurable SSL modes
 - **[Resilience](docs/resilience.md)** - Exponential backoff retries with jitter, integrated with circuit breaking and health monitoring
 - **[Query Anonymization](docs/query-anonymization.md)** - Privacy-preserving query logging with Blake3 fingerprinting for compliance
 - **[Metrics & Monitoring](docs/metrics.md)** - Prometheus metrics with percentile latencies, pool utilization, and circuit breaker state
@@ -77,6 +78,65 @@ export SCRY_PUBLISHER__ANONYMIZE=true
 
 Or use a `scry.toml` configuration file. See **[Configuration](docs/configuration.md)** for complete reference.
 
+## TLS Configuration
+
+Scry supports TLS/SSL encryption for both client connections (clients → proxy) and backend connections (proxy → database), with SSL modes matching PgBouncer conventions.
+
+### Client-Facing TLS (Clients → Proxy)
+
+Accept encrypted connections from database clients:
+
+```bash
+# Enable TLS for client connections
+export SCRY_TLS__CLIENT_TLS_SSLMODE=require
+export SCRY_TLS__CLIENT_TLS_CERT_FILE=/path/to/server.crt
+export SCRY_TLS__CLIENT_TLS_KEY_FILE=/path/to/server.key
+
+# Optional: Require client certificates (mTLS)
+export SCRY_TLS__CLIENT_TLS_SSLMODE=verify-ca
+export SCRY_TLS__CLIENT_TLS_CA_FILE=/path/to/ca.crt
+```
+
+### Backend TLS (Proxy → Database)
+
+Connect to TLS-enabled databases (RDS, Cloud SQL, etc.):
+
+```bash
+# Require TLS to backend (recommended for cloud databases)
+export SCRY_TLS__SERVER_TLS_SSLMODE=require
+
+# Verify backend certificate against CA
+export SCRY_TLS__SERVER_TLS_SSLMODE=verify-ca
+export SCRY_TLS__SERVER_TLS_CA_FILE=/path/to/backend-ca.crt
+
+# Optional: Client certificate for backend authentication
+export SCRY_TLS__SERVER_TLS_CERT_FILE=/path/to/client.crt
+export SCRY_TLS__SERVER_TLS_KEY_FILE=/path/to/client.key
+```
+
+### SSL Modes
+
+| Mode | Description |
+|------|-------------|
+| `disable` | No TLS (default) |
+| `allow` | Use TLS if client/server requests it, otherwise plain TCP |
+| `require` | Require TLS, but don't verify certificates |
+| `verify-ca` | Require TLS with CA-verified certificate |
+| `verify-full` | Require TLS with CA-verified certificate and hostname match |
+
+### Environment Variables Reference
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `SCRY_TLS__CLIENT_TLS_SSLMODE` | Client connection TLS mode | `disable` |
+| `SCRY_TLS__CLIENT_TLS_CERT_FILE` | Server certificate (PEM) | - |
+| `SCRY_TLS__CLIENT_TLS_KEY_FILE` | Server private key (PEM) | - |
+| `SCRY_TLS__CLIENT_TLS_CA_FILE` | CA for client cert verification | - |
+| `SCRY_TLS__SERVER_TLS_SSLMODE` | Backend connection TLS mode | `disable` |
+| `SCRY_TLS__SERVER_TLS_CA_FILE` | CA for backend cert verification | - |
+| `SCRY_TLS__SERVER_TLS_CERT_FILE` | Client cert for backend auth | - |
+| `SCRY_TLS__SERVER_TLS_KEY_FILE` | Client key for backend auth | - |
+
 ## Documentation
 
 ### Getting Started
@@ -129,10 +189,11 @@ Scry is feature-complete with comprehensive test coverage:
 - ✅ Full Postgres wire protocol support (simple and extended)
 - ✅ Production-ready resilience features (circuit breaker, retries, health checks)
 - ✅ Connection pooling with deadpool integration
+- ✅ TLS/SSL support for client and backend connections
 - ✅ Query anonymization with value fingerprinting
 - ✅ HTTP event publisher with FlexBuffers
 - ✅ Prometheus metrics endpoint
-- ✅ 20+ integration tests with real Postgres instances
+- ✅ 50+ integration tests with real Postgres instances
 - ✅ Graceful shutdown and signal handling
 
 See [CLAUDE.md](CLAUDE.md) for implementation details and architecture decisions.
