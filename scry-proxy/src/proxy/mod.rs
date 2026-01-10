@@ -20,7 +20,6 @@ pub use pool_manager::{
 };
 pub use server::ProxyServer;
 pub use state_replayer::{ReplayError, ReplayResult, StateReplayer};
-pub(crate) use tcp_pool::PooledConnection;
 pub use tcp_pool::{PoolStatus, TcpConnectionPool};
 pub use transaction::{TransactionState, TransactionTracker};
 pub use wait_queue::{QueueFullError, WaitQueue, Waiter};

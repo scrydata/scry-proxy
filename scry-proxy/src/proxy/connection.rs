@@ -100,17 +100,29 @@ impl ConnectionHandler {
         let backend_addr = format!("{}:{}", self.config.backend.host, self.config.backend.port);
 
         // Try to get connection from pool manager if available
-        if let Some(ref pool_manager) = self.pool_manager {
+        if let Some(pool_manager) = self.pool_manager.clone() {
             info!(
                 backend_addr = %backend_addr,
                 connection_id = self.connection_id,
-                "Getting backend connection from PoolManager"
+                "Acquiring backend connection from PoolManager"
             );
-            let pooled_conn = pool_manager.pool().get().await.context("Failed to get connection from pool")?;
-            info!(backend_addr = %backend_addr, "Using pooled backend connection");
 
-            // Use pooled connection - keep wrapper alive for entire session
-            return self.handle_with_pooled_backend(pooled_conn).await;
+            // Check if we need sticky connection (e.g., client has prior state)
+            let needs_sticky = pool_manager.has_sticky(self.connection_id);
+
+            let managed_conn = pool_manager
+                .acquire(self.connection_id, needs_sticky)
+                .await
+                .context("Failed to acquire connection from pool")?;
+
+            info!(
+                backend_addr = %backend_addr,
+                is_pinned = managed_conn.is_pinned(),
+                "Using managed connection"
+            );
+
+            // Use managed connection with proper pool integration
+            return self.handle_with_managed_connection(managed_conn, &pool_manager).await;
         } else {
             info!(backend_addr = %backend_addr, "Creating direct backend connection");
             let backend_stream =
@@ -121,14 +133,19 @@ impl ConnectionHandler {
         }
     }
 
-    /// Handle connection with a pooled backend connection
-    async fn handle_with_pooled_backend(
+    /// Handle connection with a managed connection from PoolManager
+    ///
+    /// This method integrates with the PoolManager for proper connection lifecycle:
+    /// - Tracks transaction state for connection release decisions
+    /// - Handles sticky connections for clients with pinned state
+    /// - Releases connections back to the pool on transaction boundaries
+    ///
+    /// TODO(Task 1.4): Full implementation with transaction-based release
+    async fn handle_with_managed_connection(
         mut self,
-        mut backend_conn: super::PooledConnection,
+        mut managed_conn: super::ManagedConnection,
+        pool_manager: &Arc<PoolManager>,
     ) -> Result<()> {
-        // For pooled connections, we use the wrapper which implements Deref/DerefMut
-        // We'll use a manual forwarding loop instead of split() to keep the wrapper alive
-
         let connection_id = self.connection_id;
         let database = self.config.backend.database.clone();
         let batcher = Arc::clone(&self.batcher);
@@ -155,7 +172,8 @@ impl ConnectionHandler {
                 bytes = self.startup_data.len(),
                 "Forwarding buffered startup data"
             );
-            backend_conn
+            managed_conn
+                .stream_mut()
                 .write_all(&self.startup_data)
                 .await
                 .context("Failed to forward startup data")?;
@@ -195,8 +213,6 @@ impl ConnectionHandler {
                                             query: query.clone(),
                                             param_oids: param_oids.clone(),
                                         });
-                                        // Set pending with empty params for Parse errors
-                                        // Will be overwritten by Bind if Parse succeeds
                                         stmt_cache.set_pending(String::new(), PendingExecution {
                                             query: query.clone(),
                                             params: vec![],
@@ -204,16 +220,6 @@ impl ConnectionHandler {
                                             started_at: Instant::now(),
                                         });
 
-                                        // Track prepared statement in connection state (for pinning)
-                                        //
-                                        // KNOWN LIMITATION: State tracking happens before backend confirmation.
-                                        // If Parse fails at the backend, we'll incorrectly think we have a prepared
-                                        // statement that doesn't exist. This is safe but suboptimal - the connection
-                                        // stays pinned when it doesn't need to be. The prepared statement will be
-                                        // re-prepared on the next attempt, and the phantom entry doesn't cause issues.
-                                        // A full fix would require tracking "pending" state changes and only applying
-                                        // them when ParseComplete is received, but the complexity isn't justified
-                                        // given the minimal practical impact.
                                         conn_state.add_prepared_statement(
                                             name.clone(),
                                             query.clone(),
@@ -251,7 +257,6 @@ impl ConnectionHandler {
                                             warn!(query = %query, error = %err_msg, "Command rejected by pooling mode");
                                             let error_response = ModeEnforcer::build_error_response(&err_msg);
                                             self.client_stream.write_all(&error_response).await.context("Failed to send error to client")?;
-                                            // Send ReadyForQuery to complete the error cycle
                                             let ready_for_query = Self::build_ready_for_query(txn_tracker.state());
                                             self.client_stream.write_all(&ready_for_query).await.context("Failed to send ReadyForQuery")?;
                                             should_forward = false;
@@ -266,16 +271,6 @@ impl ConnectionHandler {
                                             started_at: Instant::now(),
                                         });
 
-                                        // Update connection state based on detected command
-                                        //
-                                        // KNOWN LIMITATION: State tracking happens before backend confirmation.
-                                        // If a SET/CREATE TEMP TABLE/etc. command fails at the backend, we'll
-                                        // incorrectly track state that doesn't exist. This results in conservative
-                                        // behavior - the connection stays pinned when it might not need to be.
-                                        // This is safe (no data corruption or incorrect behavior) but suboptimal.
-                                        // A full fix would require tracking "pending" state and only applying
-                                        // changes on CommandComplete, discarding on ErrorResponse. Given the
-                                        // minimal practical impact, we accept this limitation.
                                         Self::update_connection_state(&mut conn_state, query);
                                     }
                                     Message::Close { kind, ref name } => {
@@ -292,9 +287,9 @@ impl ConnectionHandler {
                                 }
                             }
 
-                            // Forward to backend (using DerefMut to get &mut BackendTransport) if not rejected
+                            // Forward to backend if not rejected
                             if should_forward {
-                                backend_conn.write_all(data).await.context("Failed to write to backend")?;
+                                managed_conn.stream_mut().write_all(data).await.context("Failed to write to backend")?;
                             }
                         }
                         Err(e) => {
@@ -305,7 +300,7 @@ impl ConnectionHandler {
                 }
 
                 // Backend -> Client
-                result = backend_conn.read(&mut backend_buffer) => {
+                result = managed_conn.stream_mut().read(&mut backend_buffer) => {
                     match result {
                         Ok(0) => {
                             debug!("Backend closed connection");
@@ -316,7 +311,6 @@ impl ConnectionHandler {
 
                             // Check for error response
                             if let Some(error_msg) = extractor.extract_error(data) {
-                                // Try unnamed portal first (simple query), then named
                                 if let Some(pending) = stmt_cache.take_pending("") {
                                     let duration = pending.started_at.elapsed();
                                     warn!(query = %pending.query, error = %error_msg, duration_ms = duration.as_millis(), "Query failed");
@@ -371,6 +365,7 @@ impl ConnectionHandler {
                                 txn_tracker.update_from_ready_for_query(status);
 
                                 // Log transaction boundary for debugging
+                                // TODO(Task 1.4): Implement actual connection release here
                                 if was_in_transaction && txn_tracker.is_idle() {
                                     debug!(
                                         connection_id = connection_id,
@@ -393,11 +388,14 @@ impl ConnectionHandler {
             }
         }
 
+        // Release connection back to pool manager when handler exits
+        pool_manager.release(managed_conn);
+
         info!(
             connection_id = connection_id,
             is_pinned = conn_state.is_pinned(),
             has_unsafe_state = conn_state.has_unsafe_state(),
-            "Connection handler completed (pooled)"
+            "Connection handler completed (managed)"
         );
         Ok(())
     }
