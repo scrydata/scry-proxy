@@ -282,7 +282,7 @@ impl ConnectionHandler {
                                 }
                             }
 
-                            // Forward to backend (using DerefMut to get &mut TcpStream) if not rejected
+                            // Forward to backend (using DerefMut to get &mut BackendTransport) if not rejected
                             if should_forward {
                                 backend_conn.write_all(data).await.context("Failed to write to backend")?;
                             }
