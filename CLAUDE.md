@@ -176,9 +176,17 @@ Main proxy server implementation.
   - All features independently configurable via 12-factor env vars
   - Prometheus metrics exposed via /metrics endpoint
   - <1ms latency overhead (lock-free atomic operations)
+- ✅ TLS/SSL support for client and backend connections
+  - Client-facing TLS (clients → proxy) with PostgreSQL SSL handshake
+  - Backend TLS (proxy → database) for cloud databases (RDS, Cloud SQL)
+  - SSL modes: disable, allow, require, verify-ca, verify-full
+  - ClientTransport and BackendTransport abstractions for unified I/O
+  - Certificate loading with rustls and tokio-rustls
+  - 7 TLS integration tests
 
 **TODO:**
 - ✅ Backend connection pooling (complete)
 - ✅ Production event publisher (HTTP with FlexBuffers)
 - ✅ Query anonymization (with value fingerprinting for hot data detection)
 - ✅ Circuit breaking, retries, and health checks (complete with 12-factor configuration)
+- ✅ TLS/SSL support (client and backend connections with PgBouncer-compatible SSL modes)
