@@ -15,13 +15,13 @@
 use crate::proxy::connection_state::PinReason;
 use crate::proxy::tcp_pool::{PooledConnection, TcpConnectionPool};
 use crate::proxy::wait_queue::{QueueFullError, WaitQueue};
+use crate::tls::BackendTransport;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
-use tokio::net::TcpStream;
 use tracing::{debug, trace, warn};
 
 /// Errors that can occur when acquiring a connection
@@ -99,13 +99,13 @@ pub struct ManagedConnection {
 }
 
 impl ManagedConnection {
-    /// Get a reference to the underlying TCP stream
-    pub fn stream(&self) -> &TcpStream {
+    /// Get a reference to the underlying backend transport (TCP or TLS)
+    pub fn stream(&self) -> &BackendTransport {
         self.connection.as_ref().expect("connection taken")
     }
 
-    /// Get a mutable reference to the underlying TCP stream
-    pub fn stream_mut(&mut self) -> &mut TcpStream {
+    /// Get a mutable reference to the underlying backend transport (TCP or TLS)
+    pub fn stream_mut(&mut self) -> &mut BackendTransport {
         self.connection.as_mut().expect("connection taken")
     }
 
@@ -417,6 +417,7 @@ impl PoolManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::TlsConfig;
     use crate::protocol::postgres::PostgresProtocol;
     use crate::protocol::{Protocol, ProtocolConfig};
 
@@ -433,10 +434,14 @@ mod tests {
             user: Some("postgres".to_string()),
             password: Some("password".to_string()),
         };
+        let tls_config = TlsConfig::default();
 
         Arc::new(
             TcpConnectionPool::new(
-                protocol, config, 10,   // max_size
+                protocol,
+                config,
+                &tls_config,
+                10,   // max_size
                 None, // min_idle
                 None, // circuit_breaker
                 None, // retry_config

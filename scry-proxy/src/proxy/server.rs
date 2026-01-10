@@ -1,5 +1,5 @@
 use super::{ConnectionHandler, EventBatcher, TcpConnectionPool};
-use crate::config::{Config, PoolingStrategy};
+use crate::config::{Config, PoolingStrategy, TlsSslMode};
 use crate::observability::ProxyMetrics;
 use crate::protocol::{Protocol, ProtocolConfig, ProtocolRegistry};
 use crate::resilience::{ActiveHealthcheck, CircuitBreaker};
@@ -150,6 +150,7 @@ impl ProxyServer {
             let pool = TcpConnectionPool::new(
                 Arc::clone(&protocol),
                 protocol_config,
+                &config.tls,
                 config.performance.pool_size,
                 Some(config.performance.pool_min_idle),
                 circuit_breaker,
@@ -157,6 +158,13 @@ impl ProxyServer {
                 config.performance.pool_lifo,
             )
             .context("Failed to create TCP connection pool")?;
+
+            if config.tls.server_tls_sslmode != TlsSslMode::Disable {
+                info!(
+                    sslmode = ?config.tls.server_tls_sslmode,
+                    "Backend TLS enabled"
+                );
+            }
 
             info!("TCP connection pool created successfully");
             Some(Arc::new(pool))

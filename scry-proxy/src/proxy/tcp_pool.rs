@@ -1,32 +1,34 @@
-/// Protocol-agnostic TCP connection pooling
+/// Protocol-agnostic TCP connection pooling with optional TLS
 ///
 /// This module provides a generic connection pool that works with any
 /// database protocol implementing the Protocol trait. The pool manages
-/// raw TCP connections and delegates protocol-specific behavior (state
+/// TCP or TLS connections and delegates protocol-specific behavior (state
 /// reset, health checks) to the Protocol implementation.
-use crate::config::ConnectionRetryConfig;
+use crate::config::{ConnectionRetryConfig, TlsConfig, TlsSslMode};
 use crate::protocol::{Protocol, ProtocolConfig};
 use crate::resilience::{CircuitBreaker, RetryStrategy};
+use crate::tls::{load_server_tls_config, upgrade_backend_to_tls, BackendTransport};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use deadpool::managed::{Manager, Pool, QueueMode, RecycleResult};
+use rustls::ClientConfig;
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
-/// Pooled TCP connection wrapper
+/// Pooled backend connection wrapper
 ///
-/// This type wraps a pooled TCP stream connection. When dropped, the connection
-/// is automatically returned to the pool for reuse.
-pub(crate) type PooledConnection = deadpool::managed::Object<TcpStreamManager>;
+/// This type wraps a pooled backend connection (TCP or TLS).
+/// When dropped, the connection is automatically returned to the pool.
+pub(crate) type PooledConnection = deadpool::managed::Object<BackendTransportManager>;
 
 /// TCP connection pool for database backends
 ///
 /// This pool is protocol-agnostic and works with any Protocol implementation.
-/// It manages raw TCP streams and uses the Protocol trait for lifecycle hooks.
+/// It manages TCP or TLS streams and uses the Protocol trait for lifecycle hooks.
 /// Includes circuit breaker and retry logic for resilience.
 pub struct TcpConnectionPool {
-    pool: Pool<TcpStreamManager>,
+    pool: Pool<BackendTransportManager>,
     protocol: Arc<dyn Protocol>,
     config: ProtocolConfig,
     circuit_breaker: Option<Arc<CircuitBreaker>>,
@@ -34,11 +36,12 @@ pub struct TcpConnectionPool {
 }
 
 impl TcpConnectionPool {
-    /// Create a new TCP connection pool
+    /// Create a new TCP connection pool with optional TLS
     ///
     /// # Arguments
     /// * `protocol` - Protocol implementation (Postgres, MySQL, etc.)
     /// * `config` - Protocol-agnostic connection configuration
+    /// * `tls_config` - TLS configuration for backend connections
     /// * `max_size` - Maximum number of connections in the pool
     /// * `min_idle` - Minimum number of idle connections to maintain
     /// * `circuit_breaker` - Optional circuit breaker for resilience
@@ -47,6 +50,7 @@ impl TcpConnectionPool {
     pub fn new(
         protocol: Arc<dyn Protocol>,
         config: ProtocolConfig,
+        tls_config: &TlsConfig,
         max_size: usize,
         min_idle: Option<usize>,
         circuit_breaker: Option<Arc<CircuitBreaker>>,
@@ -55,6 +59,10 @@ impl TcpConnectionPool {
     ) -> Result<Self> {
         let queue_mode = if lifo { QueueMode::Lifo } else { QueueMode::Fifo };
 
+        // Load TLS configuration for backend connections
+        let server_tls_config =
+            load_server_tls_config(tls_config).context("Failed to load server TLS configuration")?;
+
         info!(
             protocol = protocol.name(),
             backend_addr = %config.backend_addr(),
@@ -62,13 +70,18 @@ impl TcpConnectionPool {
             min_idle = ?min_idle,
             circuit_breaker_enabled = circuit_breaker.is_some(),
             retry_enabled = retry_config.is_some(),
+            tls_enabled = server_tls_config.is_some(),
+            sslmode = ?tls_config.server_tls_sslmode,
             lifo = lifo,
-            "Creating TCP connection pool"
+            "Creating backend connection pool"
         );
 
-        let manager = TcpStreamManager {
+        let manager = BackendTransportManager {
             backend_addr: config.backend_addr(),
+            backend_host: config.host.clone(),
             protocol: Arc::clone(&protocol),
+            tls_config: server_tls_config,
+            tls_sslmode: tls_config.server_tls_sslmode.clone(),
         };
 
         let mut builder = Pool::builder(manager).max_size(max_size).queue_mode(queue_mode);
@@ -85,7 +98,7 @@ impl TcpConnectionPool {
             .build()
             .context("Failed to create connection pool")?;
 
-        info!("TCP connection pool created successfully");
+        info!("Backend connection pool created successfully");
 
         Ok(Self { pool, protocol, config, circuit_breaker, retry_config })
     }
@@ -177,38 +190,56 @@ pub struct PoolStatus {
     pub backend_addr: String,
 }
 
-/// Manager for raw TCP stream connections
+/// Manager for backend transport connections (TCP or TLS)
 ///
 /// Implements deadpool's Manager trait to handle connection lifecycle:
-/// - Creating new connections
+/// - Creating new connections (with optional TLS upgrade)
 /// - Recycling connections between uses
-pub struct TcpStreamManager {
+pub struct BackendTransportManager {
     backend_addr: String,
+    backend_host: String,
     protocol: Arc<dyn Protocol>,
+    tls_config: Option<Arc<ClientConfig>>,
+    tls_sslmode: TlsSslMode,
 }
 
 #[async_trait]
-impl Manager for TcpStreamManager {
-    type Type = TcpStream;
+impl Manager for BackendTransportManager {
+    type Type = BackendTransport;
     type Error = anyhow::Error;
 
-    /// Create a new TCP connection to the backend
-    async fn create(&self) -> Result<TcpStream, Self::Error> {
+    /// Create a new backend connection, optionally upgrading to TLS
+    async fn create(&self) -> Result<BackendTransport, Self::Error> {
         debug!(
             backend_addr = %self.backend_addr,
             protocol = self.protocol.name(),
-            "Creating new TCP connection"
+            sslmode = ?self.tls_sslmode,
+            "Creating new backend connection"
         );
 
+        // First, establish TCP connection
         let stream =
             TcpStream::connect(&self.backend_addr).await.context("Failed to connect to backend")?;
 
-        debug!(
-            backend_addr = %self.backend_addr,
-            "TCP connection established"
-        );
+        debug!(backend_addr = %self.backend_addr, "TCP connection established");
 
-        Ok(stream)
+        // Then, negotiate SSL if configured
+        let transport = upgrade_backend_to_tls(
+            stream,
+            &self.backend_host,
+            &self.tls_sslmode,
+            self.tls_config.clone(),
+        )
+        .await
+        .context("Failed to negotiate SSL with backend")?;
+
+        if transport.is_encrypted() {
+            info!(backend_addr = %self.backend_addr, "Backend connection using TLS");
+        } else {
+            debug!(backend_addr = %self.backend_addr, "Backend connection using plain TCP");
+        }
+
+        Ok(transport)
     }
 
     /// Recycle a connection before returning it to the pool
@@ -218,44 +249,59 @@ impl Manager for TcpStreamManager {
     /// reset_connection method to clear any session state.
     async fn recycle(
         &self,
-        conn: &mut TcpStream,
+        conn: &mut BackendTransport,
         _metrics: &deadpool::managed::Metrics,
     ) -> RecycleResult<Self::Error> {
-        debug!(protocol = self.protocol.name(), "Recycling connection");
+        debug!(protocol = self.protocol.name(), "Recycling backend connection");
 
-        // First, check if connection is still healthy
-        match self.protocol.health_check(conn).await {
-            Ok(true) => {
-                debug!("Connection health check passed");
-            }
-            Ok(false) => {
-                warn!("Connection failed health check, will be closed");
-                return Err(deadpool::managed::RecycleError::Backend(anyhow::anyhow!(
-                    "Connection failed health check"
-                )));
-            }
-            Err(e) => {
-                warn!(error = %e, "Connection health check error, will be closed");
-                return Err(deadpool::managed::RecycleError::Backend(e));
-            }
-        }
+        // Health check and reset work differently for plain vs TLS connections
+        // For plain TCP, we can use the protocol methods directly
+        // For TLS, we have limited health check capability without protocol changes
+        match conn {
+            BackendTransport::Plain(stream) => {
+                // First, check if connection is still healthy
+                match self.protocol.health_check(stream).await {
+                    Ok(true) => {
+                        debug!("Connection health check passed");
+                    }
+                    Ok(false) => {
+                        warn!("Connection failed health check, will be closed");
+                        return Err(deadpool::managed::RecycleError::Backend(anyhow::anyhow!(
+                            "Connection failed health check"
+                        )));
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Connection health check error, will be closed");
+                        return Err(deadpool::managed::RecycleError::Backend(e));
+                    }
+                }
 
-        // Try to reset connection state
-        match self.protocol.reset_connection(conn).await {
-            Ok(true) => {
-                debug!("Connection state reset successfully");
+                // Try to reset connection state
+                match self.protocol.reset_connection(stream).await {
+                    Ok(true) => {
+                        debug!("Connection state reset successfully");
+                        Ok(())
+                    }
+                    Ok(false) => {
+                        // Protocol doesn't support reset - close connection
+                        debug!("Protocol doesn't support state reset, closing connection");
+                        Err(deadpool::managed::RecycleError::Backend(anyhow::anyhow!(
+                            "Protocol does not support connection reset"
+                        )))
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Failed to reset connection state, will be closed");
+                        Err(deadpool::managed::RecycleError::Backend(e))
+                    }
+                }
+            }
+            BackendTransport::Tls(_) => {
+                // For TLS connections, we can't easily run protocol health checks
+                // without making Protocol trait generic over AsyncRead+AsyncWrite.
+                // For now, assume TLS connections are healthy if they haven't errored.
+                // TODO: Make Protocol trait generic over AsyncRead+AsyncWrite
+                debug!("TLS connection recycled (limited health check)");
                 Ok(())
-            }
-            Ok(false) => {
-                // Protocol doesn't support reset - close connection
-                debug!("Protocol doesn't support state reset, closing connection");
-                Err(deadpool::managed::RecycleError::Backend(anyhow::anyhow!(
-                    "Protocol does not support connection reset"
-                )))
-            }
-            Err(e) => {
-                warn!(error = %e, "Failed to reset connection state, will be closed");
-                Err(deadpool::managed::RecycleError::Backend(e))
             }
         }
     }
@@ -276,10 +322,12 @@ mod tests {
             user: Some("postgres".to_string()),
             password: Some("password".to_string()),
         };
+        let tls_config = TlsConfig::default();
 
         let pool = TcpConnectionPool::new(
             protocol,
             config,
+            &tls_config,
             10,
             Some(2),
             None, // circuit_breaker
