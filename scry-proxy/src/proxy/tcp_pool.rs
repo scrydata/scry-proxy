@@ -47,6 +47,7 @@ impl TcpConnectionPool {
     /// * `circuit_breaker` - Optional circuit breaker for resilience
     /// * `retry_config` - Optional retry configuration
     /// * `lifo` - Use LIFO (last-in-first-out) connection selection for better cache locality
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         protocol: Arc<dyn Protocol>,
         config: ProtocolConfig,
@@ -60,8 +61,8 @@ impl TcpConnectionPool {
         let queue_mode = if lifo { QueueMode::Lifo } else { QueueMode::Fifo };
 
         // Load TLS configuration for backend connections
-        let server_tls_config =
-            load_server_tls_config(tls_config).context("Failed to load server TLS configuration")?;
+        let server_tls_config = load_server_tls_config(tls_config)
+            .context("Failed to load server TLS configuration")?;
 
         info!(
             protocol = protocol.name(),

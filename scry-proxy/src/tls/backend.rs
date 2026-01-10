@@ -54,10 +54,7 @@ pub async fn negotiate_backend_ssl(
         TlsSslMode::Allow | TlsSslMode::Require | TlsSslMode::VerifyCa | TlsSslMode::VerifyFull => {
             // Send SSL request to backend
             debug!("Sending SSLRequest to backend");
-            stream
-                .write_all(&SSL_REQUEST)
-                .await
-                .context("Failed to send SSLRequest to backend")?;
+            stream.write_all(&SSL_REQUEST).await.context("Failed to send SSLRequest to backend")?;
 
             // Read single-byte response
             let mut response = [0u8; 1];
@@ -91,9 +88,7 @@ pub async fn negotiate_backend_ssl(
                         .context("TLS handshake with backend failed")?;
 
                     info!("Backend TLS handshake completed");
-                    Ok(BackendSslResult::Upgraded(BackendTransport::Tls(Box::new(
-                        tls_stream,
-                    ))))
+                    Ok(BackendSslResult::Upgraded(BackendTransport::Tls(Box::new(tls_stream))))
                 }
 
                 b'N' => {
@@ -137,9 +132,9 @@ pub async fn upgrade_backend_to_tls(
     match negotiate_backend_ssl(stream, hostname, sslmode, tls_config).await? {
         BackendSslResult::Upgraded(transport) => Ok(transport),
         BackendSslResult::Declined(stream) => Ok(BackendTransport::Plain(stream)),
-        BackendSslResult::Required => Err(anyhow::anyhow!(
-            "Backend does not support SSL but configuration requires it"
-        )),
+        BackendSslResult::Required => {
+            Err(anyhow::anyhow!("Backend does not support SSL but configuration requires it"))
+        }
     }
 }
 

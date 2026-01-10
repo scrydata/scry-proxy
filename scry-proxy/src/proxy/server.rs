@@ -174,8 +174,8 @@ impl ProxyServer {
         };
 
         // Load TLS configuration for client connections
-        let tls_config = load_client_tls_config(&config.tls)
-            .context("Failed to load TLS configuration")?;
+        let tls_config =
+            load_client_tls_config(&config.tls).context("Failed to load TLS configuration")?;
 
         if tls_config.is_some() {
             info!(

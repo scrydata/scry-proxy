@@ -113,9 +113,7 @@ pub async fn handle_ssl_startup(
             let tls_stream = acceptor.accept(stream).await?;
 
             info!("TLS handshake completed");
-            Ok(SslStartupResult::Upgraded(ClientTransport::Tls(Box::new(
-                tls_stream,
-            ))))
+            Ok(SslStartupResult::Upgraded(ClientTransport::Tls(Box::new(tls_stream))))
         }
 
         (TlsSslMode::Require | TlsSslMode::VerifyCa | TlsSslMode::VerifyFull, None) => {
@@ -124,10 +122,7 @@ pub async fn handle_ssl_startup(
             warn!("TLS required but not configured, declining (config error)");
             stream.write_all(&[SSL_RESPONSE_NO]).await?;
 
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "TLS required but not configured",
-            ))
+            Err(std::io::Error::other("TLS required but not configured"))
         }
     }
 }

@@ -307,13 +307,9 @@ async fn test_backend_tls_require_fails_without_ssl() {
 
     let server_tls = load_server_tls_config(&tls_config).unwrap();
 
-    let result = upgrade_backend_to_tls(
-        stream,
-        "localhost",
-        &tls_config.server_tls_sslmode,
-        server_tls,
-    )
-    .await;
+    let result =
+        upgrade_backend_to_tls(stream, "localhost", &tls_config.server_tls_sslmode, server_tls)
+            .await;
 
     // Should fail because backend declined SSL
     match result {
@@ -359,13 +355,9 @@ async fn test_backend_tls_allow_fallback() {
 
     let server_tls = load_server_tls_config(&tls_config).unwrap();
 
-    let result = upgrade_backend_to_tls(
-        stream,
-        "localhost",
-        &tls_config.server_tls_sslmode,
-        server_tls,
-    )
-    .await;
+    let result =
+        upgrade_backend_to_tls(stream, "localhost", &tls_config.server_tls_sslmode, server_tls)
+            .await;
 
     // Should succeed with plain TCP fallback
     match result {
@@ -394,12 +386,11 @@ async fn test_backend_tls_disable_skips_negotiation() {
         // With sslmode=disable, we should NOT receive an SSLRequest
         // Set a short timeout - if we receive anything, the test should fail
         let mut buf = [0u8; 8];
-        let result =
-            tokio::time::timeout(Duration::from_millis(100), stream.read(&mut buf)).await;
+        let result = tokio::time::timeout(Duration::from_millis(100), stream.read(&mut buf)).await;
 
         // We expect timeout (no data received) because sslmode=disable skips negotiation
         match result {
-            Err(_) => {} // Timeout is expected - no SSL negotiation
+            Err(_) => {}    // Timeout is expected - no SSL negotiation
             Ok(Ok(0)) => {} // Connection closed without sending is also fine
             Ok(Ok(_)) => panic!("Received unexpected data with sslmode=disable"),
             Ok(Err(e)) => panic!("Unexpected error: {}", e),
@@ -412,13 +403,9 @@ async fn test_backend_tls_disable_skips_negotiation() {
 
     let server_tls = load_server_tls_config(&tls_config).unwrap();
 
-    let result = upgrade_backend_to_tls(
-        stream,
-        "localhost",
-        &tls_config.server_tls_sslmode,
-        server_tls,
-    )
-    .await;
+    let result =
+        upgrade_backend_to_tls(stream, "localhost", &tls_config.server_tls_sslmode, server_tls)
+            .await;
 
     // Should succeed immediately with plain TCP (no negotiation)
     match result {

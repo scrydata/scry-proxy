@@ -32,6 +32,7 @@ pub struct ConnectionHandler {
 }
 
 impl ConnectionHandler {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         client_stream: ClientTransport,
         client_addr: SocketAddr,
@@ -42,7 +43,16 @@ impl ConnectionHandler {
         metrics: Arc<ProxyMetrics>,
         startup_data: Vec<u8>,
     ) -> Self {
-        Self { client_stream, client_addr, connection_id, config, batcher, pool, metrics, startup_data }
+        Self {
+            client_stream,
+            client_addr,
+            connection_id,
+            config,
+            batcher,
+            pool,
+            metrics,
+            startup_data,
+        }
     }
 
     /// Convert PoolingStrategy from config to PoolingMode for enforcement
