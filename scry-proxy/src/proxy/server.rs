@@ -281,7 +281,7 @@ impl ProxyServer {
 
                             let config = Arc::clone(&self.config);
                             let batcher = Arc::clone(&self.batcher);
-                            let pool = self.pool.clone();
+                            let pool_manager = self.pool_manager.clone();
                             let metrics = Arc::clone(&self.metrics);
                             let tls_config = self.tls_config.clone();
 
@@ -330,7 +330,7 @@ impl ProxyServer {
                                     conn_id,
                                     config,
                                     batcher,
-                                    pool,
+                                    pool_manager,
                                     metrics,
                                     startup_data,
                                 );

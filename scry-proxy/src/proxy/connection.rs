@@ -1,6 +1,6 @@
 use super::{
-    ConnectionState, EventBatcher, ModeEnforcer, PendingExecution, PoolingMode, PreparedStatement,
-    PreparedStatementCache, TcpConnectionPool, TransactionTracker,
+    ConnectionState, EventBatcher, ModeEnforcer, PendingExecution, PoolingMode, PoolManager,
+    PreparedStatement, PreparedStatementCache, TransactionTracker,
 };
 use crate::config::{Config, PoolingStrategy};
 use crate::observability::{ProxyMetrics, QueryTimeline};
@@ -26,7 +26,7 @@ pub struct ConnectionHandler {
     connection_id: u64,
     config: Arc<Config>,
     batcher: Arc<EventBatcher>,
-    pool: Option<Arc<TcpConnectionPool>>,
+    pool_manager: Option<Arc<PoolManager>>,
     metrics: Arc<ProxyMetrics>,
     startup_data: Vec<u8>,
 }
@@ -39,7 +39,7 @@ impl ConnectionHandler {
         connection_id: u64,
         config: Arc<Config>,
         batcher: Arc<EventBatcher>,
-        pool: Option<Arc<TcpConnectionPool>>,
+        pool_manager: Option<Arc<PoolManager>>,
         metrics: Arc<ProxyMetrics>,
         startup_data: Vec<u8>,
     ) -> Self {
@@ -49,7 +49,7 @@ impl ConnectionHandler {
             connection_id,
             config,
             batcher,
-            pool,
+            pool_manager,
             metrics,
             startup_data,
         }
@@ -96,17 +96,17 @@ impl ConnectionHandler {
     pub async fn handle(self) -> Result<()> {
         info!("Starting connection handler");
 
-        // Get backend connection - either from pool or create direct connection
+        // Get backend connection - either from pool manager or create direct connection
         let backend_addr = format!("{}:{}", self.config.backend.host, self.config.backend.port);
 
-        // Try to get connection from pool if available
-        if let Some(ref pool) = self.pool {
+        // Try to get connection from pool manager if available
+        if let Some(ref pool_manager) = self.pool_manager {
             info!(
                 backend_addr = %backend_addr,
                 connection_id = self.connection_id,
-                "Getting backend connection from pool"
+                "Getting backend connection from PoolManager"
             );
-            let pooled_conn = pool.get().await.context("Failed to get connection from pool")?;
+            let pooled_conn = pool_manager.pool().get().await.context("Failed to get connection from pool")?;
             info!(backend_addr = %backend_addr, "Using pooled backend connection");
 
             // Use pooled connection - keep wrapper alive for entire session
