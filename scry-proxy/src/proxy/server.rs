@@ -238,6 +238,33 @@ impl ProxyServer {
             "Proxy server starting"
         );
 
+        // Spawn idle cleanup background task if pool_manager exists and idle_unpin_secs > 0
+        if let Some(ref pool_manager) = self.pool_manager {
+            let idle_interval = self.config.performance.pool_idle_unpin_secs;
+
+            if idle_interval > 0 {
+                let cleanup_interval_secs = std::cmp::max(1, idle_interval / 2);
+                let pm = Arc::clone(pool_manager);
+                tokio::spawn(async move {
+                    let mut interval =
+                        tokio::time::interval(Duration::from_secs(cleanup_interval_secs));
+                    loop {
+                        interval.tick().await;
+                        let cleaned = pm.cleanup_idle();
+                        if cleaned > 0 {
+                            debug!(cleaned, "Cleaned up idle sticky connections");
+                        }
+                    }
+                });
+
+                info!(
+                    interval_secs = cleanup_interval_secs,
+                    idle_unpin_secs = idle_interval,
+                    "Idle cleanup background task started"
+                );
+            }
+        }
+
         let mut connection_count = 0u64;
         let mut connection_tasks = JoinSet::new();
 
