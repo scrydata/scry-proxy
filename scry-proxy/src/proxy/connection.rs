@@ -1,5 +1,5 @@
 use super::{
-    ConnectionState, EventBatcher, ModeEnforcer, PendingExecution, PoolingMode, PoolManager,
+    ConnectionState, EventBatcher, ModeEnforcer, PendingExecution, PoolManager, PoolingMode,
     PreparedStatement, PreparedStatementCache, TransactionTracker,
 };
 use crate::config::{Config, PoolingStrategy};
@@ -381,48 +381,58 @@ impl ConnectionHandler {
                                 let was_in_transaction = txn_tracker.is_in_transaction();
                                 txn_tracker.update_from_ready_for_query(status);
 
-                                // Check if transaction just completed and we should release connection
-                                if was_in_transaction && txn_tracker.is_idle() {
-                                    if Self::should_release_connection(&pooling_strategy, &conn_state) {
-                                        debug!(
-                                            connection_id = connection_id,
-                                            is_pinned = conn_state.is_pinned(),
-                                            "Transaction complete, releasing connection to pool"
-                                        );
+                                // Determine if we should release the connection back to the pool
+                                // We release when a transaction completes (was_in_transaction && now idle)
+                                //
+                                // Note: We do NOT release for auto-commit queries (queries outside transactions)
+                                // because releasing triggers DISCARD ALL which clears prepared statements.
+                                // Clients using extended protocol (like tokio-postgres) cache prepared
+                                // statement names and would break if we released mid-session.
+                                //
+                                // The connection will be released when the client disconnects (handler exits).
+                                let just_finished_transaction = was_in_transaction && txn_tracker.is_idle();
 
-                                        // Forward to client BEFORE releasing connection
-                                        // This ensures client receives the ReadyForQuery
-                                        self.client_stream.write_all(data).await.context("Failed to write to client")?;
+                                let should_release = Self::should_release_connection(&pooling_strategy, &conn_state);
 
-                                        // Release current connection back to pool
-                                        pool_manager.release(managed_conn);
+                                if just_finished_transaction && should_release {
+                                    debug!(
+                                        connection_id = connection_id,
+                                        is_pinned = conn_state.is_pinned(),
+                                        "Transaction complete, releasing connection to pool"
+                                    );
 
-                                        // Re-acquire connection lazily - spawn a brief yield to allow
-                                        // the released connection to return to the pool
-                                        tokio::task::yield_now().await;
+                                    // Forward to client BEFORE releasing connection
+                                    // This ensures client receives the ReadyForQuery
+                                    self.client_stream.write_all(data).await.context("Failed to write to client")?;
 
-                                        // Now re-acquire connection for next query
-                                        managed_conn = pool_manager
-                                            .acquire(connection_id, conn_state.is_pinned())
-                                            .await
-                                            .context("Failed to re-acquire connection from pool")?;
+                                    // Release current connection back to pool
+                                    pool_manager.release(managed_conn);
 
-                                        debug!(
-                                            connection_id = connection_id,
-                                            new_is_pinned = managed_conn.is_pinned(),
-                                            "Re-acquired connection from pool"
-                                        );
+                                    // Re-acquire connection lazily - spawn a brief yield to allow
+                                    // the released connection to return to the pool
+                                    tokio::task::yield_now().await;
 
-                                        // Continue to next iteration (data already sent to client)
-                                        continue;
-                                    } else {
-                                        debug!(
-                                            connection_id = connection_id,
-                                            is_pinned = conn_state.is_pinned(),
-                                            has_unsafe_state = conn_state.has_unsafe_state(),
-                                            "Transaction ended but connection NOT released (session/pinned)"
-                                        );
-                                    }
+                                    // Now re-acquire connection for next query
+                                    managed_conn = pool_manager
+                                        .acquire(connection_id, conn_state.is_pinned())
+                                        .await
+                                        .context("Failed to re-acquire connection from pool")?;
+
+                                    debug!(
+                                        connection_id = connection_id,
+                                        new_is_pinned = managed_conn.is_pinned(),
+                                        "Re-acquired connection from pool"
+                                    );
+
+                                    // Continue to next iteration (data already sent to client)
+                                    continue;
+                                } else if was_in_transaction && txn_tracker.is_idle() {
+                                    debug!(
+                                        connection_id = connection_id,
+                                        is_pinned = conn_state.is_pinned(),
+                                        has_unsafe_state = conn_state.has_unsafe_state(),
+                                        "Transaction ended but connection NOT released (session/pinned)"
+                                    );
                                 }
                             }
 

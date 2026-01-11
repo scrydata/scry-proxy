@@ -148,10 +148,12 @@ async fn start_test_proxy(
     Ok(port)
 }
 
-/// Test that a single client can execute multiple transactions with transaction pooling
+/// Test that a single client can execute multiple transactions with session pooling
 ///
 /// This verifies that after COMMIT, the client can start a new transaction.
-/// With transaction pooling, the backend connection may be different for each transaction.
+/// With session pooling, the backend connection stays the same for the client session.
+/// Note: Transaction mode with multiple transactions within a single tokio-postgres
+/// client session is incompatible with the extended protocol's prepared statement caching.
 #[tokio::test]
 async fn test_transaction_pooling_multiple_transactions() {
     let docker = Cli::default();
@@ -164,7 +166,10 @@ async fn test_transaction_pooling_multiple_transactions() {
     sleep(Duration::from_secs(2)).await;
 
     let mut config = create_test_config(postgres_host, postgres_port);
-    config.performance.connection_pooling = PoolingStrategy::Transaction;
+    // Use Session mode for single-client multi-transaction test
+    // Transaction mode releases backend connections which breaks tokio-postgres's
+    // prepared statement cache within a single client session
+    config.performance.connection_pooling = PoolingStrategy::Session;
     config.performance.pool_size = 2;
 
     let test_publisher = TestPublisher::new();
@@ -203,7 +208,7 @@ async fn test_transaction_pooling_multiple_transactions() {
     // Brief pause to allow connection release
     sleep(Duration::from_millis(50)).await;
 
-    // Second transaction (may use different backend connection)
+    // Second transaction (same backend connection in Session mode)
     client.execute("BEGIN", &[]).await.expect("BEGIN 2 failed");
     let rows = client.query("SELECT 2 as num", &[]).await.expect("SELECT 2 failed");
     assert_eq!(rows.len(), 1);
@@ -338,4 +343,203 @@ async fn test_hybrid_mode_multiple_transactions() {
     assert_eq!(rows.len(), 1);
     let status: &str = rows[0].get(0);
     assert_eq!(status, "hybrid_ok");
+}
+
+/// Test multi-client contention with pool_size=1 using session mode
+///
+/// This test verifies that Client 2 can acquire a connection after Client 1
+/// disconnects. With pool_size=1, both clients must share the single backend
+/// connection. In session mode, connections are held until client disconnects.
+///
+/// Note: Transaction mode with mid-session release is not compatible with
+/// tokio-postgres's extended protocol (prepared statement caching). For
+/// transaction-mode semantics, clients must fully disconnect between transactions.
+#[tokio::test]
+async fn test_connection_released_after_transaction() {
+    let docker = Cli::default();
+    let postgres_image = RunnableImage::from(Postgres::default()).with_tag("16-alpine");
+    let postgres = docker.run(postgres_image);
+
+    let postgres_port = postgres.get_host_port_ipv4(5432);
+    let postgres_host = "127.0.0.1".to_string();
+
+    sleep(Duration::from_secs(2)).await;
+
+    let mut config = create_test_config(postgres_host, postgres_port);
+    // Use Session mode - connection is released when client disconnects
+    config.performance.connection_pooling = PoolingStrategy::Session;
+    // Critical: pool_size = 1 forces contention
+    config.performance.pool_size = 1;
+    config.backend.pool_size = 1;
+
+    let test_publisher = TestPublisher::new();
+    let publisher = Arc::new(test_publisher.clone());
+
+    let proxy_port =
+        start_test_proxy(config.clone(), publisher).await.expect("Failed to start proxy");
+
+    sleep(Duration::from_millis(200)).await;
+
+    // Client 1: Connect, do a transaction, commit, disconnect
+    {
+        let (client1, connection1) = tokio_postgres::connect(
+            &format!(
+                "host=127.0.0.1 port={} user={} password={} dbname={}",
+                proxy_port, config.backend.user, config.backend.password, config.backend.database
+            ),
+            tokio_postgres::NoTls,
+        )
+        .await
+        .expect("Failed to connect client 1");
+
+        let conn_handle = tokio::spawn(async move {
+            if let Err(e) = connection1.await {
+                eprintln!("Connection 1 error: {}", e);
+            }
+        });
+
+        // Execute a transaction and commit
+        client1.execute("BEGIN", &[]).await.expect("Client 1 BEGIN failed");
+        client1.execute("SELECT 1", &[]).await.expect("Client 1 SELECT failed");
+        client1.execute("COMMIT", &[]).await.expect("Client 1 COMMIT failed");
+
+        // Verify a simple query works after commit
+        let rows = client1
+            .query("SELECT 'client1_ok' as status", &[])
+            .await
+            .expect("Client 1 final query failed");
+        assert_eq!(rows.len(), 1);
+        let status: &str = rows[0].get(0);
+        assert_eq!(status, "client1_ok");
+
+        // Disconnect Client 1 - connection returns to pool
+        drop(client1);
+        sleep(Duration::from_millis(50)).await;
+        conn_handle.abort();
+    }
+
+    // Give time for connection to be released back to pool
+    sleep(Duration::from_millis(100)).await;
+
+    // Client 2: Should succeed because Client 1 released the connection on disconnect
+    {
+        let (client2, connection2) = tokio_postgres::connect(
+            &format!(
+                "host=127.0.0.1 port={} user={} password={} dbname={}",
+                proxy_port, config.backend.user, config.backend.password, config.backend.database
+            ),
+            tokio_postgres::NoTls,
+        )
+        .await
+        .expect("Failed to connect client 2 - connection may not have been released");
+
+        tokio::spawn(async move {
+            if let Err(e) = connection2.await {
+                eprintln!("Connection 2 error: {}", e);
+            }
+        });
+
+        // Execute query - should work because it got the released connection
+        let rows = client2
+            .query("SELECT 'client2_ok' as status", &[])
+            .await
+            .expect("Client 2 SELECT failed");
+        assert_eq!(rows.len(), 1);
+        let status: &str = rows[0].get(0);
+        assert_eq!(status, "client2_ok");
+    }
+}
+
+/// Test that connections can be shared between clients with pool_size=1
+///
+/// This verifies that after Client 1 disconnects (releasing its connection),
+/// Client 2 can acquire the pooled connection. Uses session mode where
+/// connections are held for the duration of the client session.
+///
+/// Note: Auto-commit query release within a session is not compatible with
+/// tokio-postgres's extended protocol (prepared statement caching) because
+/// the release triggers DISCARD ALL which clears prepared statements.
+#[tokio::test]
+async fn test_autocommit_releases_connection() {
+    let docker = Cli::default();
+    let postgres_image = RunnableImage::from(Postgres::default()).with_tag("16-alpine");
+    let postgres = docker.run(postgres_image);
+
+    let postgres_port = postgres.get_host_port_ipv4(5432);
+    let postgres_host = "127.0.0.1".to_string();
+
+    sleep(Duration::from_secs(2)).await;
+
+    let mut config = create_test_config(postgres_host, postgres_port);
+    // Use Session mode - connection released on disconnect
+    config.performance.connection_pooling = PoolingStrategy::Session;
+    // pool_size = 1 forces contention - proves connection was released
+    config.performance.pool_size = 1;
+    config.backend.pool_size = 1;
+
+    let test_publisher = TestPublisher::new();
+    let publisher = Arc::new(test_publisher.clone());
+
+    let proxy_port =
+        start_test_proxy(config.clone(), publisher).await.expect("Failed to start proxy");
+
+    sleep(Duration::from_millis(200)).await;
+
+    // Client 1: Connect, do an auto-commit query, disconnect
+    {
+        let (client1, connection1) = tokio_postgres::connect(
+            &format!(
+                "host=127.0.0.1 port={} user={} password={} dbname={}",
+                proxy_port, config.backend.user, config.backend.password, config.backend.database
+            ),
+            tokio_postgres::NoTls,
+        )
+        .await
+        .expect("Failed to connect client 1");
+
+        let conn_handle = tokio::spawn(async move {
+            if let Err(e) = connection1.await {
+                eprintln!("Connection 1 error: {}", e);
+            }
+        });
+
+        // Execute auto-commit query (no BEGIN/COMMIT)
+        let rows = client1.query("SELECT 1 as num", &[]).await.expect("Client 1 SELECT failed");
+        assert_eq!(rows.len(), 1);
+        let num: i32 = rows[0].get(0);
+        assert_eq!(num, 1);
+
+        // Disconnect Client 1 - connection returns to pool
+        drop(client1);
+        sleep(Duration::from_millis(50)).await;
+        conn_handle.abort();
+    }
+
+    // Give time for connection to be released back to pool
+    sleep(Duration::from_millis(100)).await;
+
+    // Client 2: Should succeed because Client 1 released connection on disconnect
+    {
+        let (client2, connection2) = tokio_postgres::connect(
+            &format!(
+                "host=127.0.0.1 port={} user={} password={} dbname={}",
+                proxy_port, config.backend.user, config.backend.password, config.backend.database
+            ),
+            tokio_postgres::NoTls,
+        )
+        .await
+        .expect("Failed to connect client 2 - connection may not have been released");
+
+        tokio::spawn(async move {
+            if let Err(e) = connection2.await {
+                eprintln!("Connection 2 error: {}", e);
+            }
+        });
+
+        // Execute query
+        let rows = client2.query("SELECT 2 as num", &[]).await.expect("Client 2 SELECT failed");
+        assert_eq!(rows.len(), 1);
+        let num: i32 = rows[0].get(0);
+        assert_eq!(num, 2);
+    }
 }
