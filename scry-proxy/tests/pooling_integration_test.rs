@@ -543,3 +543,199 @@ async fn test_autocommit_releases_connection() {
         assert_eq!(num, 2);
     }
 }
+
+/// Test that session variables are replayed on reconnection (Hybrid mode)
+///
+/// In Hybrid mode, when a client has session variables set (pinning state),
+/// the connection should remain pinned to that client. However, if the client
+/// gets a fresh (unpinned) connection after transaction release, the proxy
+/// should replay the session variables to the new connection.
+///
+/// This test verifies that:
+/// 1. Session variables are tracked as pinning state
+/// 2. The connection is properly pinned when session variables are set
+/// 3. Session variables persist across transactions within a session
+#[tokio::test]
+async fn test_session_variable_state_tracked_in_hybrid_mode() {
+    let docker = Cli::default();
+    let postgres_image = RunnableImage::from(Postgres::default()).with_tag("16-alpine");
+    let postgres = docker.run(postgres_image);
+
+    let postgres_port = postgres.get_host_port_ipv4(5432);
+    let postgres_host = "127.0.0.1".to_string();
+
+    sleep(Duration::from_secs(2)).await;
+
+    let mut config = create_test_config(postgres_host, postgres_port);
+    // Use Hybrid mode for state tracking
+    config.performance.connection_pooling = PoolingStrategy::Hybrid;
+    config.performance.pool_size = 5;
+
+    let test_publisher = TestPublisher::new();
+    let publisher = Arc::new(test_publisher.clone());
+
+    let proxy_port =
+        start_test_proxy(config.clone(), publisher).await.expect("Failed to start proxy");
+
+    sleep(Duration::from_millis(200)).await;
+
+    // Connect client
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user={} password={} dbname={}",
+            proxy_port, config.backend.user, config.backend.password, config.backend.database
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("Failed to connect to proxy");
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("Connection error: {}", e);
+        }
+    });
+
+    // Set a session variable - this should pin the connection in hybrid mode
+    client
+        .execute("SET application_name = 'test_replay'", &[])
+        .await
+        .expect("SET application_name failed");
+
+    // Verify the session variable was set
+    let rows =
+        client.query("SHOW application_name", &[]).await.expect("SHOW application_name failed");
+    let app_name: String = rows[0].get(0);
+    assert_eq!(app_name, "test_replay", "Session variable should be set");
+
+    // Execute a transaction
+    client.execute("BEGIN", &[]).await.expect("BEGIN failed");
+    client.query("SELECT 1", &[]).await.expect("SELECT failed");
+    client.execute("COMMIT", &[]).await.expect("COMMIT failed");
+
+    // Brief pause
+    sleep(Duration::from_millis(50)).await;
+
+    // Verify session variable still works (should persist due to pinning or replay)
+    let rows = client
+        .query("SHOW application_name", &[])
+        .await
+        .expect("SHOW application_name after transaction failed");
+    let app_name: String = rows[0].get(0);
+    assert_eq!(app_name, "test_replay", "Session variable should persist after transaction");
+
+    // Execute another transaction to verify continued state
+    client.execute("BEGIN", &[]).await.expect("BEGIN 2 failed");
+    let rows = client.query("SELECT 42 as num", &[]).await.expect("SELECT 2 failed");
+    assert_eq!(rows.len(), 1);
+    let num: i32 = rows[0].get(0);
+    assert_eq!(num, 42);
+    client.execute("COMMIT", &[]).await.expect("COMMIT 2 failed");
+
+    // Final verification that session variable is still set
+    let rows = client
+        .query("SHOW application_name", &[])
+        .await
+        .expect("Final SHOW application_name failed");
+    let app_name: String = rows[0].get(0);
+    assert_eq!(app_name, "test_replay", "Session variable should still be set at end");
+}
+
+/// Test that prepared statements work after transaction in Hybrid mode
+///
+/// This test verifies that prepared statements created during a session
+/// continue to work after transactions complete. In Hybrid mode, the
+/// connection state (including prepared statements) should be preserved
+/// or replayed.
+#[tokio::test]
+async fn test_prepared_statement_persists_across_transactions_hybrid() {
+    let docker = Cli::default();
+    let postgres_image = RunnableImage::from(Postgres::default()).with_tag("16-alpine");
+    let postgres = docker.run(postgres_image);
+
+    let postgres_port = postgres.get_host_port_ipv4(5432);
+    let postgres_host = "127.0.0.1".to_string();
+
+    sleep(Duration::from_secs(2)).await;
+
+    let mut config = create_test_config(postgres_host, postgres_port);
+    // Use Hybrid mode - connection stays pinned due to prepared statement
+    config.performance.connection_pooling = PoolingStrategy::Hybrid;
+    config.performance.pool_size = 5;
+
+    let test_publisher = TestPublisher::new();
+    let publisher = Arc::new(test_publisher.clone());
+
+    let proxy_port =
+        start_test_proxy(config.clone(), publisher).await.expect("Failed to start proxy");
+
+    sleep(Duration::from_millis(200)).await;
+
+    // Connect client
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user={} password={} dbname={}",
+            proxy_port, config.backend.user, config.backend.password, config.backend.database
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("Failed to connect to proxy");
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("Connection error: {}", e);
+        }
+    });
+
+    // Prepare a statement - this should pin the connection in hybrid mode
+    let stmt = client
+        .prepare("SELECT $1::int + $2::int as sum")
+        .await
+        .expect("Failed to prepare statement");
+
+    // Execute the prepared statement
+    let rows = client.query(&stmt, &[&3i32, &7i32]).await.expect("Failed to execute prepared stmt");
+    assert_eq!(rows.len(), 1);
+    let sum: i32 = rows[0].get(0);
+    assert_eq!(sum, 10);
+
+    // Execute a transaction
+    client.execute("BEGIN", &[]).await.expect("BEGIN failed");
+    let rows = client.query("SELECT 'in_txn' as status", &[]).await.expect("SELECT in txn failed");
+    assert_eq!(rows.len(), 1);
+    let status: &str = rows[0].get(0);
+    assert_eq!(status, "in_txn");
+    client.execute("COMMIT", &[]).await.expect("COMMIT failed");
+
+    // Brief pause
+    sleep(Duration::from_millis(50)).await;
+
+    // Execute the prepared statement again - should still work
+    let rows = client
+        .query(&stmt, &[&10i32, &20i32])
+        .await
+        .expect("Failed to execute prepared stmt after transaction");
+    assert_eq!(rows.len(), 1);
+    let sum: i32 = rows[0].get(0);
+    assert_eq!(sum, 30);
+
+    // Another transaction
+    client.execute("BEGIN", &[]).await.expect("BEGIN 2 failed");
+    // Use prepared statement inside transaction
+    let rows = client
+        .query(&stmt, &[&100i32, &200i32])
+        .await
+        .expect("Failed to execute prepared stmt inside txn");
+    assert_eq!(rows.len(), 1);
+    let sum: i32 = rows[0].get(0);
+    assert_eq!(sum, 300);
+    client.execute("COMMIT", &[]).await.expect("COMMIT 2 failed");
+
+    // Final execution of prepared statement
+    let rows =
+        client.query(&stmt, &[&1i32, &1i32]).await.expect("Final prepared stmt execution failed");
+    assert_eq!(rows.len(), 1);
+    let sum: i32 = rows[0].get(0);
+    assert_eq!(sum, 2, "Prepared statement should work throughout session");
+}

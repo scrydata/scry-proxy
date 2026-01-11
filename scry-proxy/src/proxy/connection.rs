@@ -1,6 +1,6 @@
 use super::{
     ConnectionState, EventBatcher, ModeEnforcer, PendingExecution, PoolManager, PoolingMode,
-    PreparedStatement, PreparedStatementCache, TransactionTracker,
+    PreparedStatement, PreparedStatementCache, StateReplayer, TransactionTracker,
 };
 use crate::config::{Config, PoolingStrategy};
 use crate::observability::{ProxyMetrics, QueryTimeline};
@@ -423,6 +423,49 @@ impl ConnectionHandler {
                                         new_is_pinned = managed_conn.is_pinned(),
                                         "Re-acquired connection from pool"
                                     );
+
+                                    // State replay: if client has state but got a fresh connection,
+                                    // replay the state to the new connection
+                                    if conn_state.is_pinned() && !managed_conn.is_pinned() && !conn_state.has_unsafe_state() {
+                                        let replay_state = conn_state.get_replayable_state();
+                                        if !replay_state.prepared_statements.is_empty() || !replay_state.session_variables.is_empty() {
+                                            debug!(
+                                                connection_id = connection_id,
+                                                prepared_statements = replay_state.prepared_statements.len(),
+                                                session_variables = replay_state.session_variables.len(),
+                                                "Replaying state to new connection"
+                                            );
+
+                                            let replayer = StateReplayer::new();
+                                            match replayer.replay(&replay_state, managed_conn.stream_mut()).await {
+                                                Ok(result) => {
+                                                    if result.is_success() {
+                                                        debug!(
+                                                            connection_id = connection_id,
+                                                            prepared_statements_replayed = result.prepared_statements_replayed,
+                                                            session_variables_replayed = result.session_variables_replayed,
+                                                            "State replay completed successfully"
+                                                        );
+                                                    } else {
+                                                        warn!(
+                                                            connection_id = connection_id,
+                                                            errors = ?result.errors,
+                                                            "State replay had errors"
+                                                        );
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    warn!(
+                                                        connection_id = connection_id,
+                                                        error = %e,
+                                                        "State replay failed"
+                                                    );
+                                                    // Clear client state since replay failed
+                                                    conn_state.clear_all();
+                                                }
+                                            }
+                                        }
+                                    }
 
                                     // Continue to next iteration (data already sent to client)
                                     continue;

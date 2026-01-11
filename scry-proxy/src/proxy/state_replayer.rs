@@ -7,8 +7,7 @@
 
 use crate::proxy::ReplayableState;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 
 /// Default timeout for read operations during state replay
@@ -143,14 +142,16 @@ impl StateReplayer {
     /// Read response from stream until ReadyForQuery is received.
     /// Uses default timeout of 5 seconds.
     /// Returns true if successful, false if error response received.
-    pub async fn read_response(stream: &mut TcpStream) -> Result<bool, anyhow::Error> {
+    pub async fn read_response<S: AsyncRead + Unpin>(
+        stream: &mut S,
+    ) -> Result<bool, anyhow::Error> {
         Self::read_response_with_timeout(stream, DEFAULT_READ_TIMEOUT).await
     }
 
     /// Read response from stream until ReadyForQuery is received with configurable timeout.
     /// Returns true if successful, false if error response received.
-    pub async fn read_response_with_timeout(
-        stream: &mut TcpStream,
+    pub async fn read_response_with_timeout<S: AsyncRead + Unpin>(
+        stream: &mut S,
         read_timeout: Duration,
     ) -> Result<bool, anyhow::Error> {
         let mut buffer = Vec::new();
@@ -218,10 +219,10 @@ impl StateReplayer {
     /// Uses simple query protocol to execute:
     /// - "PREPARE stmt_name AS query" for each prepared statement
     /// - "SET variable = 'value'" for each session variable
-    pub async fn replay(
+    pub async fn replay<S: AsyncRead + AsyncWrite + Unpin>(
         &self,
         state: &ReplayableState,
-        stream: &mut TcpStream,
+        stream: &mut S,
     ) -> Result<ReplayResult, anyhow::Error> {
         let mut result = ReplayResult::default();
 
@@ -274,6 +275,7 @@ impl Default for StateReplayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::TcpStream;
 
     #[test]
     fn test_build_query_message_simple() {
