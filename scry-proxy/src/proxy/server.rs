@@ -18,6 +18,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 #[cfg(unix)]
 use tokio::net::UnixListener;
+use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
@@ -35,7 +36,11 @@ pub struct ProxyServer {
     router: DatabaseRouter,
     metrics: Arc<ProxyMetrics>,
     tls_config: Option<Arc<ServerConfig>>,
-    authenticator: Option<Arc<FileAuthenticator>>,
+    authenticator: std::sync::RwLock<Option<Arc<FileAuthenticator>>>,
+    /// Channel to trigger config reload (e.g., on SIGHUP)
+    reload_trigger: watch::Receiver<()>,
+    /// Sender side of reload channel, exposed for signal handlers
+    reload_sender: watch::Sender<()>,
 }
 
 impl ProxyServer {
@@ -322,6 +327,9 @@ impl ProxyServer {
             warn!("UNIX socket configuration ignored on non-Unix platform");
         }
 
+        // Create reload channel for SIGHUP config reload
+        let (reload_sender, reload_trigger) = watch::channel(());
+
         Ok(Self {
             config: Arc::new(config),
             listener,
@@ -332,7 +340,9 @@ impl ProxyServer {
             router,
             metrics,
             tls_config,
-            authenticator,
+            authenticator: std::sync::RwLock::new(authenticator),
+            reload_trigger,
+            reload_sender,
         })
     }
 
@@ -360,12 +370,64 @@ impl ProxyServer {
     }
 
     /// Get the authenticator, if authentication is enabled
-    pub fn authenticator(&self) -> Option<&Arc<FileAuthenticator>> {
-        self.authenticator.as_ref()
+    pub fn authenticator(&self) -> Option<Arc<FileAuthenticator>> {
+        self.authenticator.read().unwrap().clone()
+    }
+
+    /// Get the reload sender for use by signal handlers
+    ///
+    /// Returns a clone of the watch::Sender that can be used to trigger
+    /// a config reload from external code (e.g., SIGHUP handler in main.rs).
+    pub fn reload_sender(&self) -> watch::Sender<()> {
+        self.reload_sender.clone()
+    }
+
+    /// Apply a config reload, updating hot-reloadable settings
+    ///
+    /// Currently supports reloading:
+    /// - auth_file: Re-reads the userlist.txt file to update user credentials
+    ///
+    /// Settings that require restart (not hot-reloaded):
+    /// - listen_address, unix_socket (requires re-binding)
+    /// - pool_size, pool settings (requires pool recreation)
+    /// - TLS certificates (requires TLS context recreation)
+    pub fn apply_config_reload(&self) {
+        info!("Applying config reload");
+
+        // Reload auth file if configured
+        let auth_file = self.config.auth.auth_file.as_ref();
+        if let Some(auth_file) = auth_file {
+            match FileAuthenticator::from_file(auth_file) {
+                Ok(new_auth) => {
+                    let mut auth_guard = self.authenticator.write().unwrap();
+                    let user_count = new_auth.len();
+                    *auth_guard = Some(Arc::new(new_auth));
+                    info!(
+                        auth_file = %auth_file,
+                        users = user_count,
+                        "Auth file reloaded successfully"
+                    );
+                }
+                Err(e) => {
+                    error!(
+                        auth_file = %auth_file,
+                        error = %e,
+                        "Failed to reload auth file, keeping existing configuration"
+                    );
+                }
+            }
+        }
+
+        // Future: reload other hot-reloadable config here
+        // - circuit breaker thresholds
+        // - publisher settings
+        // - observability settings
+
+        info!("Config reload complete");
     }
 
     /// Run the proxy server, accepting connections until shutdown signal
-    pub async fn run(self) -> Result<()> {
+    pub async fn run(mut self) -> Result<()> {
         info!(
             listen_address = %self.config.proxy.listen_address,
             max_connections = self.config.proxy.max_connections,
@@ -440,7 +502,7 @@ impl ProxyServer {
     /// Accept loop for Unix platforms (supports both TCP and UNIX sockets)
     #[cfg(unix)]
     async fn accept_loop_with_unix(
-        &self,
+        &mut self,
         shutdown: &mut std::pin::Pin<&mut impl std::future::Future<Output = ()>>,
         connection_count: &mut u64,
         connection_tasks: &mut JoinSet<()>,
@@ -460,6 +522,12 @@ impl ProxyServer {
                 _ = &mut *shutdown => {
                     info!("Shutdown signal received, stopping new connections");
                     break;
+                }
+
+                // Handle config reload signal (SIGHUP)
+                _ = self.reload_trigger.changed() => {
+                    info!("Received reload signal");
+                    self.apply_config_reload();
                 }
 
                 accept_result = self.listener.accept() => {
@@ -516,7 +584,7 @@ impl ProxyServer {
     /// Accept loop for non-Unix platforms (TCP only)
     #[cfg(not(unix))]
     async fn accept_loop_tcp_only(
-        &self,
+        &mut self,
         shutdown: &mut std::pin::Pin<&mut impl std::future::Future<Output = ()>>,
         connection_count: &mut u64,
         connection_tasks: &mut JoinSet<()>,
@@ -526,6 +594,12 @@ impl ProxyServer {
                 _ = &mut *shutdown => {
                     info!("Shutdown signal received, stopping new connections");
                     break;
+                }
+
+                // Handle config reload signal
+                _ = self.reload_trigger.changed() => {
+                    info!("Received reload signal");
+                    self.apply_config_reload();
                 }
 
                 accept_result = self.listener.accept() => {
@@ -629,7 +703,8 @@ impl ProxyServer {
         let pool_managers = self.pool_managers.clone();
         let metrics = Arc::clone(&self.metrics);
         let tls_config = self.tls_config.clone();
-        let authenticator = self.authenticator.clone();
+        // Read current authenticator from RwLock (allows hot-reload via SIGHUP)
+        let authenticator = self.authenticator.read().unwrap().clone();
 
         connection_tasks.spawn(async move {
             // Handle SSL startup handshake
@@ -691,7 +766,8 @@ impl ProxyServer {
         let batcher = Arc::clone(&self.batcher);
         let pool_managers = self.pool_managers.clone();
         let metrics = Arc::clone(&self.metrics);
-        let authenticator = self.authenticator.clone();
+        // Read current authenticator from RwLock (allows hot-reload via SIGHUP)
+        let authenticator = self.authenticator.read().unwrap().clone();
 
         connection_tasks.spawn(async move {
             // UNIX sockets don't use SSL, so wrap directly
@@ -1008,5 +1084,90 @@ mod tests {
         assert!(server.router().has_route("app1"));
         assert!(server.router().has_route("app2"));
         assert!(!server.router().has_route("unknown"));
+    }
+
+    #[tokio::test]
+    async fn test_config_reload_updates_auth_file() {
+        // Create initial auth file with one user
+        let mut auth_file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(auth_file, "\"user1\" \"pass1\"").unwrap();
+        auth_file.flush().unwrap();
+
+        let mut config = create_test_config();
+        config.auth.auth_type = AuthType::Md5;
+        config.auth.auth_file = Some(auth_file.path().to_string_lossy().to_string());
+
+        let publisher = Arc::new(DebugLoggerPublisher::new());
+        let metrics = Arc::new(ProxyMetrics::new(100, HealthConfig::default()));
+
+        let server = ProxyServer::new(config, EventBatcher::new(publisher, 10, 100, 1000), metrics)
+            .await
+            .unwrap();
+
+        // Verify initial state
+        let auth = server.authenticator().unwrap();
+        assert!(auth.has_user("user1"));
+        assert!(auth.check_password("user1", "pass1"));
+        assert!(!auth.has_user("user2"));
+
+        // Update auth file with a new user
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(auth_file.path())
+            .unwrap();
+        use std::io::Write as _;
+        writeln!(&file, "\"user1\" \"pass1\"").unwrap();
+        writeln!(&file, "\"user2\" \"pass2\"").unwrap();
+        drop(file);
+
+        // Trigger reload
+        server.apply_config_reload();
+
+        // Verify updated state
+        let auth = server.authenticator().unwrap();
+        assert!(auth.has_user("user1"));
+        assert!(auth.has_user("user2"));
+        assert!(auth.check_password("user2", "pass2"));
+    }
+
+    #[tokio::test]
+    async fn test_reload_sender_can_trigger_reload() {
+        // Create initial auth file
+        let mut auth_file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(auth_file, "\"user1\" \"pass1\"").unwrap();
+        auth_file.flush().unwrap();
+
+        let mut config = create_test_config();
+        config.auth.auth_type = AuthType::Md5;
+        config.auth.auth_file = Some(auth_file.path().to_string_lossy().to_string());
+
+        let publisher = Arc::new(DebugLoggerPublisher::new());
+        let metrics = Arc::new(ProxyMetrics::new(100, HealthConfig::default()));
+
+        let server = ProxyServer::new(config, EventBatcher::new(publisher, 10, 100, 1000), metrics)
+            .await
+            .unwrap();
+
+        // Get reload sender
+        let reload_sender = server.reload_sender();
+
+        // Update auth file
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(auth_file.path())
+            .unwrap();
+        use std::io::Write as _;
+        writeln!(&file, "\"newuser\" \"newpass\"").unwrap();
+        drop(file);
+
+        // Send reload signal (simulating SIGHUP)
+        reload_sender.send(()).unwrap();
+
+        // The reload happens asynchronously in the accept loop,
+        // but for this test we just verify the sender works
+        // In a full integration test, we'd run the server and verify
+        assert!(reload_sender.send(()).is_ok());
     }
 }

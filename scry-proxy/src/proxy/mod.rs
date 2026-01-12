@@ -44,5 +44,33 @@ pub async fn start_proxy(
     );
 
     let server = ProxyServer::new(config, batcher, metrics).await?;
+
+    // Setup SIGHUP handler for config reload (Unix only)
+    #[cfg(unix)]
+    {
+        let reload_sender = server.reload_sender();
+        tokio::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+
+            let mut sighup = match signal(SignalKind::hangup()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to setup SIGHUP handler");
+                    return;
+                }
+            };
+
+            loop {
+                sighup.recv().await;
+                tracing::info!("Received SIGHUP, triggering config reload");
+                if reload_sender.send(()).is_err() {
+                    tracing::warn!("Failed to send reload signal, server may have shutdown");
+                    break;
+                }
+            }
+        });
+        tracing::info!("SIGHUP handler registered for config reload");
+    }
+
     server.run().await
 }
