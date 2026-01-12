@@ -9,8 +9,10 @@
 
 mod authenticator;
 mod file_auth;
+mod scram;
 mod types;
 
 pub use authenticator::{AuthHandshakeResult, Authenticator};
 pub use file_auth::FileAuthenticator;
+pub use scram::{ScramClient, ScramError};
 pub use types::{AuthError, AuthResult, UserCredentials};
