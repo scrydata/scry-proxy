@@ -20,7 +20,9 @@ fn create_test_config(backend_host: String, backend_port: u16) -> Config {
             listen_address: "127.0.0.1:0".to_string(),
             max_connections: 10,
             shutdown_timeout_secs: 5,
+            unix_socket: None,
         },
+        databases: Vec::new(),
         backend: BackendConfig {
             protocol: scry::config::DatabaseProtocol::Postgres,
             host: backend_host,
@@ -373,5 +375,65 @@ async fn test_md5_auth_multiple_users() {
     });
 
     let rows = client3.query("SELECT 3", &[]).await.expect("Query failed for user3");
+    assert_eq!(rows.len(), 1);
+}
+
+/// Test that the proxy can authenticate to a backend that requires MD5 password
+///
+/// This test verifies the BackendAuthenticator works correctly:
+/// 1. Starts Postgres with md5 auth (default in testcontainers)
+/// 2. Starts the proxy pointing to Postgres with backend credentials
+/// 3. Connects a client through the proxy (trust auth to proxy)
+/// 4. Verifies queries work (proving proxy authenticated to backend)
+#[tokio::test]
+async fn test_proxy_with_md5_backend() {
+    // Setup: Start Postgres container (uses MD5 or SCRAM by default)
+    let docker = Cli::default();
+    let postgres_image = RunnableImage::from(Postgres::default()).with_tag("16-alpine");
+    let postgres = docker.run(postgres_image);
+
+    let postgres_port = postgres.get_host_port_ipv4(5432);
+
+    // Wait for Postgres to be ready
+    sleep(Duration::from_secs(2)).await;
+
+    // Create config - client uses trust auth to proxy, proxy uses MD5 to backend
+    let mut config = create_test_config("127.0.0.1".to_string(), postgres_port);
+    config.auth.auth_type = AuthType::Trust;
+    // Backend credentials are already set in create_test_config (postgres/postgres)
+
+    // Start proxy
+    let proxy_port = start_test_proxy(config).await.expect("Failed to start proxy");
+
+    sleep(Duration::from_millis(100)).await;
+
+    // Connect through proxy - no password needed (trust mode to proxy)
+    // Proxy will authenticate to backend using configured credentials
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=testuser dbname=postgres",
+            proxy_port
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("Failed to connect through proxy");
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("Connection error: {}", e);
+        }
+    });
+
+    // Verify query works - this proves proxy authenticated to backend successfully
+    let row = client.query_one("SELECT 1 as value", &[]).await.expect("Query failed");
+    let value: i32 = row.get("value");
+    assert_eq!(value, 1);
+
+    // Run additional query to verify connection is fully working
+    let rows = client
+        .query("SELECT current_user, current_database()", &[])
+        .await
+        .expect("Query failed");
     assert_eq!(rows.len(), 1);
 }
