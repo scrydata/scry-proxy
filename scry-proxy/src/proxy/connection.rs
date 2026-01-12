@@ -146,8 +146,9 @@ impl ConnectionHandler {
             return self.handle_with_managed_connection(managed_conn, &pool_manager).await;
         } else {
             info!(backend_addr = %backend_addr, "Creating direct backend connection");
-            let backend_stream =
-                TcpStream::connect(&backend_addr).await.context("Failed to connect to backend")?;
+            let backend_stream = TcpStream::connect(&backend_addr)
+                .await
+                .context("Failed to connect to backend")?;
 
             // Use direct connection
             return self.handle_with_owned_backend(backend_stream).await;
@@ -159,7 +160,8 @@ impl ConnectionHandler {
     /// This method:
     /// 1. Authenticates the client (if auth enabled)
     /// 2. Forwards the startup message to the backend (with backend credentials)
-    /// 3. Forwards the backend's auth response to the client
+    /// 3. Handles backend authentication (MD5, SCRAM, etc.)
+    /// 4. Forwards remaining startup messages to the client
     ///
     /// After this completes, the connection is ready for query forwarding.
     async fn perform_startup_handshake(
@@ -167,18 +169,21 @@ impl ConnectionHandler {
         backend_stream: &mut (impl AsyncWriteExt + AsyncReadExt + Unpin),
     ) -> Result<()> {
         let connection_id = self.connection_id;
+        debug!(connection_id, "Starting handshake");
 
-        // Create authenticator
+        // Create authenticator for client auth
         let authenticator = Authenticator::new(
             Arc::clone(&self.config),
             self.authenticator.clone(),
         );
 
         // Perform client authentication and get startup bytes for backend
+        debug!(connection_id, startup_data_len = self.startup_data.len(), "Starting client authentication");
         let auth_result = authenticator
             .authenticate(&mut self.client_stream, &self.startup_data)
             .await
             .context("Client authentication failed")?;
+        debug!(connection_id, username = %auth_result.username, "Client authenticated");
 
         info!(
             connection_id = connection_id,
@@ -188,25 +193,57 @@ impl ConnectionHandler {
         );
 
         // Forward startup to backend
-        debug!(
-            connection_id = connection_id,
-            bytes = auth_result.startup_bytes.len(),
-            "Forwarding startup to backend"
-        );
+        debug!(connection_id, bytes = auth_result.startup_bytes.len(), "Forwarding startup to backend");
         backend_stream
             .write_all(&auth_result.startup_bytes)
             .await
             .context("Failed to forward startup to backend")?;
 
-        // Read backend's authentication response and forward to client
-        // Backend may send multiple messages: AuthenticationOk, ParameterStatus, BackendKeyData, ReadyForQuery
+        // Handle backend authentication using BackendAuthenticator
+        let backend_auth = crate::auth::BackendAuthenticator::new(
+            self.config.backend.user.clone(),
+            self.config.backend.password.clone(),
+        );
+
+        debug!(connection_id, "Handling backend authentication");
+        let remaining_data = backend_auth
+            .authenticate(backend_stream, &[])
+            .await
+            .context("Backend authentication failed")?;
+
+        // Forward AuthenticationOk to client
+        let auth_ok = crate::protocol::build_auth_ok();
+        self.client_stream
+            .write_all(&auth_ok)
+            .await
+            .context("Failed to send AuthenticationOk to client")?;
+
+        // Forward any remaining data and continue reading until ReadyForQuery
+        let mut pending = remaining_data;
         let mut backend_buffer = vec![0u8; 8192];
 
         loop {
+            // Check pending data first
+            if !pending.is_empty() {
+                // Forward to client
+                self.client_stream
+                    .write_all(&pending)
+                    .await
+                    .context("Failed to forward startup data to client")?;
+
+                // Check for ReadyForQuery
+                if pending.iter().any(|&b| b == b'Z') {
+                    debug!(connection_id, "Backend startup complete (ReadyForQuery received)");
+                    break;
+                }
+                pending.clear();
+            }
+
+            // Read more from backend
             let n = backend_stream
                 .read(&mut backend_buffer)
                 .await
-                .context("Failed to read backend auth response")?;
+                .context("Failed to read backend startup data")?;
 
             if n == 0 {
                 anyhow::bail!("Backend closed connection during startup");
@@ -218,15 +255,16 @@ impl ConnectionHandler {
             self.client_stream
                 .write_all(data)
                 .await
-                .context("Failed to forward auth response to client")?;
+                .context("Failed to forward startup data to client")?;
 
-            // Check if we received ReadyForQuery ('Z') which means startup is complete
+            // Check for ReadyForQuery
             if data.iter().any(|&b| b == b'Z') {
-                debug!(connection_id = connection_id, "Backend startup complete");
+                debug!(connection_id, "Backend startup complete (ReadyForQuery received)");
                 break;
             }
         }
 
+        debug!(connection_id, "Handshake complete");
         Ok(())
     }
 
