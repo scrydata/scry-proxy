@@ -9,7 +9,8 @@ pub mod traits;
 pub use anonymize::{AnonymizedQuery, QueryAnonymizer};
 pub use auth_messages::{
     build_auth_cleartext_password, build_auth_md5_password, build_auth_ok, build_error_response,
-    compute_md5_response, parse_password_message, verify_md5_response, StartupMessage,
+    build_password_message, build_sasl_initial_response, build_sasl_response,
+    compute_md5_response, parse_password_message, verify_md5_response, AuthRequest, StartupMessage,
 };
 pub use bind::decode_params;
 pub use command_detector::{CommandDetector, DetectedCommand};
