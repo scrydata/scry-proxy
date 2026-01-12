@@ -45,7 +45,9 @@ fn create_pooled_config(backend_host: String, backend_port: u16, pool_size: usiz
             listen_address: "127.0.0.1:0".to_string(),
             max_connections: 10,
             shutdown_timeout_secs: 30,
+            unix_socket: None,
         },
+        databases: Vec::new(),
         backend: BackendConfig {
             protocol: DatabaseProtocol::Postgres,
             host: backend_host,

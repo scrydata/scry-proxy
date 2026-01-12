@@ -71,7 +71,9 @@ fn create_minimal_config() -> Config {
             listen_address: "127.0.0.1:0".to_string(),
             max_connections: 10,
             shutdown_timeout_secs: 5,
+            unix_socket: None,
         },
+        databases: Vec::new(),
         backend: BackendConfig {
             protocol: DatabaseProtocol::Postgres,
             host: "127.0.0.1".to_string(),

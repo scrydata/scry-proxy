@@ -55,7 +55,9 @@ fn create_test_config(host: String, port: u16, pooling: PoolingStrategy) -> Conf
             listen_address: "127.0.0.1:0".to_string(), // Random port
             max_connections: 100,
             shutdown_timeout_secs: 5,
+            unix_socket: None,
         },
+        databases: Vec::new(),
         backend: BackendConfig {
             protocol: DatabaseProtocol::Postgres,
             host,
@@ -758,6 +760,127 @@ async fn test_transaction_mode_rejects_set_outside_transaction() {
             panic!("Expected a database error (DbError) but got a different error type: {}", e);
         }
     }
+}
+
+/// Test that hybrid mode unpins connection after DROP TEMP TABLE
+///
+/// In hybrid mode, creating a temp table pins the connection (prevents release
+/// to pool). After dropping the temp table, the connection should be unpinned
+/// and can be released back to the pool after the transaction.
+///
+/// This test verifies that aggressive unpinning works correctly when the
+/// pinning state (temp table) is removed.
+#[tokio::test]
+async fn test_hybrid_mode_unpins_on_drop_temp_table() {
+    let docker = Cli::default();
+    let postgres_image = RunnableImage::from(Postgres::default()).with_tag("16-alpine");
+    let postgres = docker.run(postgres_image);
+
+    let postgres_port = postgres.get_host_port_ipv4(5432);
+    let postgres_host = "127.0.0.1".to_string();
+
+    sleep(Duration::from_secs(2)).await;
+
+    let mut config = create_test_config(postgres_host, postgres_port, PoolingStrategy::Hybrid);
+    // Enable aggressive unpinning - this allows unpinning when state is cleared
+    config.performance.pool_aggressive_unpinning = true;
+    // Use pool_size = 1 to test connection release
+    config.performance.pool_size = 1;
+
+    let test_publisher = TestPublisher::new();
+    let publisher = Arc::new(test_publisher.clone());
+
+    let proxy_port =
+        start_test_proxy(config.clone(), publisher).await.expect("Failed to start proxy");
+
+    sleep(Duration::from_millis(100)).await;
+
+    // Client 1: Create temp table, then drop it
+    {
+        let (client1, connection1) = tokio_postgres::connect(
+            &format!(
+                "host=127.0.0.1 port={} user={} password={} dbname={}",
+                proxy_port, config.backend.user, config.backend.password, config.backend.database
+            ),
+            tokio_postgres::NoTls,
+        )
+        .await
+        .expect("Failed to connect client 1");
+
+        tokio::spawn(async move {
+            let _ = connection1.await;
+        });
+
+        // Create temp table - this should pin the connection
+        client1
+            .execute("CREATE TEMP TABLE test_unpin (id INT)", &[])
+            .await
+            .expect("CREATE TEMP TABLE failed");
+
+        // Use the temp table
+        client1
+            .execute("INSERT INTO test_unpin VALUES (1)", &[])
+            .await
+            .expect("INSERT failed");
+
+        let rows = client1
+            .query("SELECT COUNT(*) FROM test_unpin", &[])
+            .await
+            .expect("SELECT failed");
+        let count: i64 = rows[0].get(0);
+        assert_eq!(count, 1);
+
+        // Drop the temp table - this should unpin the connection
+        client1.execute("DROP TABLE test_unpin", &[]).await.expect("DROP TABLE failed");
+
+        // Disconnect client 1
+        drop(client1);
+    }
+
+    // Wait for connection to be released back to pool
+    sleep(Duration::from_millis(200)).await;
+
+    // Client 2: Should be able to get a connection now that client 1's
+    // connection was unpinned and released
+    {
+        let connect_result = tokio::time::timeout(
+            Duration::from_secs(3),
+            tokio_postgres::connect(
+                &format!(
+                    "host=127.0.0.1 port={} user={} password={} dbname={}",
+                    proxy_port,
+                    config.backend.user,
+                    config.backend.password,
+                    config.backend.database
+                ),
+                tokio_postgres::NoTls,
+            ),
+        )
+        .await;
+
+        assert!(
+            connect_result.is_ok(),
+            "Client 2 should be able to connect after temp table was dropped"
+        );
+
+        let (client2, connection2) = connect_result.unwrap().expect("Failed to connect client 2");
+
+        tokio::spawn(async move {
+            let _ = connection2.await;
+        });
+
+        // Execute a query to verify connection works
+        let rows = client2.query("SELECT 'unpinned' as status", &[]).await.expect("SELECT failed");
+        let status: &str = rows[0].get(0);
+        assert_eq!(status, "unpinned");
+
+        // Verify the temp table doesn't exist on this connection
+        // (proving we got a clean pooled connection)
+        let result = client2.query("SELECT * FROM test_unpin", &[]).await;
+        assert!(result.is_err(), "Temp table should not exist on pooled connection");
+    }
+
+    println!("Hybrid mode unpin on DROP TEMP TABLE verified");
 }
 
 /// Test that events are captured for transaction operations

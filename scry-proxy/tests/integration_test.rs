@@ -2,7 +2,7 @@
 ///
 /// These tests spin up a real Postgres instance using testcontainers,
 /// start the proxy, and verify end-to-end query execution and event publishing.
-use scry::{config::*, observability::*, proxy::*, publisher::*};
+use scry::{config::*, config::DatabaseConfig, observability::*, proxy::*, publisher::*};
 use scry_protocol::ParamValue;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -59,7 +59,9 @@ fn create_test_config(backend_host: String, backend_port: u16) -> Config {
             listen_address: "127.0.0.1:0".to_string(), // Let OS assign port
             max_connections: 10,
             shutdown_timeout_secs: 30,
+            unix_socket: None,
         },
+        databases: Vec::new(),
         backend: BackendConfig {
             protocol: scry::config::DatabaseProtocol::Postgres,
             host: backend_host,
@@ -139,6 +141,10 @@ async fn start_test_proxy(
     config: Config,
     publisher: Arc<dyn EventPublisher>,
 ) -> anyhow::Result<u16> {
+    println!("DEBUG: Starting proxy with backend {}:{}", config.backend.host, config.backend.port);
+    println!("DEBUG: Listen address: {}", config.proxy.listen_address);
+    println!("DEBUG: Pooling: {:?}", config.performance.connection_pooling);
+
     let batcher = EventBatcher::new(
         publisher,
         config.publisher.batch_size,
@@ -167,6 +173,7 @@ async fn test_basic_query_proxying() {
 
     let postgres_port = postgres.get_host_port_ipv4(5432);
     let postgres_host = "127.0.0.1".to_string();
+    println!("DEBUG: Postgres container on {}:{}", postgres_host, postgres_port);
 
     // Wait for Postgres to be ready
     sleep(Duration::from_secs(2)).await;
@@ -179,9 +186,11 @@ async fn test_basic_query_proxying() {
     // Start proxy
     let proxy_port =
         start_test_proxy(config.clone(), publisher).await.expect("Failed to start proxy");
+    println!("DEBUG: Proxy listening on port {}", proxy_port);
 
     // Wait for proxy to be ready
-    sleep(Duration::from_millis(100)).await;
+    sleep(Duration::from_millis(500)).await;
+    println!("DEBUG: Attempting to connect to proxy at 127.0.0.1:{}", proxy_port);
 
     // Connect client to proxy
     let (client, connection) = tokio_postgres::connect(
@@ -674,4 +683,175 @@ async fn test_prepared_statement_params_captured() {
     // params_incomplete may be true if OIDs weren't in Parse message
     // (tokio_postgres uses server-inferred types)
     println!("params_incomplete: {}", event.params_incomplete);
+}
+
+/// Test multi-database routing with different database names
+///
+/// This test verifies that the proxy correctly routes connections based on
+/// the database name specified in the PostgreSQL startup message. Clients
+/// connecting with different database names should be routed to their
+/// respective backend configurations.
+#[tokio::test]
+async fn test_multi_database_routing() {
+    // Setup: Start Postgres container
+    let docker = Cli::default();
+    let postgres_image = RunnableImage::from(Postgres::default()).with_tag("16-alpine");
+    let postgres = docker.run(postgres_image);
+
+    let postgres_port = postgres.get_host_port_ipv4(5432);
+    let postgres_host = "127.0.0.1".to_string();
+
+    sleep(Duration::from_secs(2)).await;
+
+    // Create config with multiple database routes
+    // All routes point to the same backend (for test simplicity) but have
+    // different logical names - proving the routing mechanism works
+    let mut config = create_test_config(postgres_host.clone(), postgres_port);
+
+    // Add database routing entries
+    config.databases = vec![
+        DatabaseConfig {
+            name: "app_db".to_string(),
+            host: postgres_host.clone(),
+            port: postgres_port,
+            database: "postgres".to_string(), // Same actual DB
+            user: "postgres".to_string(),
+            password: "postgres".to_string(),
+            pool_size: Some(5),
+        },
+        DatabaseConfig {
+            name: "analytics_db".to_string(),
+            host: postgres_host.clone(),
+            port: postgres_port,
+            database: "postgres".to_string(), // Same actual DB
+            user: "postgres".to_string(),
+            password: "postgres".to_string(),
+            pool_size: Some(3),
+        },
+    ];
+
+    let test_publisher = TestPublisher::new();
+    let publisher = Arc::new(test_publisher.clone());
+
+    let proxy_port =
+        start_test_proxy(config.clone(), publisher).await.expect("Failed to start proxy");
+
+    sleep(Duration::from_millis(100)).await;
+
+    // Test 1: Connect using "app_db" logical name
+    {
+        let (client, connection) = tokio_postgres::connect(
+            &format!(
+                "host=127.0.0.1 port={} user=postgres password=postgres dbname=app_db",
+                proxy_port
+            ),
+            tokio_postgres::NoTls,
+        )
+        .await
+        .expect("Failed to connect to app_db");
+
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                eprintln!("Connection error: {}", e);
+            }
+        });
+
+        // Verify connection works
+        let rows = client
+            .query("SELECT 'app_db_test' as source", &[])
+            .await
+            .expect("Query on app_db failed");
+        assert_eq!(rows.len(), 1);
+        let source: &str = rows[0].get(0);
+        assert_eq!(source, "app_db_test");
+
+        println!("Successfully connected and queried via app_db route");
+    }
+
+    // Test 2: Connect using "analytics_db" logical name
+    {
+        let (client, connection) = tokio_postgres::connect(
+            &format!(
+                "host=127.0.0.1 port={} user=postgres password=postgres dbname=analytics_db",
+                proxy_port
+            ),
+            tokio_postgres::NoTls,
+        )
+        .await
+        .expect("Failed to connect to analytics_db");
+
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                eprintln!("Connection error: {}", e);
+            }
+        });
+
+        // Verify connection works
+        let rows = client
+            .query("SELECT 'analytics_db_test' as source", &[])
+            .await
+            .expect("Query on analytics_db failed");
+        assert_eq!(rows.len(), 1);
+        let source: &str = rows[0].get(0);
+        assert_eq!(source, "analytics_db_test");
+
+        println!("Successfully connected and queried via analytics_db route");
+    }
+
+    // Test 3: Connect using default backend (postgres - the default database)
+    {
+        let (client, connection) = tokio_postgres::connect(
+            &format!(
+                "host=127.0.0.1 port={} user=postgres password=postgres dbname=postgres",
+                proxy_port
+            ),
+            tokio_postgres::NoTls,
+        )
+        .await
+        .expect("Failed to connect to default database");
+
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                eprintln!("Connection error: {}", e);
+            }
+        });
+
+        // Verify connection works
+        let rows = client
+            .query("SELECT 'default_test' as source", &[])
+            .await
+            .expect("Query on default database failed");
+        assert_eq!(rows.len(), 1);
+        let source: &str = rows[0].get(0);
+        assert_eq!(source, "default_test");
+
+        println!("Successfully connected and queried via default route");
+    }
+
+    // Wait for events to be published
+    sleep(Duration::from_millis(300)).await;
+
+    // Verify events were captured from all connections
+    let events = test_publisher.events();
+    println!("Captured {} events from multi-database routing test", events.len());
+
+    // Should have at least 3 SELECT queries (one from each connection)
+    let select_events: Vec<_> = events.iter().filter(|e| e.query.contains("SELECT")).collect();
+    assert!(
+        select_events.len() >= 3,
+        "Expected at least 3 SELECT events, got {}",
+        select_events.len()
+    );
+
+    // Verify we can find events from each database route
+    let app_db_event = events.iter().find(|e| e.query.contains("app_db_test"));
+    assert!(app_db_event.is_some(), "Expected event from app_db connection");
+
+    let analytics_event = events.iter().find(|e| e.query.contains("analytics_db_test"));
+    assert!(analytics_event.is_some(), "Expected event from analytics_db connection");
+
+    let default_event = events.iter().find(|e| e.query.contains("default_test"));
+    assert!(default_event.is_some(), "Expected event from default connection");
+
+    println!("Multi-database routing integration test passed");
 }

@@ -46,7 +46,9 @@ fn create_test_config(backend_host: String, backend_port: u16, shutdown_timeout:
             listen_address: "127.0.0.1:0".to_string(),
             max_connections: 10,
             shutdown_timeout_secs: shutdown_timeout,
+            unix_socket: None,
         },
+        databases: Vec::new(),
         backend: BackendConfig {
             protocol: scry::config::DatabaseProtocol::Postgres,
             host: backend_host,
