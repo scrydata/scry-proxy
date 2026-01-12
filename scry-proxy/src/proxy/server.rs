@@ -16,6 +16,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+#[cfg(unix)]
+use tokio::net::UnixListener;
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
@@ -23,6 +25,9 @@ use tracing::{debug, error, info, warn};
 pub struct ProxyServer {
     config: Arc<Config>,
     listener: TcpListener,
+    /// Optional UNIX socket listener (Unix platforms only)
+    #[cfg(unix)]
+    unix_listener: Option<UnixListener>,
     batcher: Arc<EventBatcher>,
     /// Per-database pool managers. Key is database name, "*" is default.
     pool_managers: HashMap<String, Arc<PoolManager>>,
@@ -290,9 +295,38 @@ impl ProxyServer {
             None
         };
 
+        // Create UNIX socket listener if configured (Unix platforms only)
+        #[cfg(unix)]
+        let unix_listener = if let Some(ref socket_path) = config.proxy.unix_socket {
+            // Remove existing socket file if it exists
+            if std::path::Path::new(socket_path).exists() {
+                std::fs::remove_file(socket_path)
+                    .context(format!("Failed to remove existing socket: {}", socket_path))?;
+            }
+
+            let listener = UnixListener::bind(socket_path)
+                .context(format!("Failed to bind UNIX socket: {}", socket_path))?;
+
+            info!(
+                socket_path = %socket_path,
+                "UNIX socket listener bound"
+            );
+
+            Some(listener)
+        } else {
+            None
+        };
+
+        #[cfg(not(unix))]
+        if config.proxy.unix_socket.is_some() {
+            warn!("UNIX socket configuration ignored on non-Unix platform");
+        }
+
         Ok(Self {
             config: Arc::new(config),
             listener,
+            #[cfg(unix)]
+            unix_listener,
             batcher: Arc::new(batcher),
             pool_managers,
             router,
@@ -386,159 +420,13 @@ impl ProxyServer {
         tokio::pin!(shutdown);
 
         // Accept connections until shutdown signal
-        loop {
-            tokio::select! {
-                // Handle shutdown signal
-                _ = &mut shutdown => {
-                    info!("Shutdown signal received, stopping new connections");
-                    break;
-                }
+        #[cfg(unix)]
+        self.accept_loop_with_unix(&mut shutdown, &mut connection_count, &mut connection_tasks)
+            .await;
 
-                // Accept new connections
-                accept_result = self.listener.accept() => {
-                    match accept_result {
-                        Ok((client_stream, client_addr)) => {
-                            connection_count += 1;
-                            let conn_id = connection_count;
-
-                            info!(
-                                connection_id = conn_id,
-                                client_addr = %client_addr,
-                                "Accepted client connection"
-                            );
-
-                            let config = Arc::clone(&self.config);
-                            let batcher = Arc::clone(&self.batcher);
-                            let pool_managers = self.pool_managers.clone();
-                            let metrics = Arc::clone(&self.metrics);
-                            let tls_config = self.tls_config.clone();
-                            let authenticator = self.authenticator.clone();
-
-                            // Spawn a task to handle this connection and track it
-                            connection_tasks.spawn(async move {
-                                // Handle SSL startup handshake
-                                let (transport, startup_data) = match handle_ssl_startup(
-                                    client_stream,
-                                    &config.tls.client_tls_sslmode,
-                                    tls_config,
-                                ).await {
-                                    Ok(SslStartupResult::Upgraded(transport)) => {
-                                        info!(
-                                            connection_id = conn_id,
-                                            "Connection upgraded to TLS"
-                                        );
-                                        (transport, Vec::new())
-                                    }
-                                    Ok(SslStartupResult::Declined(stream, startup_data)) => {
-                                        debug!(
-                                            connection_id = conn_id,
-                                            "SSL declined, continuing with plain TCP"
-                                        );
-                                        (ClientTransport::Plain(stream), startup_data)
-                                    }
-                                    Ok(SslStartupResult::NoSslRequest(stream, startup_data)) => {
-                                        debug!(
-                                            connection_id = conn_id,
-                                            "No SSL request, continuing with plain TCP"
-                                        );
-                                        (ClientTransport::Plain(stream), startup_data)
-                                    }
-                                    Err(e) => {
-                                        error!(
-                                            connection_id = conn_id,
-                                            error = %e,
-                                            "SSL startup failed"
-                                        );
-                                        return;
-                                    }
-                                };
-
-                                // Parse startup message to get database name and check for admin
-                                let (database_name, is_admin) = if !startup_data.is_empty() {
-                                    if let Some(startup) = StartupMessage::parse(&startup_data) {
-                                        let db = startup.database().map(|s| s.to_string());
-                                        let is_admin = db.as_ref()
-                                            .is_some_and(|d| d.eq_ignore_ascii_case(ADMIN_DATABASE));
-                                        (db, is_admin)
-                                    } else {
-                                        (None, false)
-                                    }
-                                } else {
-                                    (None, false)
-                                };
-
-                                // Select the appropriate pool manager for this database
-                                let pool_manager = database_name.as_ref()
-                                    .and_then(|db| pool_managers.get(db))
-                                    .or_else(|| pool_managers.get("*"))
-                                    .cloned();
-
-                                if let Some(ref db) = database_name {
-                                    debug!(
-                                        connection_id = conn_id,
-                                        database = %db,
-                                        has_specific_pool = pool_managers.contains_key(db),
-                                        "Routing connection to database"
-                                    );
-                                }
-
-                                if is_admin {
-                                    info!(
-                                        connection_id = conn_id,
-                                        client_addr = %client_addr,
-                                        "Routing to admin console"
-                                    );
-
-                                    // Admin console gets access to all pool managers
-                                    if let Err(e) = handle_admin_connection(
-                                        transport,
-                                        pool_manager,
-                                        metrics,
-                                    ).await {
-                                        error!(
-                                            connection_id = conn_id,
-                                            client_addr = %client_addr,
-                                            error = %e,
-                                            "Admin console connection failed"
-                                        );
-                                    }
-                                } else {
-                                    let handler = ConnectionHandler::new(
-                                        transport,
-                                        client_addr,
-                                        conn_id,
-                                        config,
-                                        batcher,
-                                        pool_manager,
-                                        metrics,
-                                        startup_data,
-                                        authenticator,
-                                    );
-
-                                    if let Err(e) = handler.handle().await {
-                                        error!(
-                                            connection_id = conn_id,
-                                            client_addr = %client_addr,
-                                            error = %e,
-                                            "Connection handler failed"
-                                        );
-                                    }
-                                }
-
-                                info!(
-                                    connection_id = conn_id,
-                                    client_addr = %client_addr,
-                                    "Connection closed"
-                                );
-                            });
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "Failed to accept connection");
-                        }
-                    }
-                }
-            }
-        }
+        #[cfg(not(unix))]
+        self.accept_loop_tcp_only(&mut shutdown, &mut connection_count, &mut connection_tasks)
+            .await;
 
         // Graceful shutdown: wait for active connections to drain
         self.drain_connections(connection_tasks).await;
@@ -547,6 +435,125 @@ impl ProxyServer {
         // and triggers flush of remaining events + publisher shutdown
         info!("Proxy server shutdown complete");
         Ok(())
+    }
+
+    /// Accept loop for Unix platforms (supports both TCP and UNIX sockets)
+    #[cfg(unix)]
+    async fn accept_loop_with_unix(
+        &self,
+        shutdown: &mut std::pin::Pin<&mut impl std::future::Future<Output = ()>>,
+        connection_count: &mut u64,
+        connection_tasks: &mut JoinSet<()>,
+    ) {
+        loop {
+            // Create the UNIX accept future inside the loop
+            let unix_accept = async {
+                if let Some(ref listener) = self.unix_listener {
+                    listener.accept().await
+                } else {
+                    // Never resolves if no UNIX socket configured
+                    std::future::pending().await
+                }
+            };
+
+            tokio::select! {
+                _ = &mut *shutdown => {
+                    info!("Shutdown signal received, stopping new connections");
+                    break;
+                }
+
+                accept_result = self.listener.accept() => {
+                    match accept_result {
+                        Ok((client_stream, client_addr)) => {
+                            *connection_count += 1;
+                            let conn_id = *connection_count;
+
+                            info!(
+                                connection_id = conn_id,
+                                client_addr = %client_addr,
+                                "Accepted TCP client connection"
+                            );
+
+                            self.spawn_tcp_connection_handler(
+                                connection_tasks,
+                                client_stream,
+                                client_addr,
+                                conn_id,
+                            );
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Failed to accept TCP connection");
+                        }
+                    }
+                }
+
+                accept_result = unix_accept => {
+                    match accept_result {
+                        Ok((client_stream, _addr)) => {
+                            *connection_count += 1;
+                            let conn_id = *connection_count;
+
+                            info!(
+                                connection_id = conn_id,
+                                "Accepted UNIX socket client connection"
+                            );
+
+                            self.spawn_unix_connection_handler(
+                                connection_tasks,
+                                client_stream,
+                                conn_id,
+                            );
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Failed to accept UNIX socket connection");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Accept loop for non-Unix platforms (TCP only)
+    #[cfg(not(unix))]
+    async fn accept_loop_tcp_only(
+        &self,
+        shutdown: &mut std::pin::Pin<&mut impl std::future::Future<Output = ()>>,
+        connection_count: &mut u64,
+        connection_tasks: &mut JoinSet<()>,
+    ) {
+        loop {
+            tokio::select! {
+                _ = &mut *shutdown => {
+                    info!("Shutdown signal received, stopping new connections");
+                    break;
+                }
+
+                accept_result = self.listener.accept() => {
+                    match accept_result {
+                        Ok((client_stream, client_addr)) => {
+                            *connection_count += 1;
+                            let conn_id = *connection_count;
+
+                            info!(
+                                connection_id = conn_id,
+                                client_addr = %client_addr,
+                                "Accepted TCP client connection"
+                            );
+
+                            self.spawn_tcp_connection_handler(
+                                connection_tasks,
+                                client_stream,
+                                client_addr,
+                                conn_id,
+                            );
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Failed to accept TCP connection");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Wait for active connections to complete, with timeout
@@ -607,6 +614,200 @@ impl ProxyServer {
                 warn!("Forcefully closed remaining connections");
             }
         }
+    }
+
+    /// Spawn a handler for a TCP connection
+    fn spawn_tcp_connection_handler(
+        &self,
+        connection_tasks: &mut JoinSet<()>,
+        client_stream: tokio::net::TcpStream,
+        client_addr: std::net::SocketAddr,
+        conn_id: u64,
+    ) {
+        let config = Arc::clone(&self.config);
+        let batcher = Arc::clone(&self.batcher);
+        let pool_managers = self.pool_managers.clone();
+        let metrics = Arc::clone(&self.metrics);
+        let tls_config = self.tls_config.clone();
+        let authenticator = self.authenticator.clone();
+
+        connection_tasks.spawn(async move {
+            // Handle SSL startup handshake
+            let (transport, startup_data) = match handle_ssl_startup(
+                client_stream,
+                &config.tls.client_tls_sslmode,
+                tls_config,
+            )
+            .await
+            {
+                Ok(SslStartupResult::Upgraded(transport)) => {
+                    info!(connection_id = conn_id, "Connection upgraded to TLS");
+                    (transport, Vec::new())
+                }
+                Ok(SslStartupResult::Declined(stream, startup_data)) => {
+                    debug!(
+                        connection_id = conn_id,
+                        "SSL declined, continuing with plain TCP"
+                    );
+                    (ClientTransport::Plain(stream), startup_data)
+                }
+                Ok(SslStartupResult::NoSslRequest(stream, startup_data)) => {
+                    debug!(
+                        connection_id = conn_id,
+                        "No SSL request, continuing with plain TCP"
+                    );
+                    (ClientTransport::Plain(stream), startup_data)
+                }
+                Err(e) => {
+                    error!(connection_id = conn_id, error = %e, "SSL startup failed");
+                    return;
+                }
+            };
+
+            Self::handle_client_connection(
+                transport,
+                Some(client_addr),
+                conn_id,
+                config,
+                batcher,
+                pool_managers,
+                metrics,
+                startup_data,
+                authenticator,
+            )
+            .await;
+        });
+    }
+
+    /// Spawn a handler for a UNIX socket connection (Unix platforms only)
+    #[cfg(unix)]
+    fn spawn_unix_connection_handler(
+        &self,
+        connection_tasks: &mut JoinSet<()>,
+        client_stream: tokio::net::UnixStream,
+        conn_id: u64,
+    ) {
+        let config = Arc::clone(&self.config);
+        let batcher = Arc::clone(&self.batcher);
+        let pool_managers = self.pool_managers.clone();
+        let metrics = Arc::clone(&self.metrics);
+        let authenticator = self.authenticator.clone();
+
+        connection_tasks.spawn(async move {
+            // UNIX sockets don't use SSL, so wrap directly
+            let transport = ClientTransport::Unix(client_stream);
+
+            // For UNIX sockets, we need to read the startup message directly
+            // since there's no SSL handshake
+            Self::handle_client_connection(
+                transport,
+                None, // No socket address for UNIX sockets
+                conn_id,
+                config,
+                batcher,
+                pool_managers,
+                metrics,
+                Vec::new(), // Startup data will be read by connection handler
+                authenticator,
+            )
+            .await;
+        });
+    }
+
+    /// Common connection handling logic for both TCP and UNIX sockets
+    async fn handle_client_connection(
+        transport: ClientTransport,
+        client_addr: Option<std::net::SocketAddr>,
+        conn_id: u64,
+        config: Arc<Config>,
+        batcher: Arc<EventBatcher>,
+        pool_managers: HashMap<String, Arc<PoolManager>>,
+        metrics: Arc<ProxyMetrics>,
+        startup_data: Vec<u8>,
+        authenticator: Option<Arc<FileAuthenticator>>,
+    ) {
+        let addr_str = client_addr
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| "unix".to_string());
+
+        // Parse startup message to get database name and check for admin
+        let (database_name, is_admin) = if !startup_data.is_empty() {
+            if let Some(startup) = StartupMessage::parse(&startup_data) {
+                let db = startup.database().map(|s| s.to_string());
+                let is_admin = db
+                    .as_ref()
+                    .is_some_and(|d| d.eq_ignore_ascii_case(ADMIN_DATABASE));
+                (db, is_admin)
+            } else {
+                (None, false)
+            }
+        } else {
+            (None, false)
+        };
+
+        // Select the appropriate pool manager for this database
+        let pool_manager = database_name
+            .as_ref()
+            .and_then(|db| pool_managers.get(db))
+            .or_else(|| pool_managers.get("*"))
+            .cloned();
+
+        if let Some(ref db) = database_name {
+            debug!(
+                connection_id = conn_id,
+                database = %db,
+                has_specific_pool = pool_managers.contains_key(db),
+                "Routing connection to database"
+            );
+        }
+
+        if is_admin {
+            info!(
+                connection_id = conn_id,
+                client_addr = %addr_str,
+                "Routing to admin console"
+            );
+
+            if let Err(e) = handle_admin_connection(transport, pool_manager, metrics).await {
+                error!(
+                    connection_id = conn_id,
+                    client_addr = %addr_str,
+                    error = %e,
+                    "Admin console connection failed"
+                );
+            }
+        } else {
+            // Use a placeholder address for UNIX sockets
+            let handler_addr =
+                client_addr.unwrap_or_else(|| "0.0.0.0:0".parse().expect("valid placeholder addr"));
+
+            let handler = ConnectionHandler::new(
+                transport,
+                handler_addr,
+                conn_id,
+                config,
+                batcher,
+                pool_manager,
+                metrics,
+                startup_data,
+                authenticator,
+            );
+
+            if let Err(e) = handler.handle().await {
+                error!(
+                    connection_id = conn_id,
+                    client_addr = %addr_str,
+                    error = %e,
+                    "Connection handler failed"
+                );
+            }
+        }
+
+        info!(
+            connection_id = conn_id,
+            client_addr = %addr_str,
+            "Connection closed"
+        );
     }
 }
 

@@ -4,16 +4,21 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
+#[cfg(unix)]
+use tokio::net::UnixStream;
 use tokio_rustls::client::TlsStream as ClientTlsStream;
 use tokio_rustls::server::TlsStream;
 
-/// A client transport that can be either plain TCP or TLS-encrypted
+/// A client transport that can be plain TCP, TLS-encrypted, or UNIX socket
 #[pin_project(project = ClientTransportProj)]
 pub enum ClientTransport {
     /// Plain unencrypted TCP connection
     Plain(#[pin] TcpStream),
     /// TLS-encrypted connection (boxed to reduce enum size variance)
     Tls(#[pin] Box<TlsStream<TcpStream>>),
+    /// UNIX socket connection (Unix platforms only)
+    #[cfg(unix)]
+    Unix(#[pin] UnixStream),
 }
 
 impl ClientTransport {
@@ -22,11 +27,22 @@ impl ClientTransport {
         matches!(self, ClientTransport::Tls(_))
     }
 
-    /// Get the peer address
+    /// Check if this is a UNIX socket connection
+    #[cfg(unix)]
+    pub fn is_unix(&self) -> bool {
+        matches!(self, ClientTransport::Unix(_))
+    }
+
+    /// Get the peer address (returns error for UNIX sockets)
     pub fn peer_addr(&self) -> io::Result<std::net::SocketAddr> {
         match self {
             ClientTransport::Plain(stream) => stream.peer_addr(),
             ClientTransport::Tls(stream) => stream.get_ref().0.peer_addr(),
+            #[cfg(unix)]
+            ClientTransport::Unix(_) => Err(io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "UNIX sockets don't have peer address",
+            )),
         }
     }
 }
@@ -40,6 +56,8 @@ impl AsyncRead for ClientTransport {
         match self.project() {
             ClientTransportProj::Plain(stream) => stream.poll_read(cx, buf),
             ClientTransportProj::Tls(stream) => stream.poll_read(cx, buf),
+            #[cfg(unix)]
+            ClientTransportProj::Unix(stream) => stream.poll_read(cx, buf),
         }
     }
 }
@@ -53,6 +71,8 @@ impl AsyncWrite for ClientTransport {
         match self.project() {
             ClientTransportProj::Plain(stream) => stream.poll_write(cx, buf),
             ClientTransportProj::Tls(stream) => stream.poll_write(cx, buf),
+            #[cfg(unix)]
+            ClientTransportProj::Unix(stream) => stream.poll_write(cx, buf),
         }
     }
 
@@ -60,6 +80,8 @@ impl AsyncWrite for ClientTransport {
         match self.project() {
             ClientTransportProj::Plain(stream) => stream.poll_flush(cx),
             ClientTransportProj::Tls(stream) => stream.poll_flush(cx),
+            #[cfg(unix)]
+            ClientTransportProj::Unix(stream) => stream.poll_flush(cx),
         }
     }
 
@@ -67,6 +89,8 @@ impl AsyncWrite for ClientTransport {
         match self.project() {
             ClientTransportProj::Plain(stream) => stream.poll_shutdown(cx),
             ClientTransportProj::Tls(stream) => stream.poll_shutdown(cx),
+            #[cfg(unix)]
+            ClientTransportProj::Unix(stream) => stream.poll_shutdown(cx),
         }
     }
 }

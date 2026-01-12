@@ -55,6 +55,10 @@ pub struct Config {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyConfig {
     pub listen_address: String,
+    /// UNIX socket path for listening (e.g., /var/run/scry/.s.PGSQL.6432)
+    /// Only available on Unix platforms.
+    #[serde(default)]
+    pub unix_socket: Option<String>,
     pub max_connections: usize,
     /// How long to wait for connections to drain during shutdown (seconds)
     pub shutdown_timeout_secs: u64,
@@ -341,6 +345,7 @@ impl Default for Config {
         Self {
             proxy: ProxyConfig {
                 listen_address: "127.0.0.1:5433".to_string(),
+                unix_socket: None,
                 max_connections: 100,
                 shutdown_timeout_secs: 30,
             },
