@@ -37,6 +37,12 @@ impl DatabaseProtocol {
 pub struct Config {
     pub proxy: ProxyConfig,
     pub backend: BackendConfig,
+    /// Additional databases for multi-database routing.
+    /// If a client connects to a database name matching an entry here,
+    /// they will be routed to that specific backend.
+    /// If no match, falls back to the default `backend` config.
+    #[serde(default)]
+    pub databases: Vec<DatabaseConfig>,
     pub observability: ObservabilityConfig,
     pub protocol: ProtocolConfig,
     pub publisher: PublisherConfig,
@@ -139,6 +145,26 @@ pub enum AuthType {
     ScramSha256,
     /// Certificate-based authentication
     Cert,
+}
+
+/// Database routing configuration for multi-database support
+/// Each entry defines a named database with its connection parameters
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatabaseConfig {
+    /// Logical name clients use to connect (matched against startup message database)
+    pub name: String,
+    /// Backend host for this database
+    pub host: String,
+    /// Backend port for this database
+    pub port: u16,
+    /// Actual database name on the backend
+    pub database: String,
+    /// User for backend connection (if different from client user)
+    pub user: String,
+    /// Password for backend connection
+    pub password: String,
+    /// Pool size override for this database (uses default if None)
+    pub pool_size: Option<usize>,
 }
 
 /// Authentication configuration
@@ -328,6 +354,7 @@ impl Default for Config {
                 pool_size: 10,
                 connection_timeout_ms: 5000,
             },
+            databases: Vec::new(),
             observability: ObservabilityConfig {
                 enable_tracing: true,
                 otlp_endpoint: Some("http://localhost:4317".to_string()),
