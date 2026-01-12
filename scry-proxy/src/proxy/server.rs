@@ -38,6 +38,7 @@ pub struct ProxyServer {
     tls_config: Option<Arc<ServerConfig>>,
     authenticator: std::sync::RwLock<Option<Arc<FileAuthenticator>>>,
     /// Channel to trigger config reload (e.g., on SIGHUP)
+    #[allow(dead_code)]
     reload_trigger: watch::Receiver<()>,
     /// Sender side of reload channel, exposed for signal handlers
     reload_sender: watch::Sender<()>,
@@ -787,6 +788,7 @@ impl ProxyServer {
     }
 
     /// Common connection handling logic for both TCP and UNIX sockets
+    #[allow(clippy::too_many_arguments)]
     async fn handle_client_connection(
         transport: ClientTransport,
         client_addr: Option<std::net::SocketAddr>,

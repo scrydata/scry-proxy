@@ -232,7 +232,7 @@ impl ConnectionHandler {
                     .context("Failed to forward startup data to client")?;
 
                 // Check for ReadyForQuery
-                if pending.iter().any(|&b| b == b'Z') {
+                if pending.contains(&b'Z') {
                     debug!(connection_id, "Backend startup complete (ReadyForQuery received)");
                     break;
                 }
@@ -258,7 +258,7 @@ impl ConnectionHandler {
                 .context("Failed to forward startup data to client")?;
 
             // Check for ReadyForQuery
-            if data.iter().any(|&b| b == b'Z') {
+            if data.contains(&b'Z') {
                 debug!(connection_id, "Backend startup complete (ReadyForQuery received)");
                 break;
             }

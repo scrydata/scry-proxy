@@ -108,7 +108,7 @@ impl ScramClient {
         let client_signature = hmac_sha256(&stored_key, auth_message.as_bytes());
         let client_proof = xor_bytes(&client_key, &client_signature);
 
-        let proof_b64 = BASE64.encode(&client_proof);
+        let proof_b64 = BASE64.encode(client_proof);
         let client_final = format!("{},p={}", client_final_without_proof, proof_b64);
 
         Ok(client_final.into_bytes())
