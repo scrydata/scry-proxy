@@ -119,6 +119,87 @@ impl StartupMessage {
     }
 }
 
+/// Parsed authentication request from backend
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthRequest {
+    /// AuthenticationOk (auth_code = 0) - authentication successful
+    Ok,
+    /// AuthenticationCleartextPassword (auth_code = 3)
+    CleartextPassword,
+    /// AuthenticationMD5Password (auth_code = 5) with 4-byte salt
+    Md5 { salt: [u8; 4] },
+    /// AuthenticationSASL (auth_code = 10) - SCRAM initiation
+    Sasl { mechanisms: Vec<String> },
+    /// AuthenticationSASLContinue (auth_code = 11) - server challenge
+    SaslContinue { data: Vec<u8> },
+    /// AuthenticationSASLFinal (auth_code = 12) - server signature
+    SaslFinal { data: Vec<u8> },
+}
+
+impl AuthRequest {
+    /// Parse an authentication request message from the backend
+    ///
+    /// Format: 'R' + length (4 bytes) + auth_code (4 bytes) + [payload]
+    pub fn parse(data: &[u8]) -> Option<Self> {
+        if data.len() < 9 {
+            return None;
+        }
+
+        if data[0] != b'R' {
+            return None;
+        }
+
+        let length = i32::from_be_bytes([data[1], data[2], data[3], data[4]]) as usize;
+        if data.len() < 1 + length {
+            return None;
+        }
+
+        let auth_code = i32::from_be_bytes([data[5], data[6], data[7], data[8]]);
+
+        match auth_code {
+            0 => Some(AuthRequest::Ok),
+            3 => Some(AuthRequest::CleartextPassword),
+            5 => {
+                if data.len() < 13 {
+                    return None;
+                }
+                let salt = [data[9], data[10], data[11], data[12]];
+                Some(AuthRequest::Md5 { salt })
+            }
+            10 => {
+                // SASL: parse null-terminated mechanism names
+                let mut mechanisms = Vec::new();
+                let mut offset = 9;
+                while offset < 1 + length {
+                    let start = offset;
+                    while offset < 1 + length && data[offset] != 0 {
+                        offset += 1;
+                    }
+                    if start < offset {
+                        if let Ok(mech) = std::str::from_utf8(&data[start..offset]) {
+                            mechanisms.push(mech.to_string());
+                        }
+                    }
+                    offset += 1; // Skip null
+                    if offset < 1 + length && data[offset] == 0 {
+                        break; // Double null = end
+                    }
+                }
+                Some(AuthRequest::Sasl { mechanisms })
+            }
+            11 => {
+                let payload = data[9..1 + length].to_vec();
+                Some(AuthRequest::SaslContinue { data: payload })
+            }
+            12 => {
+                let payload = data[9..1 + length].to_vec();
+                Some(AuthRequest::SaslFinal { data: payload })
+            }
+            _ => None, // Unsupported auth type
+        }
+    }
+}
+
 /// Build an AuthenticationOk message
 ///
 /// Format: 'R' + length(8) + auth_type(0)
@@ -337,5 +418,44 @@ mod tests {
         assert!(msg_str.contains("FATAL"));
         assert!(msg_str.contains("28P01"));
         assert!(msg_str.contains("password authentication failed"));
+    }
+
+    #[test]
+    fn test_parse_auth_request_md5() {
+        let salt = [0x01, 0x02, 0x03, 0x04];
+        let msg = build_auth_md5_password(salt);
+
+        let parsed = AuthRequest::parse(&msg).unwrap();
+        assert_eq!(parsed, AuthRequest::Md5 { salt });
+    }
+
+    #[test]
+    fn test_parse_auth_request_ok() {
+        let msg = build_auth_ok();
+
+        let parsed = AuthRequest::parse(&msg).unwrap();
+        assert_eq!(parsed, AuthRequest::Ok);
+    }
+
+    #[test]
+    fn test_parse_auth_request_cleartext() {
+        let msg = build_auth_cleartext_password();
+
+        let parsed = AuthRequest::parse(&msg).unwrap();
+        assert_eq!(parsed, AuthRequest::CleartextPassword);
+    }
+
+    #[test]
+    fn test_parse_auth_request_scram() {
+        // AuthenticationSASL: 'R' + length + 10 + "SCRAM-SHA-256\0" + "\0"
+        let mut msg = vec![b'R'];
+        let mechanisms = b"SCRAM-SHA-256\0\0";
+        let length = (4 + 4 + mechanisms.len()) as i32;
+        msg.extend_from_slice(&length.to_be_bytes());
+        msg.extend_from_slice(&10i32.to_be_bytes()); // AuthenticationSASL
+        msg.extend_from_slice(mechanisms);
+
+        let parsed = AuthRequest::parse(&msg).unwrap();
+        assert!(matches!(parsed, AuthRequest::Sasl { .. }));
     }
 }
