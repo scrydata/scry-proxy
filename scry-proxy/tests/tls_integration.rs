@@ -142,6 +142,7 @@ fn create_minimal_config() -> Config {
             },
         },
         tls: TlsConfig::default(),
+        auth: AuthConfig::default(),
     }
 }
 

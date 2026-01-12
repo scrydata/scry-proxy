@@ -122,6 +122,7 @@ fn create_test_config(backend_host: String, backend_port: u16) -> Config {
             },
         },
         tls: TlsConfig::default(),
+        auth: AuthConfig::default(),
     }
 }
 

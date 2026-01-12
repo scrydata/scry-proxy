@@ -126,6 +126,7 @@ fn create_test_config(host: String, port: u16, pooling: PoolingStrategy) -> Conf
             },
         },
         tls: TlsConfig::default(),
+        auth: AuthConfig::default(),
     }
 }
 

@@ -116,6 +116,7 @@ fn create_pooled_config(backend_host: String, backend_port: u16, pool_size: usiz
             },
         },
         tls: TlsConfig::default(),
+        auth: AuthConfig::default(),
     }
 }
 
