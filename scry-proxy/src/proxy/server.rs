@@ -1,16 +1,18 @@
 use super::{
     ConnectionHandler, EventBatcher, PoolManager, PoolManagerConfig, TcpConnectionPool, WaitQueue,
 };
+use crate::admin::{AdminConsole, AdminResponse, ADMIN_DATABASE};
 use crate::auth::FileAuthenticator;
 use crate::config::{AuthType, Config, PoolingStrategy, TlsSslMode};
 use crate::observability::ProxyMetrics;
-use crate::protocol::{Protocol, ProtocolConfig, ProtocolRegistry};
+use crate::protocol::{Protocol, ProtocolConfig, ProtocolRegistry, StartupMessage};
 use crate::resilience::{ActiveHealthcheck, CircuitBreaker};
 use crate::tls::{handle_ssl_startup, load_client_tls_config, ClientTransport, SslStartupResult};
 use anyhow::{Context, Result};
 use rustls::ServerConfig;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
@@ -381,25 +383,62 @@ impl ProxyServer {
                                     }
                                 };
 
-                                let handler = ConnectionHandler::new(
-                                    transport,
-                                    client_addr,
-                                    conn_id,
-                                    config,
-                                    batcher,
-                                    pool_manager,
-                                    metrics,
-                                    startup_data,
-                                    authenticator,
-                                );
+                                // Check if this is an admin console connection
+                                // by parsing the startup message to see if database = "pgbouncer"
+                                let is_admin = if !startup_data.is_empty() {
+                                    if let Some(startup) = StartupMessage::parse(&startup_data) {
+                                        if let Some(db) = startup.database() {
+                                            db.eq_ignore_ascii_case(ADMIN_DATABASE)
+                                        } else {
+                                            false
+                                        }
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    false
+                                };
 
-                                if let Err(e) = handler.handle().await {
-                                    error!(
+                                if is_admin {
+                                    info!(
                                         connection_id = conn_id,
                                         client_addr = %client_addr,
-                                        error = %e,
-                                        "Connection handler failed"
+                                        "Routing to admin console"
                                     );
+
+                                    if let Err(e) = handle_admin_connection(
+                                        transport,
+                                        pool_manager,
+                                        metrics,
+                                    ).await {
+                                        error!(
+                                            connection_id = conn_id,
+                                            client_addr = %client_addr,
+                                            error = %e,
+                                            "Admin console connection failed"
+                                        );
+                                    }
+                                } else {
+                                    let handler = ConnectionHandler::new(
+                                        transport,
+                                        client_addr,
+                                        conn_id,
+                                        config,
+                                        batcher,
+                                        pool_manager,
+                                        metrics,
+                                        startup_data,
+                                        authenticator,
+                                    );
+
+                                    if let Err(e) = handler.handle().await {
+                                        error!(
+                                            connection_id = conn_id,
+                                            client_addr = %client_addr,
+                                            error = %e,
+                                            "Connection handler failed"
+                                        );
+                                    }
                                 }
 
                                 info!(
@@ -485,6 +524,70 @@ impl ProxyServer {
             }
         }
     }
+}
+
+/// Handle an admin console connection
+///
+/// This handles connections to the virtual "pgbouncer" database,
+/// which provides administrative commands for monitoring and controlling the proxy.
+async fn handle_admin_connection(
+    mut client: ClientTransport,
+    pool_manager: Option<Arc<PoolManager>>,
+    metrics: Arc<ProxyMetrics>,
+) -> Result<()> {
+    // Send AuthenticationOk
+    // Format: 'R' + length(8) + auth_type(0)
+    let auth_ok = [b'R', 0, 0, 0, 8, 0, 0, 0, 0];
+    client.write_all(&auth_ok).await.context("Failed to send AuthenticationOk")?;
+
+    // Send ReadyForQuery (idle state)
+    // Format: 'Z' + length(5) + status('I')
+    let ready_for_query = [b'Z', 0, 0, 0, 5, b'I'];
+    client.write_all(&ready_for_query).await.context("Failed to send ReadyForQuery")?;
+
+    let admin = AdminConsole::new(pool_manager, metrics);
+    let mut buffer = vec![0u8; 8192];
+
+    loop {
+        let n = client.read(&mut buffer).await.context("Failed to read from admin client")?;
+        if n == 0 {
+            debug!("Admin client closed connection");
+            break;
+        }
+
+        // Check for Query message ('Q')
+        if buffer[0] == b'Q' {
+            // Parse query: 'Q' + length(4) + query_string (null-terminated)
+            if n >= 5 {
+                let length = i32::from_be_bytes([buffer[1], buffer[2], buffer[3], buffer[4]]) as usize;
+                if n >= 5 + length - 4 {
+                    // Query string is null-terminated
+                    let query_end = 5 + length - 4 - 1; // -4 for length already counted, -1 for null
+                    let query = String::from_utf8_lossy(&buffer[5..query_end]).to_string();
+
+                    debug!(query = %query, "Admin console query");
+
+                    let response = match admin.execute(&query).await {
+                        Ok(resp) => resp,
+                        Err(e) => AdminResponse::Error {
+                            message: e.to_string(),
+                        },
+                    };
+
+                    let wire_response = response.to_wire();
+                    client.write_all(&wire_response).await.context("Failed to send admin response")?;
+                }
+            }
+        } else if buffer[0] == b'X' {
+            // Terminate message
+            debug!("Admin client sent Terminate");
+            break;
+        }
+        // Ignore other message types (Sync, etc.)
+    }
+
+    info!("Admin console connection closed");
+    Ok(())
 }
 
 #[cfg(test)]
