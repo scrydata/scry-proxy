@@ -32,3 +32,6 @@ src/generated/
 
 # Data
 /data/
+
+# Claude Code temp files
+tmpclaude-*
