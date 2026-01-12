@@ -2,7 +2,7 @@ use super::{
     ConnectionState, EventBatcher, ModeEnforcer, PendingExecution, PoolManager, PoolingMode,
     PreparedStatement, PreparedStatementCache, StateReplayer, TransactionTracker,
 };
-use crate::auth::FileAuthenticator;
+use crate::auth::{Authenticator, FileAuthenticator};
 use crate::config::{Config, PoolingStrategy};
 use crate::observability::{ProxyMetrics, QueryTimeline};
 use crate::protocol::{
@@ -154,6 +154,82 @@ impl ConnectionHandler {
         }
     }
 
+    /// Perform the startup/authentication handshake
+    ///
+    /// This method:
+    /// 1. Authenticates the client (if auth enabled)
+    /// 2. Forwards the startup message to the backend (with backend credentials)
+    /// 3. Forwards the backend's auth response to the client
+    ///
+    /// After this completes, the connection is ready for query forwarding.
+    async fn perform_startup_handshake(
+        &mut self,
+        backend_stream: &mut (impl AsyncWriteExt + AsyncReadExt + Unpin),
+    ) -> Result<()> {
+        let connection_id = self.connection_id;
+
+        // Create authenticator
+        let authenticator = Authenticator::new(
+            Arc::clone(&self.config),
+            self.authenticator.clone(),
+        );
+
+        // Perform client authentication and get startup bytes for backend
+        let auth_result = authenticator
+            .authenticate(&mut self.client_stream, &self.startup_data)
+            .await
+            .context("Client authentication failed")?;
+
+        info!(
+            connection_id = connection_id,
+            username = %auth_result.username,
+            database = ?auth_result.database,
+            "Client authenticated successfully"
+        );
+
+        // Forward startup to backend
+        debug!(
+            connection_id = connection_id,
+            bytes = auth_result.startup_bytes.len(),
+            "Forwarding startup to backend"
+        );
+        backend_stream
+            .write_all(&auth_result.startup_bytes)
+            .await
+            .context("Failed to forward startup to backend")?;
+
+        // Read backend's authentication response and forward to client
+        // Backend may send multiple messages: AuthenticationOk, ParameterStatus, BackendKeyData, ReadyForQuery
+        let mut backend_buffer = vec![0u8; 8192];
+
+        loop {
+            let n = backend_stream
+                .read(&mut backend_buffer)
+                .await
+                .context("Failed to read backend auth response")?;
+
+            if n == 0 {
+                anyhow::bail!("Backend closed connection during startup");
+            }
+
+            let data = &backend_buffer[..n];
+
+            // Forward to client
+            self.client_stream
+                .write_all(data)
+                .await
+                .context("Failed to forward auth response to client")?;
+
+            // Check if we received ReadyForQuery ('Z') which means startup is complete
+            if data.iter().any(|&b| b == b'Z') {
+                debug!(connection_id = connection_id, "Backend startup complete");
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Handle connection with a managed connection from PoolManager
     ///
     /// This method integrates with the PoolManager for proper connection lifecycle:
@@ -186,19 +262,10 @@ impl ConnectionHandler {
         let mut client_buffer = vec![0u8; self.config.performance.buffer_size];
         let mut backend_buffer = vec![0u8; self.config.performance.buffer_size];
 
-        // Forward any buffered startup data from SSL handshake
-        if !self.startup_data.is_empty() {
-            debug!(
-                connection_id = connection_id,
-                bytes = self.startup_data.len(),
-                "Forwarding buffered startup data"
-            );
-            managed_conn
-                .stream_mut()
-                .write_all(&self.startup_data)
-                .await
-                .context("Failed to forward startup data")?;
-        }
+        // Perform authentication and startup handshake
+        self.perform_startup_handshake(managed_conn.stream_mut())
+            .await
+            .context("Startup handshake failed")?;
 
         loop {
             tokio::select! {
@@ -568,19 +635,11 @@ impl ConnectionHandler {
     }
 
     /// Handle connection with an owned backend TCP stream
-    async fn handle_with_owned_backend(self, mut backend_stream: TcpStream) -> Result<()> {
-        // Forward any buffered startup data from SSL handshake first
-        if !self.startup_data.is_empty() {
-            debug!(
-                connection_id = self.connection_id,
-                bytes = self.startup_data.len(),
-                "Forwarding buffered startup data"
-            );
-            backend_stream
-                .write_all(&self.startup_data)
-                .await
-                .context("Failed to forward startup data")?;
-        }
+    async fn handle_with_owned_backend(mut self, mut backend_stream: TcpStream) -> Result<()> {
+        // Perform authentication and startup handshake
+        self.perform_startup_handshake(&mut backend_stream)
+            .await
+            .context("Startup handshake failed")?;
 
         // For owned connections, we can use split() - works with ClientTransport via tokio::io::split
         let (mut client_read, mut client_write) = tokio::io::split(self.client_stream);

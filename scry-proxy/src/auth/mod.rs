@@ -7,8 +7,10 @@
 //! - SCRAM-SHA-256 authentication
 //! - Certificate-based authentication
 
+mod authenticator;
 mod file_auth;
 mod types;
 
+pub use authenticator::{AuthHandshakeResult, Authenticator};
 pub use file_auth::FileAuthenticator;
 pub use types::{AuthError, AuthResult, UserCredentials};
