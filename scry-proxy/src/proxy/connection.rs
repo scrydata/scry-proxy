@@ -2,6 +2,7 @@ use super::{
     ConnectionState, EventBatcher, ModeEnforcer, PendingExecution, PoolManager, PoolingMode,
     PreparedStatement, PreparedStatementCache, StateReplayer, TransactionTracker,
 };
+use crate::auth::FileAuthenticator;
 use crate::config::{Config, PoolingStrategy};
 use crate::observability::{ProxyMetrics, QueryTimeline};
 use crate::protocol::{
@@ -29,6 +30,7 @@ pub struct ConnectionHandler {
     pool_manager: Option<Arc<PoolManager>>,
     metrics: Arc<ProxyMetrics>,
     startup_data: Vec<u8>,
+    authenticator: Option<Arc<FileAuthenticator>>,
 }
 
 impl ConnectionHandler {
@@ -42,6 +44,7 @@ impl ConnectionHandler {
         pool_manager: Option<Arc<PoolManager>>,
         metrics: Arc<ProxyMetrics>,
         startup_data: Vec<u8>,
+        authenticator: Option<Arc<FileAuthenticator>>,
     ) -> Self {
         Self {
             client_stream,
@@ -52,6 +55,7 @@ impl ConnectionHandler {
             pool_manager,
             metrics,
             startup_data,
+            authenticator,
         }
     }
 

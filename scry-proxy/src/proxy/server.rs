@@ -1,7 +1,8 @@
 use super::{
     ConnectionHandler, EventBatcher, PoolManager, PoolManagerConfig, TcpConnectionPool, WaitQueue,
 };
-use crate::config::{Config, PoolingStrategy, TlsSslMode};
+use crate::auth::FileAuthenticator;
+use crate::config::{AuthType, Config, PoolingStrategy, TlsSslMode};
 use crate::observability::ProxyMetrics;
 use crate::protocol::{Protocol, ProtocolConfig, ProtocolRegistry};
 use crate::resilience::{ActiveHealthcheck, CircuitBreaker};
@@ -22,6 +23,7 @@ pub struct ProxyServer {
     pool_manager: Option<Arc<PoolManager>>,
     metrics: Arc<ProxyMetrics>,
     tls_config: Option<Arc<ServerConfig>>,
+    authenticator: Option<Arc<FileAuthenticator>>,
 }
 
 impl ProxyServer {
@@ -208,6 +210,29 @@ impl ProxyServer {
             info!("Client TLS disabled");
         }
 
+        // Load authenticator if auth_file is configured
+        let authenticator = if let Some(ref auth_file) = config.auth.auth_file {
+            let auth = FileAuthenticator::from_file(auth_file)
+                .context(format!("Failed to load auth file: {}", auth_file))?;
+            info!(
+                auth_type = ?config.auth.auth_type,
+                auth_file = %auth_file,
+                users = auth.len(),
+                "Authentication enabled with {} users",
+                auth.len()
+            );
+            Some(Arc::new(auth))
+        } else if config.auth.auth_type != AuthType::Trust {
+            warn!(
+                auth_type = ?config.auth.auth_type,
+                "Auth type set but no auth_file configured, falling back to trust"
+            );
+            None
+        } else {
+            info!("Authentication disabled (trust mode)");
+            None
+        };
+
         Ok(Self {
             config: Arc::new(config),
             listener,
@@ -215,6 +240,7 @@ impl ProxyServer {
             pool_manager,
             metrics,
             tls_config,
+            authenticator,
         })
     }
 
@@ -227,6 +253,11 @@ impl ProxyServer {
     /// Get the pool manager, if pooling is enabled
     pub fn pool_manager(&self) -> Option<&Arc<PoolManager>> {
         self.pool_manager.as_ref()
+    }
+
+    /// Get the authenticator, if authentication is enabled
+    pub fn authenticator(&self) -> Option<&Arc<FileAuthenticator>> {
+        self.authenticator.as_ref()
     }
 
     /// Run the proxy server, accepting connections until shutdown signal
@@ -309,6 +340,7 @@ impl ProxyServer {
                             let pool_manager = self.pool_manager.clone();
                             let metrics = Arc::clone(&self.metrics);
                             let tls_config = self.tls_config.clone();
+                            let authenticator = self.authenticator.clone();
 
                             // Spawn a task to handle this connection and track it
                             connection_tasks.spawn(async move {
@@ -358,6 +390,7 @@ impl ProxyServer {
                                     pool_manager,
                                     metrics,
                                     startup_data,
+                                    authenticator,
                                 );
 
                                 if let Err(e) = handler.handle().await {
@@ -457,10 +490,11 @@ impl ProxyServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{AuthType, Config};
     use crate::observability::{HealthConfig, ProxyMetrics};
     use crate::proxy::EventBatcher;
     use crate::publisher::DebugLoggerPublisher;
+    use std::io::Write;
 
     fn create_test_config() -> Config {
         let mut config = Config::default();
@@ -498,5 +532,43 @@ mod tests {
             .unwrap();
 
         assert!(server.pool_manager().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_server_no_authenticator_in_trust_mode() {
+        let config = create_test_config();
+        let publisher = Arc::new(DebugLoggerPublisher::new());
+        let metrics = Arc::new(ProxyMetrics::new(100, HealthConfig::default()));
+
+        let server = ProxyServer::new(config, EventBatcher::new(publisher, 10, 100, 1000), metrics)
+            .await
+            .unwrap();
+
+        // Trust mode should not have an authenticator
+        assert!(server.authenticator().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_server_loads_authenticator_from_file() {
+        // Create a temp auth file
+        let mut auth_file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(auth_file, "\"testuser\" \"testpass\"").unwrap();
+        auth_file.flush().unwrap();
+
+        let mut config = create_test_config();
+        config.auth.auth_type = AuthType::Md5;
+        config.auth.auth_file = Some(auth_file.path().to_string_lossy().to_string());
+
+        let publisher = Arc::new(DebugLoggerPublisher::new());
+        let metrics = Arc::new(ProxyMetrics::new(100, HealthConfig::default()));
+
+        let server = ProxyServer::new(config, EventBatcher::new(publisher, 10, 100, 1000), metrics)
+            .await
+            .unwrap();
+
+        // Should have authenticator with the test user
+        let auth = server.authenticator().unwrap();
+        assert!(auth.has_user("testuser"));
+        assert!(auth.check_password("testuser", "testpass"));
     }
 }
