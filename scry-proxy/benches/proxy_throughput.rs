@@ -58,6 +58,7 @@ fn create_test_config(backend_host: String, backend_port: u16) -> Config {
     Config {
         proxy: ProxyConfig {
             listen_address: "127.0.0.1:0".to_string(),
+            unix_socket: None,
             max_connections: 100,
             shutdown_timeout_secs: 30,
         },
@@ -131,6 +132,8 @@ fn create_test_config(backend_host: String, backend_port: u16) -> Config {
             },
         },
         tls: TlsConfig::default(),
+        auth: AuthConfig::default(),
+        databases: vec![],
     }
 }
 
