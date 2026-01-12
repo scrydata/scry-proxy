@@ -3,13 +3,15 @@ use super::{
 };
 use crate::admin::{AdminConsole, AdminResponse, ADMIN_DATABASE};
 use crate::auth::FileAuthenticator;
-use crate::config::{AuthType, Config, PoolingStrategy, TlsSslMode};
+use crate::config::{AuthType, Config, DatabaseConfig, PoolingStrategy, TlsSslMode};
 use crate::observability::ProxyMetrics;
 use crate::protocol::{Protocol, ProtocolConfig, ProtocolRegistry, StartupMessage};
 use crate::resilience::{ActiveHealthcheck, CircuitBreaker};
+use crate::routing::DatabaseRouter;
 use crate::tls::{handle_ssl_startup, load_client_tls_config, ClientTransport, SslStartupResult};
 use anyhow::{Context, Result};
 use rustls::ServerConfig;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -22,7 +24,10 @@ pub struct ProxyServer {
     config: Arc<Config>,
     listener: TcpListener,
     batcher: Arc<EventBatcher>,
-    pool_manager: Option<Arc<PoolManager>>,
+    /// Per-database pool managers. Key is database name, "*" is default.
+    pool_managers: HashMap<String, Arc<PoolManager>>,
+    /// Database router for multi-database support
+    router: DatabaseRouter,
     metrics: Arc<ProxyMetrics>,
     tls_config: Option<Arc<ServerConfig>>,
     authenticator: Option<Arc<FileAuthenticator>>,
@@ -102,68 +107,137 @@ impl ProxyServer {
             info!("Active healthcheck disabled");
         }
 
-        // Create connection pool if pooling is enabled
-        let pool = if config.performance.connection_pooling != PoolingStrategy::Disabled {
+        // Create database router for multi-database support
+        let router = DatabaseRouter::new(
+            &config.databases,
+            &config.backend,
+            config.performance.pool_size,
+        );
+
+        if !config.databases.is_empty() {
+            info!(
+                database_count = config.databases.len(),
+                "Multi-database routing enabled"
+            );
+        }
+
+        // Create circuit breaker if enabled (shared across all pools)
+        let circuit_breaker = if config.resilience.circuit_breaker.enabled {
+            let health_monitor = if config.resilience.circuit_breaker.use_health_monitor {
+                Some(Arc::clone(metrics.health_monitor()))
+            } else {
+                None
+            };
+
+            let cb = Arc::new(CircuitBreaker::new(
+                config.resilience.circuit_breaker.clone(),
+                health_monitor,
+            ));
+
+            // Store circuit breaker in metrics for observability
+            metrics.set_circuit_breaker(Some(Arc::clone(&cb)));
+
+            info!("Circuit breaker created and enabled");
+            Some(cb)
+        } else {
+            info!("Circuit breaker disabled");
+            metrics.set_circuit_breaker(None);
+            None
+        };
+
+        // Pass retry config if enabled
+        let retry_config = if config.resilience.connection_retry.enabled {
+            info!("Connection retries enabled");
+            Some(config.resilience.connection_retry.clone())
+        } else {
+            info!("Connection retries disabled");
+            None
+        };
+
+        // Create per-database connection pools and pool managers
+        let mut pool_managers: HashMap<String, Arc<PoolManager>> = HashMap::new();
+
+        if config.performance.connection_pooling != PoolingStrategy::Disabled {
             info!(
                 strategy = ?config.performance.connection_pooling,
                 protocol = protocol.name(),
-                pool_size = config.performance.pool_size,
-                pool_min_idle = config.performance.pool_min_idle,
-                "Creating TCP connection pool"
+                "Creating connection pools"
             );
 
-            let protocol_config = ProtocolConfig {
-                host: config.backend.host.clone(),
-                port: config.backend.port,
-                database: Some(config.backend.database.clone()),
-                user: Some(config.backend.user.clone()),
-                password: Some(config.backend.password.clone()),
-            };
+            // Helper to create a pool manager for a database config
+            let create_pool_manager = |db_config: &DatabaseConfig,
+                                       protocol: &Arc<dyn Protocol>,
+                                       tls_config: &crate::config::TlsConfig,
+                                       perf_config: &crate::config::PerformanceConfig,
+                                       circuit_breaker: &Option<Arc<CircuitBreaker>>,
+                                       retry_config: &Option<crate::config::ConnectionRetryConfig>|
+             -> Result<Arc<PoolManager>> {
+                let pool_size = db_config.pool_size.unwrap_or(perf_config.pool_size);
+                let min_idle = std::cmp::min(perf_config.pool_min_idle, pool_size);
 
-            // Create circuit breaker if enabled
-            let circuit_breaker = if config.resilience.circuit_breaker.enabled {
-                let health_monitor = if config.resilience.circuit_breaker.use_health_monitor {
-                    Some(Arc::clone(metrics.health_monitor()))
-                } else {
-                    None
+                let protocol_config = ProtocolConfig {
+                    host: db_config.host.clone(),
+                    port: db_config.port,
+                    database: Some(db_config.database.clone()),
+                    user: Some(db_config.user.clone()),
+                    password: Some(db_config.password.clone()),
                 };
 
-                let cb = Arc::new(CircuitBreaker::new(
-                    config.resilience.circuit_breaker.clone(),
-                    health_monitor,
-                ));
+                let pool = TcpConnectionPool::new(
+                    Arc::clone(protocol),
+                    protocol_config,
+                    tls_config,
+                    pool_size,
+                    Some(min_idle),
+                    circuit_breaker.clone(),
+                    retry_config.clone(),
+                    perf_config.pool_lifo,
+                )
+                .context(format!("Failed to create pool for database '{}'", db_config.name))?;
 
-                // Store circuit breaker in metrics for observability
-                metrics.set_circuit_breaker(Some(Arc::clone(&cb)));
+                let wait_queue = WaitQueue::new(perf_config.pool_queue_depth);
+                let pm_config = PoolManagerConfig {
+                    lifo: perf_config.pool_lifo,
+                    queue_depth: perf_config.pool_queue_depth,
+                    idle_unpin_secs: perf_config.pool_idle_unpin_secs,
+                    wait_timeout_ms: perf_config.pool_timeout_secs * 1000,
+                };
 
-                info!("Circuit breaker created and enabled");
-                Some(cb)
-            } else {
-                info!("Circuit breaker disabled");
-                metrics.set_circuit_breaker(None);
-                None
+                info!(
+                    database = %db_config.name,
+                    pool_size = pool_size,
+                    host = %db_config.host,
+                    port = db_config.port,
+                    "Created pool for database"
+                );
+
+                Ok(PoolManager::new(Arc::new(pool), wait_queue, pm_config))
             };
 
-            // Pass retry config if enabled
-            let retry_config = if config.resilience.connection_retry.enabled {
-                info!("Connection retries enabled");
-                Some(config.resilience.connection_retry.clone())
-            } else {
-                info!("Connection retries disabled");
-                None
-            };
-
-            let pool = TcpConnectionPool::new(
-                Arc::clone(&protocol),
-                protocol_config,
+            // Create pool for default backend ("*")
+            let default_db_config = router.default_config();
+            let default_pm = create_pool_manager(
+                default_db_config,
+                &protocol,
                 &config.tls,
-                config.performance.pool_size,
-                Some(config.performance.pool_min_idle),
-                circuit_breaker,
-                retry_config,
-                config.performance.pool_lifo,
-            )
-            .context("Failed to create TCP connection pool")?;
+                &config.performance,
+                &circuit_breaker,
+                &retry_config,
+            )?;
+            pool_managers.insert("*".to_string(), default_pm);
+
+            // Create pools for each configured database
+            for db_config in &config.databases {
+                let pm = create_pool_manager(
+                    db_config,
+                    &protocol,
+                    &config.tls,
+                    &config.performance,
+                    &circuit_breaker,
+                    &retry_config,
+                )?;
+                pool_managers.insert(db_config.name.clone(), pm);
+            }
 
             if config.tls.server_tls_sslmode != TlsSslMode::Disable {
                 info!(
@@ -172,32 +246,13 @@ impl ProxyServer {
                 );
             }
 
-            info!("TCP connection pool created successfully");
-            Some(Arc::new(pool))
+            info!(
+                pool_count = pool_managers.len(),
+                "Connection pools created successfully"
+            );
         } else {
             info!("Connection pooling disabled, using direct connections");
-            None
-        };
-
-        // Create PoolManager if pooling is enabled
-        let pool_manager = if let Some(ref pool) = pool {
-            let wait_queue = WaitQueue::new(config.performance.pool_queue_depth);
-            let pm_config = PoolManagerConfig {
-                lifo: config.performance.pool_lifo,
-                queue_depth: config.performance.pool_queue_depth,
-                idle_unpin_secs: config.performance.pool_idle_unpin_secs,
-                wait_timeout_ms: config.performance.pool_timeout_secs * 1000,
-            };
-            info!(
-                lifo = pm_config.lifo,
-                queue_depth = pm_config.queue_depth,
-                idle_unpin_secs = pm_config.idle_unpin_secs,
-                "Creating PoolManager"
-            );
-            Some(PoolManager::new(Arc::clone(pool), wait_queue, pm_config))
-        } else {
-            None
-        };
+        }
 
         // Load TLS configuration for client connections
         let tls_config =
@@ -239,7 +294,8 @@ impl ProxyServer {
             config: Arc::new(config),
             listener,
             batcher: Arc::new(batcher),
-            pool_manager,
+            pool_managers,
+            router,
             metrics,
             tls_config,
             authenticator,
@@ -252,9 +308,21 @@ impl ProxyServer {
         self.listener.local_addr().context("Failed to get local address")
     }
 
-    /// Get the pool manager, if pooling is enabled
+    /// Get the default pool manager, if pooling is enabled
     pub fn pool_manager(&self) -> Option<&Arc<PoolManager>> {
-        self.pool_manager.as_ref()
+        self.pool_managers.get("*")
+    }
+
+    /// Get a pool manager for a specific database
+    pub fn pool_manager_for(&self, database: &str) -> Option<&Arc<PoolManager>> {
+        self.pool_managers
+            .get(database)
+            .or_else(|| self.pool_managers.get("*"))
+    }
+
+    /// Get the database router
+    pub fn router(&self) -> &DatabaseRouter {
+        &self.router
     }
 
     /// Get the authenticator, if authentication is enabled
@@ -271,13 +339,14 @@ impl ProxyServer {
             "Proxy server starting"
         );
 
-        // Spawn idle cleanup background task if pool_manager exists and idle_unpin_secs > 0
-        if let Some(ref pool_manager) = self.pool_manager {
-            let idle_interval = self.config.performance.pool_idle_unpin_secs;
+        // Spawn idle cleanup background tasks for all pool managers
+        let idle_interval = self.config.performance.pool_idle_unpin_secs;
+        if idle_interval > 0 && !self.pool_managers.is_empty() {
+            let cleanup_interval_secs = std::cmp::max(1, idle_interval / 2);
 
-            if idle_interval > 0 {
-                let cleanup_interval_secs = std::cmp::max(1, idle_interval / 2);
+            for (db_name, pool_manager) in &self.pool_managers {
                 let pm = Arc::clone(pool_manager);
+                let db_name = db_name.clone();
                 tokio::spawn(async move {
                     let mut interval =
                         tokio::time::interval(Duration::from_secs(cleanup_interval_secs));
@@ -285,17 +354,18 @@ impl ProxyServer {
                         interval.tick().await;
                         let cleaned = pm.cleanup_idle();
                         if cleaned > 0 {
-                            debug!(cleaned, "Cleaned up idle sticky connections");
+                            debug!(database = %db_name, cleaned, "Cleaned up idle sticky connections");
                         }
                     }
                 });
-
-                info!(
-                    interval_secs = cleanup_interval_secs,
-                    idle_unpin_secs = idle_interval,
-                    "Idle cleanup background task started"
-                );
             }
+
+            info!(
+                interval_secs = cleanup_interval_secs,
+                idle_unpin_secs = idle_interval,
+                pool_count = self.pool_managers.len(),
+                "Idle cleanup background tasks started"
+            );
         }
 
         let mut connection_count = 0u64;
@@ -339,7 +409,7 @@ impl ProxyServer {
 
                             let config = Arc::clone(&self.config);
                             let batcher = Arc::clone(&self.batcher);
-                            let pool_manager = self.pool_manager.clone();
+                            let pool_managers = self.pool_managers.clone();
                             let metrics = Arc::clone(&self.metrics);
                             let tls_config = self.tls_config.clone();
                             let authenticator = self.authenticator.clone();
@@ -383,21 +453,34 @@ impl ProxyServer {
                                     }
                                 };
 
-                                // Check if this is an admin console connection
-                                // by parsing the startup message to see if database = "pgbouncer"
-                                let is_admin = if !startup_data.is_empty() {
+                                // Parse startup message to get database name and check for admin
+                                let (database_name, is_admin) = if !startup_data.is_empty() {
                                     if let Some(startup) = StartupMessage::parse(&startup_data) {
-                                        if let Some(db) = startup.database() {
-                                            db.eq_ignore_ascii_case(ADMIN_DATABASE)
-                                        } else {
-                                            false
-                                        }
+                                        let db = startup.database().map(|s| s.to_string());
+                                        let is_admin = db.as_ref()
+                                            .is_some_and(|d| d.eq_ignore_ascii_case(ADMIN_DATABASE));
+                                        (db, is_admin)
                                     } else {
-                                        false
+                                        (None, false)
                                     }
                                 } else {
-                                    false
+                                    (None, false)
                                 };
+
+                                // Select the appropriate pool manager for this database
+                                let pool_manager = database_name.as_ref()
+                                    .and_then(|db| pool_managers.get(db))
+                                    .or_else(|| pool_managers.get("*"))
+                                    .cloned();
+
+                                if let Some(ref db) = database_name {
+                                    debug!(
+                                        connection_id = conn_id,
+                                        database = %db,
+                                        has_specific_pool = pool_managers.contains_key(db),
+                                        "Routing connection to database"
+                                    );
+                                }
 
                                 if is_admin {
                                     info!(
@@ -406,6 +489,7 @@ impl ProxyServer {
                                         "Routing to admin console"
                                     );
 
+                                    // Admin console gets access to all pool managers
                                     if let Err(e) = handle_admin_connection(
                                         transport,
                                         pool_manager,
@@ -673,5 +757,55 @@ mod tests {
         let auth = server.authenticator().unwrap();
         assert!(auth.has_user("testuser"));
         assert!(auth.check_password("testuser", "testpass"));
+    }
+
+    #[tokio::test]
+    async fn test_server_creates_per_database_pools() {
+        use crate::config::DatabaseConfig;
+
+        let mut config = create_test_config();
+        // Add configured databases
+        config.databases = vec![
+            DatabaseConfig {
+                name: "app1".to_string(),
+                host: "app1-host".to_string(),
+                port: 5432,
+                database: "app1_db".to_string(),
+                user: "app1_user".to_string(),
+                password: "app1_pass".to_string(),
+                pool_size: Some(5),
+            },
+            DatabaseConfig {
+                name: "app2".to_string(),
+                host: "app2-host".to_string(),
+                port: 5433,
+                database: "app2_db".to_string(),
+                user: "app2_user".to_string(),
+                password: "app2_pass".to_string(),
+                pool_size: None, // Uses default
+            },
+        ];
+
+        let publisher = Arc::new(DebugLoggerPublisher::new());
+        let metrics = Arc::new(ProxyMetrics::new(100, HealthConfig::default()));
+
+        let server = ProxyServer::new(config, EventBatcher::new(publisher, 10, 100, 1000), metrics)
+            .await
+            .unwrap();
+
+        // Should have default pool manager
+        assert!(server.pool_manager().is_some());
+
+        // Should route to specific pool for configured databases
+        assert!(server.pool_manager_for("app1").is_some());
+        assert!(server.pool_manager_for("app2").is_some());
+
+        // Should fallback to default for unknown databases
+        assert!(server.pool_manager_for("unknown").is_some());
+
+        // Router should have the configured databases
+        assert!(server.router().has_route("app1"));
+        assert!(server.router().has_route("app2"));
+        assert!(!server.router().has_route("unknown"));
     }
 }
