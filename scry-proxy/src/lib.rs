@@ -1,4 +1,5 @@
 // Library exports for testing and potential future library usage
+pub mod auth;
 pub mod config;
 pub mod observability;
 pub mod protocol;

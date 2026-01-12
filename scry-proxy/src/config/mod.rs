@@ -43,6 +43,7 @@ pub struct Config {
     pub performance: PerformanceConfig,
     pub resilience: ResilienceConfig,
     pub tls: TlsConfig,
+    pub auth: AuthConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,6 +123,47 @@ pub enum PoolingStrategy {
     Transaction,
     /// Hybrid pooling - dynamic pinning with automatic state tracking (default)
     Hybrid,
+}
+
+/// Authentication type - matches PgBouncer naming
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthType {
+    /// No authentication required
+    #[default]
+    Trust,
+    /// MD5 password authentication
+    Md5,
+    /// SCRAM-SHA-256 password authentication
+    #[serde(rename = "scram-sha-256")]
+    ScramSha256,
+    /// Certificate-based authentication
+    Cert,
+}
+
+/// Authentication configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthConfig {
+    /// Authentication type: trust, md5, scram-sha-256, cert
+    pub auth_type: AuthType,
+
+    /// Path to userlist.txt file (PgBouncer format)
+    /// Format: "username" "password" (one per line)
+    pub auth_file: Option<String>,
+
+    /// Query to execute against backend to validate credentials
+    /// Example: SELECT usename, passwd FROM pg_shadow WHERE usename=$1
+    pub auth_query: Option<String>,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            auth_type: AuthType::Trust,
+            auth_file: None,
+            auth_query: None,
+        }
+    }
 }
 
 /// TLS SSL mode - matches PgBouncer naming for familiarity
@@ -346,6 +388,7 @@ impl Default for Config {
                 },
             },
             tls: TlsConfig::default(),
+            auth: AuthConfig::default(),
         }
     }
 }
@@ -456,5 +499,19 @@ mod tests {
         assert!(config.tls.client_tls_key_file.is_none());
         assert!(config.tls.client_tls_ca_file.is_none());
         assert!(config.tls.server_tls_ca_file.is_none());
+    }
+
+    #[test]
+    fn test_auth_type_default_is_trust() {
+        let config = Config::default();
+        assert_eq!(config.auth.auth_type, AuthType::Trust);
+    }
+
+    #[test]
+    fn test_auth_config_defaults() {
+        let config = Config::default();
+        assert_eq!(config.auth.auth_type, AuthType::Trust);
+        assert!(config.auth.auth_file.is_none());
+        assert!(config.auth.auth_query.is_none());
     }
 }
