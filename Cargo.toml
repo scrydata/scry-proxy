@@ -85,3 +85,7 @@ webpki-roots = "0.26"
 
 # Authentication
 md5 = "0.7"
+sha2 = "0.10"
+hmac = "0.12"
+pbkdf2 = { version = "0.12", default-features = false }
+base64 = "0.22"
