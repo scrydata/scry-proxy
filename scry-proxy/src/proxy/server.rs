@@ -591,15 +591,11 @@ impl ProxyServer {
     ) {
         loop {
             tokio::select! {
+                biased;  // Process in order to avoid reload_trigger always winning
+
                 _ = &mut *shutdown => {
                     info!("Shutdown signal received, stopping new connections");
                     break;
-                }
-
-                // Handle config reload signal
-                _ = self.reload_trigger.changed() => {
-                    info!("Received reload signal");
-                    self.apply_config_reload();
                 }
 
                 accept_result = self.listener.accept() => {
