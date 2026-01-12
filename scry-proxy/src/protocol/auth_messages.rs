@@ -270,6 +270,36 @@ pub fn build_password_message(password: &str) -> Vec<u8> {
     msg
 }
 
+/// Build a SASLInitialResponse message
+///
+/// Format: 'p' + length + mechanism (null-terminated) + response_length (4 bytes) + response
+pub fn build_sasl_initial_response(mechanism: &str, client_first: &[u8]) -> Vec<u8> {
+    let mech_bytes = mechanism.as_bytes();
+    let content_len = mech_bytes.len() + 1 + 4 + client_first.len();
+    let length = (4 + content_len) as i32;
+
+    let mut msg = Vec::with_capacity(1 + length as usize);
+    msg.push(b'p');
+    msg.extend_from_slice(&length.to_be_bytes());
+    msg.extend_from_slice(mech_bytes);
+    msg.push(0); // Null terminate mechanism
+    msg.extend_from_slice(&(client_first.len() as i32).to_be_bytes());
+    msg.extend_from_slice(client_first);
+    msg
+}
+
+/// Build a SASLResponse message (for subsequent SCRAM messages)
+///
+/// Format: 'p' + length + response_data
+pub fn build_sasl_response(data: &[u8]) -> Vec<u8> {
+    let length = (4 + data.len()) as i32;
+    let mut msg = Vec::with_capacity(1 + length as usize);
+    msg.push(b'p');
+    msg.extend_from_slice(&length.to_be_bytes());
+    msg.extend_from_slice(data);
+    msg
+}
+
 /// Build an ErrorResponse message
 ///
 /// Format: 'E' + length + fields + terminator
@@ -483,5 +513,25 @@ mod tests {
         // Verify we can parse it back
         let parsed = parse_password_message(&msg).unwrap();
         assert_eq!(parsed, "md5abc123");
+    }
+
+    #[test]
+    fn test_build_sasl_initial_response() {
+        let msg = build_sasl_initial_response("SCRAM-SHA-256", b"n,,n=user,r=nonce123");
+
+        assert_eq!(msg[0], b'p');
+        // Should contain mechanism name and client-first-message
+        let msg_str = String::from_utf8_lossy(&msg);
+        assert!(msg_str.contains("SCRAM-SHA-256"));
+    }
+
+    #[test]
+    fn test_build_sasl_response() {
+        let client_final = b"c=biws,r=nonce,p=proof";
+        let msg = build_sasl_response(client_final);
+
+        assert_eq!(msg[0], b'p');
+        let length = i32::from_be_bytes([msg[1], msg[2], msg[3], msg[4]]);
+        assert_eq!(length as usize, 4 + client_final.len());
     }
 }
