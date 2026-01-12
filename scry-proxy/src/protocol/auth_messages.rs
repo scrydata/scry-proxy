@@ -257,6 +257,19 @@ pub fn parse_password_message(data: &[u8]) -> Option<String> {
     String::from_utf8(password_data.to_vec()).ok()
 }
 
+/// Build a PasswordMessage to send to the backend
+///
+/// Format: 'p' + length (4 bytes) + password + null terminator
+pub fn build_password_message(password: &str) -> Vec<u8> {
+    let length = (4 + password.len() + 1) as i32;
+    let mut msg = Vec::with_capacity(1 + length as usize);
+    msg.push(b'p');
+    msg.extend_from_slice(&length.to_be_bytes());
+    msg.extend_from_slice(password.as_bytes());
+    msg.push(0);
+    msg
+}
+
 /// Build an ErrorResponse message
 ///
 /// Format: 'E' + length + fields + terminator
@@ -457,5 +470,18 @@ mod tests {
 
         let parsed = AuthRequest::parse(&msg).unwrap();
         assert!(matches!(parsed, AuthRequest::Sasl { .. }));
+    }
+
+    #[test]
+    fn test_build_password_message() {
+        let msg = build_password_message("md5abc123");
+
+        assert_eq!(msg[0], b'p');
+        let length = i32::from_be_bytes([msg[1], msg[2], msg[3], msg[4]]);
+        assert_eq!(length as usize, 4 + "md5abc123".len() + 1); // length field + password + null
+
+        // Verify we can parse it back
+        let parsed = parse_password_message(&msg).unwrap();
+        assert_eq!(parsed, "md5abc123");
     }
 }
