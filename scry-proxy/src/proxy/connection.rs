@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
+use parking_lot::Mutex;
 use tracing::{debug, error, info, instrument, warn};
 
 /// Handles a single client connection, forwarding messages to/from the backend
@@ -87,26 +87,42 @@ impl ConnectionHandler {
 
     /// Build a QueryEventBuilder with anonymization if enabled
     /// Returns (builder, value_fingerprints) for hot data tracking
+    ///
+    /// Optimized to minimize allocations:
+    /// - Takes ownership of query (no clone)
+    /// - Uses Arc<str> for connection_id and database (cheap pointer copy)
     fn build_query_event(
         query: String,
-        connection_id: u64,
-        database: String,
+        connection_id: &str,
+        database: &str,
         anonymize: bool,
     ) -> (QueryEventBuilder, Vec<String>) {
-        let mut builder = QueryEventBuilder::new(query.clone());
-        builder = builder.connection_id(connection_id.to_string()).database(database);
-
-        let mut fingerprints = Vec::new();
-
-        // Apply anonymization if enabled
-        if anonymize {
+        // Process anonymization first (needs to borrow query)
+        let (final_query, normalized, fingerprints) = if anonymize {
             let anonymizer = QueryAnonymizer::new();
             if let Some(anon) = anonymizer.anonymize(&query) {
-                fingerprints = anon.value_fingerprints.clone();
-                builder = builder
-                    .normalized_query(anon.normalized_query)
-                    .value_fingerprints(anon.value_fingerprints);
+                // Clone fingerprints for builder, move original for return
+                let fps = anon.value_fingerprints;
+                (query, Some(anon.normalized_query), fps)
+            } else {
+                (query, None, Vec::new())
             }
+        } else {
+            (query, None, Vec::new())
+        };
+
+        // Move query into builder (no clone!)
+        let mut builder = QueryEventBuilder::new(final_query);
+        builder = builder
+            .connection_id(connection_id)
+            .database(database);
+
+        if let Some(nq) = normalized {
+            builder = builder.normalized_query(nq);
+        }
+        if !fingerprints.is_empty() {
+            // Clone for builder, return original
+            builder = builder.value_fingerprints(fingerprints.clone());
         }
 
         (builder, fingerprints)
@@ -286,7 +302,10 @@ impl ConnectionHandler {
         pool_manager: &Arc<PoolManager>,
     ) -> Result<()> {
         let connection_id = self.connection_id;
-        let database = self.config.backend.database.clone();
+        // Pre-format connection_id once to avoid repeated u64::to_string() calls
+        let connection_id_str: Arc<str> = Arc::from(connection_id.to_string());
+        // Use Arc<str> for database to avoid repeated String clones
+        let database: Arc<str> = Arc::from(self.config.backend.database.as_str());
         let batcher = Arc::clone(&self.batcher);
         let anonymize = self.config.publisher.anonymize;
         let metrics = Arc::clone(&self.metrics);
@@ -446,7 +465,7 @@ impl ConnectionHandler {
                                     let duration = pending.started_at.elapsed();
                                     warn!(query = %pending.query, error = %error_msg, duration_ms = duration.as_millis(), "Query failed");
 
-                                    let (builder, fingerprints) = Self::build_query_event(pending.query, connection_id, database.clone(), anonymize);
+                                    let (builder, fingerprints) = Self::build_query_event(pending.query, &connection_id_str, &database, anonymize);
                                     let event = builder
                                         .params(pending.params)
                                         .params_incomplete(pending.params_incomplete)
@@ -471,7 +490,7 @@ impl ConnectionHandler {
                                     let duration = pending.started_at.elapsed();
                                     debug!(query = %pending.query, duration_ms = duration.as_millis(), "Query completed successfully");
 
-                                    let (builder, fingerprints) = Self::build_query_event(pending.query, connection_id, database.clone(), anonymize);
+                                    let (builder, fingerprints) = Self::build_query_event(pending.query, &connection_id_str, &database, anonymize);
                                     let event = builder
                                         .params(pending.params)
                                         .params_incomplete(pending.params_incomplete)
@@ -689,7 +708,10 @@ impl ConnectionHandler {
         let (mut backend_read, mut backend_write) = backend_stream.split();
 
         let connection_id = self.connection_id;
-        let database = self.config.backend.database.clone();
+        // Pre-format connection_id once to avoid repeated u64::to_string() calls
+        let connection_id_str: Arc<str> = Arc::from(connection_id.to_string());
+        // Use Arc<str> for database to avoid repeated String clones
+        let database: Arc<str> = Arc::from(self.config.backend.database.as_str());
         let batcher_clone = Arc::clone(&self.batcher);
         let config_clone = Arc::clone(&self.config);
         let anonymize = self.config.publisher.anonymize;
@@ -718,7 +740,7 @@ impl ConnectionHandler {
                         // Process ALL protocol messages in buffer
                         let messages = extractor.extract_messages(data);
                         if !messages.is_empty() {
-                            let mut cache = cache_writer.lock().await;
+                            let mut cache = cache_writer.lock();
                             for msg in messages {
                                 match msg {
                                     Message::Parse { name, query, param_oids } => {
@@ -835,7 +857,7 @@ impl ConnectionHandler {
 
                         // Check for error response first
                         if let Some(error_msg) = extractor.extract_error(data) {
-                            let mut cache = cache_reader.lock().await;
+                            let mut cache = cache_reader.lock();
                             if let Some(pending) = cache.take_pending("") {
                                 let duration = pending.started_at.elapsed();
                                 warn!(
@@ -847,8 +869,8 @@ impl ConnectionHandler {
 
                                 let (builder, fingerprints) = Self::build_query_event(
                                     pending.query,
-                                    connection_id,
-                                    database.clone(),
+                                    &connection_id_str,
+                                    &database,
                                     anonymize,
                                 );
                                 let event = builder
@@ -871,7 +893,7 @@ impl ConnectionHandler {
                         }
                         // Check if this is a successful query completion
                         else if extractor.is_query_complete(data) {
-                            let mut cache = cache_reader.lock().await;
+                            let mut cache = cache_reader.lock();
                             if let Some(pending) = cache.take_pending("") {
                                 let duration = pending.started_at.elapsed();
                                 debug!(
@@ -882,8 +904,8 @@ impl ConnectionHandler {
 
                                 let (builder, fingerprints) = Self::build_query_event(
                                     pending.query,
-                                    connection_id,
-                                    database.clone(),
+                                    &connection_id_str,
+                                    &database,
                                     anonymize,
                                 );
                                 let event = builder
