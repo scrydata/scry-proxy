@@ -9,14 +9,16 @@ admin_password = "admin"
 [pools.postgres]
 pool_mode = "transaction"
 default_role = "primary"
-query_parser_enabled = false
+query_parser_enabled = true
+query_parser_read_write_splitting = false
 primary_reads_enabled = true
 sharding_function = "pg_bigint_hash"
+prepared_statements_cache_size = 500
 
 [pools.postgres.users.0]
 username = "postgres"
 password = "postgres"
-pool_size = 20
+pool_size = 50
 min_pool_size = 5
 
 [pools.postgres.shards.0]

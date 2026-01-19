@@ -29,6 +29,13 @@ pub fn create_pool(database_url: &str, pool_size: usize) -> Result<Pool> {
         ..Default::default()
     });
 
+    // Disable statement caching for compatibility with transaction-mode connection poolers
+    // (PgBouncer, PgCat). Statement caching doesn't work when the backend connection
+    // can change between transactions.
+    config.manager = Some(deadpool_postgres::ManagerConfig {
+        recycling_method: deadpool_postgres::RecyclingMethod::Fast,
+    });
+
     config.create_pool(Some(Runtime::Tokio1), NoTls).context("Failed to create connection pool")
 }
 

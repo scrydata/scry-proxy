@@ -5,6 +5,7 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: postgres
+      POSTGRES_HOST_AUTH_METHOD: trust
     ports:
       - "5432:5432"
     volumes:
@@ -16,17 +17,22 @@ services:
       retries: 10
 
   pgbouncer:
-    image: edoburu/pgbouncer:1.21.0
+    image: pgbouncer/pgbouncer:latest
     depends_on:
       postgres:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgres://postgres:postgres@postgres:5432/postgres
+      DATABASES_HOST: postgres
+      DATABASES_PORT: 5432
+      DATABASES_USER: postgres
+      DATABASES_PASSWORD: postgres
+      DATABASES_DBNAME: postgres
+      PGBOUNCER_POOL_MODE: session
+      PGBOUNCER_MAX_CLIENT_CONN: 1000
+      PGBOUNCER_DEFAULT_POOL_SIZE: 50
+      PGBOUNCER_AUTH_TYPE: any
     ports:
       - "6432:6432"
-    volumes:
-      - ./pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
-      - ./pgbouncer/userlist.txt:/etc/pgbouncer/userlist.txt:ro
 
   pgcat:
     image: ghcr.io/postgresml/pgcat:main
@@ -38,6 +44,97 @@ services:
     volumes:
       - ./pgcat/pgcat.toml:/etc/pgcat/pgcat.toml:ro
     command: ["/usr/bin/pgcat", "/etc/pgcat/pgcat.toml"]
+
+  # Scry proxy - base configuration (no events, pure proxy overhead)
+  scry-base:
+    build:
+      context: ../..
+      dockerfile: scry-proxy/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      SCRY_PROXY__LISTEN_ADDRESS: "0.0.0.0:5433"
+      SCRY_BACKEND__HOST: postgres
+      SCRY_BACKEND__PORT: 5432
+      SCRY_BACKEND__DATABASE: postgres
+      SCRY_BACKEND__USER: postgres
+      SCRY_BACKEND__PASSWORD: postgres
+      SCRY_BACKEND__POOL_SIZE: 50
+      SCRY_PERFORMANCE__POOL_SIZE: 50
+      SCRY_PUBLISHER__ENABLED: "false"
+      SCRY_OBSERVABILITY__ENABLE_TRACING: "false"
+      SCRY_OBSERVABILITY__ENABLE_METRICS_SERVER: "true"
+    ports:
+      - "5434:5433"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9090/health"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  # Scry proxy - events enabled (no anonymization)
+  scry-events:
+    build:
+      context: ../..
+      dockerfile: scry-proxy/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      SCRY_PROXY__LISTEN_ADDRESS: "0.0.0.0:5433"
+      SCRY_BACKEND__HOST: postgres
+      SCRY_BACKEND__PORT: 5432
+      SCRY_BACKEND__DATABASE: postgres
+      SCRY_BACKEND__USER: postgres
+      SCRY_BACKEND__PASSWORD: postgres
+      SCRY_BACKEND__POOL_SIZE: 50
+      SCRY_PERFORMANCE__POOL_SIZE: 50
+      SCRY_PUBLISHER__ENABLED: "true"
+      SCRY_PUBLISHER__ANONYMIZE: "false"
+      SCRY_PUBLISHER__PUBLISHER_TYPE: debug
+      SCRY_OBSERVABILITY__ENABLE_TRACING: "false"
+      SCRY_OBSERVABILITY__ENABLE_METRICS_SERVER: "true"
+    ports:
+      - "5435:5433"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9090/health"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  # Scry proxy - full features (events + anonymization)
+  scry-full:
+    build:
+      context: ../..
+      dockerfile: scry-proxy/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      SCRY_PROXY__LISTEN_ADDRESS: "0.0.0.0:5433"
+      SCRY_BACKEND__HOST: postgres
+      SCRY_BACKEND__PORT: 5432
+      SCRY_BACKEND__DATABASE: postgres
+      SCRY_BACKEND__USER: postgres
+      SCRY_BACKEND__PASSWORD: postgres
+      SCRY_BACKEND__POOL_SIZE: 50
+      SCRY_PERFORMANCE__POOL_SIZE: 50
+      SCRY_PUBLISHER__ENABLED: "true"
+      SCRY_PUBLISHER__ANONYMIZE: "true"
+      SCRY_PUBLISHER__PUBLISHER_TYPE: debug
+      SCRY_OBSERVABILITY__ENABLE_TRACING: "false"
+      SCRY_OBSERVABILITY__ENABLE_METRICS_SERVER: "true"
+    ports:
+      - "5436:5433"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9090/health"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
 
 networks:
   default:
