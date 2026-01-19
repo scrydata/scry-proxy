@@ -243,6 +243,7 @@ Generated charts in `benchmarks/results/scale-20260119/`:
 | **Direct Postgres** | 9,184 qps | 2.1 ms | 3.8 ms | 100% |
 | **Scry Hybrid** | 7,112 qps | 2.7 ms | 5.4 ms | 100% |
 | **PgBouncer** | 5,309 qps | 3.6 ms | 5.8 ms | 100% |
+| **PgCat** | 447 qps | 44.1 ms | 53.2 ms | 100% |
 
 ### Results at 50 Connections
 
@@ -251,6 +252,7 @@ Generated charts in `benchmarks/results/scale-20260119/`:
 | **Direct Postgres** | 11,460 qps | 3.9 ms | 12.1 ms | 100% |
 | **Scry Hybrid** | 8,560 qps | 5.0 ms | 31.2 ms | 100% |
 | **PgBouncer** | 5,287 qps | 9.0 ms | 17.2 ms | 100% |
+| **PgCat** | 1,080 qps | 44.6 ms | 56.6 ms | 100% |
 
 ### Analysis
 
@@ -266,7 +268,12 @@ Generated charts in `benchmarks/results/scale-20260119/`:
 - **+0.6ms p50 overhead at 20 conn** (proxy cost)
 - **+1.1ms p50 overhead at 50 conn** (proxy cost)
 
-**Key Finding:** With both proxies properly configured for transaction-mode pooling, Scry Hybrid significantly outperforms PgBouncer while maintaining reasonable overhead vs direct Postgres.
+**PgCat Performance:**
+- Very high latency (~44ms p50) due to `query_parser_enabled = true`
+- Query parser adds overhead for read/write splitting even when not needed
+- Throughput scales with connections but latency remains constant
+
+**Key Finding:** With all proxies properly configured for transaction-mode pooling, Scry Hybrid significantly outperforms both PgBouncer and PgCat while maintaining reasonable overhead vs direct Postgres.
 
 ## Next Steps
 
