@@ -269,11 +269,45 @@ Generated charts in `benchmarks/results/scale-20260119/`:
 - **+1.1ms p50 overhead at 50 conn** (proxy cost)
 
 **PgCat Performance:**
-- Very high latency (~44ms p50) due to `query_parser_enabled = true`
-- Query parser adds overhead for read/write splitting even when not needed
-- Throughput scales with connections but latency remains constant
+- Very high latency (~44ms p50) regardless of configuration
+- Tested with `query_parser_enabled = false` - no improvement (448 qps, 44ms p50 vs 447 qps, 44ms p50)
+- The ~44ms overhead is inherent to PgCat's architecture, not the query parser
+- Throughput scales with connections but latency remains constant (~44ms at all connection counts)
 
 **Key Finding:** With all proxies properly configured for transaction-mode pooling, Scry Hybrid significantly outperforms both PgBouncer and PgCat while maintaining reasonable overhead vs direct Postgres.
+
+## PgCat Query Parser Investigation
+
+**Date:** 2026-01-19
+**Hypothesis:** PgCat's ~44ms latency is caused by `query_parser_enabled = true`
+
+### Test Setup
+
+Disabled query parsing in PgCat configuration:
+```toml
+[pools.postgres]
+query_parser_enabled = false  # Changed from true
+```
+
+### Results Comparison
+
+| Setting | Connections | Throughput | p50 | p99 |
+|---------|-------------|------------|-----|-----|
+| query_parser=true | 20 | 447 qps | 44.1 ms | 53.2 ms |
+| query_parser=false | 20 | 448 qps | 44.1 ms | 52.5 ms |
+| query_parser=true | 50 | 1,080 qps | 44.6 ms | 56.6 ms |
+| query_parser=false | 50 | 1,093 qps | 44.3 ms | 55.6 ms |
+
+### Conclusion
+
+**Disabling the query parser has no meaningful impact on PgCat latency.**
+
+The ~44ms overhead appears to be inherent to PgCat's architecture, not the query parser. Possible causes:
+- Connection handling overhead in the async runtime
+- Protocol parsing/serialization costs
+- Internal message routing between threads/tasks
+
+This explains why PgCat latency remains constant regardless of connection count - it's not query parsing overhead, but per-request processing overhead.
 
 ## Next Steps
 

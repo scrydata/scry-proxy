@@ -9,7 +9,7 @@ admin_password = "admin"
 [pools.postgres]
 pool_mode = "transaction"
 default_role = "primary"
-query_parser_enabled = true
+query_parser_enabled = false
 query_parser_read_write_splitting = false
 primary_reads_enabled = true
 sharding_function = "pg_bigint_hash"
