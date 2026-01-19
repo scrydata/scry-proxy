@@ -534,6 +534,11 @@ impl ProxyServer {
                 accept_result = self.listener.accept() => {
                     match accept_result {
                         Ok((client_stream, client_addr)) => {
+                            // Disable Nagle's algorithm for lower latency
+                            if let Err(e) = client_stream.set_nodelay(true) {
+                                warn!(error = %e, "Failed to set TCP_NODELAY on client connection");
+                            }
+
                             *connection_count += 1;
                             let conn_id = *connection_count;
 
@@ -602,6 +607,11 @@ impl ProxyServer {
                 accept_result = self.listener.accept() => {
                     match accept_result {
                         Ok((client_stream, client_addr)) => {
+                            // Disable Nagle's algorithm for lower latency
+                            if let Err(e) = client_stream.set_nodelay(true) {
+                                warn!(error = %e, "Failed to set TCP_NODELAY on client connection");
+                            }
+
                             *connection_count += 1;
                             let conn_id = *connection_count;
 
@@ -653,7 +663,7 @@ impl ProxyServer {
                 }
 
                 let remaining = connection_tasks.len();
-                if remaining.is_multiple_of(10) || remaining < 10 {
+                if remaining % 10 == 0 || remaining < 10 {
                     info!(
                         remaining_connections = remaining,
                         elapsed_secs = drain_start.elapsed().as_secs(),

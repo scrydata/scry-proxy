@@ -150,6 +150,11 @@ impl ConnectionHandler {
                 .await
                 .context("Failed to connect to backend")?;
 
+            // Disable Nagle's algorithm for lower latency
+            backend_stream
+                .set_nodelay(true)
+                .context("Failed to set TCP_NODELAY on backend connection")?;
+
             // Use direct connection
             return self.handle_with_owned_backend(backend_stream).await;
         }

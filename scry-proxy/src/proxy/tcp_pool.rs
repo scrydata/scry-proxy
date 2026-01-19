@@ -222,6 +222,9 @@ impl Manager for BackendTransportManager {
         let stream =
             TcpStream::connect(&self.backend_addr).await.context("Failed to connect to backend")?;
 
+        // Disable Nagle's algorithm for lower latency
+        stream.set_nodelay(true).context("Failed to set TCP_NODELAY on backend connection")?;
+
         debug!(backend_addr = %self.backend_addr, "TCP connection established");
 
         // Then, negotiate SSL if configured
