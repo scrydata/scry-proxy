@@ -383,6 +383,38 @@ impl ProxyServer {
         self.reload_sender.clone()
     }
 
+    /// Warm up all connection pools before accepting client connections
+    ///
+    /// This pre-creates backend connections to avoid cold-start latency.
+    /// Should be called between `new()` and `run()`.
+    ///
+    /// # Arguments
+    /// * `min_idle` - Number of connections to pre-create per pool
+    ///
+    /// # Returns
+    /// Total number of connections created across all pools
+    pub async fn warmup_pools(&self, min_idle: usize) -> usize {
+        if self.pool_managers.is_empty() || min_idle == 0 {
+            return 0;
+        }
+
+        info!(
+            pool_count = self.pool_managers.len(),
+            min_idle = min_idle,
+            "Warming up connection pools"
+        );
+
+        let mut total_created = 0;
+        for (db_name, pool_manager) in &self.pool_managers {
+            let created = pool_manager.warmup(min_idle).await;
+            info!(database = %db_name, created = created, "Pool warmup complete");
+            total_created += created;
+        }
+
+        info!(total_created = total_created, "All pools warmed up");
+        total_created
+    }
+
     /// Apply a config reload, updating hot-reloadable settings
     ///
     /// Currently supports reloading:

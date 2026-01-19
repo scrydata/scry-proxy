@@ -43,7 +43,13 @@ pub async fn start_proxy(
         config.publisher.max_queue_size,
     );
 
-    let server = ProxyServer::new(config, batcher, metrics).await?;
+    let server = ProxyServer::new(config.clone(), batcher, metrics).await?;
+
+    // Warm up connection pools before accepting connections
+    let min_idle = config.performance.pool_min_idle;
+    if min_idle > 0 {
+        server.warmup_pools(min_idle).await;
+    }
 
     // Setup SIGHUP handler for config reload (Unix only)
     #[cfg(unix)]
