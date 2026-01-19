@@ -123,3 +123,30 @@ docker-run:
 # Tag and push to registry (requires REGISTRY env var)
 docker-push TAG="latest":
     docker tag scry-proxy ${env:REGISTRY}/scry-proxy:{{TAG}}; docker push ${env:REGISTRY}/scry-proxy:{{TAG}}
+
+# ============================================
+# Benchmark Commands
+# ============================================
+
+# Build the benchmark runner
+bench-build:
+    cargo build --release -p scry-benchmarks
+
+# Run a quick benchmark against direct Postgres
+bench-quick:
+    Push-Location benchmarks; docker compose up -d postgres; Pop-Location
+    Start-Sleep -Seconds 5
+    ./target/release/bench-runner.exe --database-url "postgres://postgres:postgres@localhost:5432/postgres" --connections 10 --queries 1000 --label "quick-test" --proxy "postgres" --output "benchmarks/quick-test.json"
+    Push-Location benchmarks; docker compose down -v; Pop-Location
+
+# Run full comparison benchmark suite
+bench-full:
+    Push-Location benchmarks; bash run-comparison.sh; Pop-Location
+
+# Generate charts from benchmark results
+bench-charts RESULTS_DIR:
+    python benchmarks/generate_charts.py {{RESULTS_DIR}}
+
+# Clean up benchmark containers
+bench-clean:
+    Push-Location benchmarks; docker compose down -v; Pop-Location
