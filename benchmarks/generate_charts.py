@@ -160,6 +160,89 @@ def plot_throughput_vs_connections(results: list[dict], output_path: Path):
     print(f"Generated: {output_path / 'throughput_vs_connections.png'}")
 
 
+def generate_scale_charts(results_dir: Path, results: list[dict]):
+    """Generate charts comparing proxies across connection counts.
+
+    Creates a combined figure with throughput and p99 latency scaling
+    side by side, showing how each proxy performs as connections increase.
+    """
+    # Group results by proxy name and connection count
+    proxy_data = {}
+    for r in results:
+        proxy = r.get('proxy', r.get('label', 'unknown'))
+        conns = r['config']['connections']
+        if proxy not in proxy_data:
+            proxy_data[proxy] = {}
+        proxy_data[proxy][conns] = r
+
+    if not proxy_data:
+        print("No data found for scale charts")
+        return
+
+    # Get sorted proxy names and connection counts
+    proxies = sorted(proxy_data.keys())
+    conn_counts = sorted(set(c for p in proxy_data.values() for c in p.keys()))
+
+    if len(conn_counts) < 2:
+        print("Scale charts require at least 2 different connection counts")
+        return
+
+    # Create figure with 2 subplots
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    colors = plt.cm.tab10(np.linspace(0, 1, len(proxies)))
+
+    # Throughput chart
+    ax1 = axes[0]
+    for proxy, color in zip(proxies, colors):
+        conns = sorted(proxy_data[proxy].keys())
+        throughputs = [proxy_data[proxy][c]['throughput_qps'] for c in conns]
+        ax1.plot(conns, throughputs, marker='o', label=proxy, color=color, linewidth=2)
+    ax1.set_xlabel('Concurrent Connections')
+    ax1.set_ylabel('Throughput (qps)')
+    ax1.set_title('Throughput Scaling')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+
+    # p99 Latency chart
+    ax2 = axes[1]
+    for proxy, color in zip(proxies, colors):
+        conns = sorted(proxy_data[proxy].keys())
+        # Convert microseconds to milliseconds for readability
+        p99s = [proxy_data[proxy][c]['latency_us']['p99'] / 1000 for c in conns]
+        ax2.plot(conns, p99s, marker='o', label=proxy, color=color, linewidth=2)
+    ax2.set_xlabel('Concurrent Connections')
+    ax2.set_ylabel('p99 Latency (ms)')
+    ax2.set_title('p99 Latency Scaling')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    output_file = results_dir / "scale-comparison.png"
+    plt.savefig(output_file, dpi=150)
+    plt.close()
+    print(f"Generated: {output_file}")
+
+
+def is_scale_test_results(results: list[dict]) -> bool:
+    """Check if results appear to be from scale testing.
+
+    Scale test results have multiple proxies tested at multiple connection counts.
+    """
+    if len(results) < 4:  # Need at least a few results
+        return False
+
+    # Count unique proxies and connection counts
+    proxies = set()
+    conn_counts = set()
+    for r in results:
+        proxies.add(r.get('proxy', r.get('label', 'unknown')))
+        conn_counts.add(r['config']['connections'])
+
+    # Scale tests typically have multiple proxies at multiple connection levels
+    return len(proxies) >= 2 and len(conn_counts) >= 2
+
+
 def generate_summary_table(results: list[dict], output_path: Path):
     """Generate a markdown summary table."""
     by_conn = group_by_connections(results)
@@ -209,6 +292,11 @@ def main():
     plot_throughput_comparison(results, results_dir)
     plot_throughput_vs_connections(results, results_dir)
     generate_summary_table(results, results_dir)
+
+    # Generate scale comparison chart if this looks like scale test results
+    if is_scale_test_results(results):
+        print("Detected scale test results, generating scale comparison chart...")
+        generate_scale_charts(results_dir, results)
 
     print("\nAll charts generated successfully!")
 
