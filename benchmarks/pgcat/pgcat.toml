@@ -18,8 +18,8 @@ prepared_statements_cache_size = 500
 [pools.postgres.users.0]
 username = "postgres"
 password = "postgres"
-pool_size = 50
-min_pool_size = 5
+pool_size = 250
+min_pool_size = 50
 
 [pools.postgres.shards.0]
 database = "postgres"
