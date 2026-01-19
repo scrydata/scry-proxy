@@ -223,11 +223,57 @@ Generated charts in `benchmarks/results/scale-20260119/`:
 - `throughput_vs_connections.png` - Line chart showing throughput scaling
 - `latency_vs_connections.png` - Line chart showing latency scaling
 
+## Transaction Mode Comparison: Scry Hybrid vs PgBouncer
+
+**Date:** 2026-01-19
+**Test Methodology:** Fresh postgres restart between each test, all proxies stopped before each run
+
+### Configuration
+
+| Setting | Scry Hybrid | PgBouncer |
+|---------|-------------|-----------|
+| Pool Mode | Hybrid (transaction-based) | Transaction |
+| Pool Size | 50-100 | 250 |
+| Min Idle | 10-20 | 50 |
+
+### Results at 20 Connections
+
+| Proxy | Throughput | p50 | p99 | Success |
+|-------|------------|-----|-----|---------|
+| **Direct Postgres** | 9,184 qps | 2.1 ms | 3.8 ms | 100% |
+| **Scry Hybrid** | 7,112 qps | 2.7 ms | 5.4 ms | 100% |
+| **PgBouncer** | 5,309 qps | 3.6 ms | 5.8 ms | 100% |
+
+### Results at 50 Connections
+
+| Proxy | Throughput | p50 | p99 | Success |
+|-------|------------|-----|-----|---------|
+| **Direct Postgres** | 11,460 qps | 3.9 ms | 12.1 ms | 100% |
+| **Scry Hybrid** | 8,560 qps | 5.0 ms | 31.2 ms | 100% |
+| **PgBouncer** | 5,287 qps | 9.0 ms | 17.2 ms | 100% |
+
+### Analysis
+
+**Scry Hybrid vs PgBouncer:**
+- **34% faster at 20 connections** (7,112 vs 5,309 qps)
+- **62% faster at 50 connections** (8,560 vs 5,287 qps)
+- **26% better p50 latency at 20 conn** (2.7ms vs 3.6ms)
+- **44% better p50 latency at 50 conn** (5.0ms vs 9.0ms)
+
+**Scry Hybrid vs Direct Postgres:**
+- **77% throughput at 20 conn** (7,112 vs 9,184 qps)
+- **75% throughput at 50 conn** (8,560 vs 11,460 qps)
+- **+0.6ms p50 overhead at 20 conn** (proxy cost)
+- **+1.1ms p50 overhead at 50 conn** (proxy cost)
+
+**Key Finding:** With both proxies properly configured for transaction-mode pooling, Scry Hybrid significantly outperforms PgBouncer while maintaining reasonable overhead vs direct Postgres.
+
 ## Next Steps
 
-- [ ] Investigate remaining throughput gap vs direct Postgres (currently at 77%)
+- [ ] Investigate remaining throughput gap vs direct Postgres (currently at 75%)
 - [x] ~~Fix connection pool warmup causing high max latency~~ **DONE** - Implemented `pool_min_idle` warmup
 - [x] ~~Re-run full comparison with PgBouncer under identical conditions~~ **DONE** - Scry outperforms PgBouncer
 - [x] ~~Test with higher connection counts (50, 100, 200)~~ **DONE** - Scale testing complete
+- [x] ~~Fix PgBouncer configuration for fair comparison~~ **DONE** - Both using transaction mode
 - [ ] Profile CPU usage to identify remaining bottlenecks
-- [ ] Fix PgBouncer configuration for fair comparison at high connection counts
+- [ ] Investigate Scry p99 spike at 50 connections (DISCARD ALL overhead)
