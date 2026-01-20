@@ -309,12 +309,96 @@ The ~44ms overhead appears to be inherent to PgCat's architecture, not the query
 
 This explains why PgCat latency remains constant regardless of connection count - it's not query parsing overhead, but per-request processing overhead.
 
+## Container Resource Usage Comparison
+
+**Date:** 2026-01-19
+**Methodology:** All proxies running in Docker containers, measured via Docker stats API. 100K queries per test.
+
+### Throughput Comparison (queries per second)
+
+| Proxy | 20 conn | 50 conn |
+|-------|---------|---------|
+| **Direct Postgres** | 8,070 | 10,615 |
+| **PgBouncer** | 4,590 | 4,255 |
+| **PgCat** | 452 | 1,113 |
+| **Scry (base)** | 7,203 | 9,810 |
+| **Scry (events)** | 7,435 | 9,393 |
+| **Scry (full)** | 6,642 | 8,223 |
+
+### Latency Comparison (microseconds)
+
+| Proxy | p50 (20c) | p50 (50c) | p95 (20c) | p95 (50c) | p99 (20c) | p99 (50c) |
+|-------|-----------|-----------|-----------|-----------|-----------|-----------|
+| **Direct Postgres** | 2,063 | 3,701 | 5,207 | 11,327 | 9,615 | 17,343 |
+| **PgBouncer** | 4,299 | 11,623 | 5,311 | 13,775 | 6,015 | 15,151 |
+| **PgCat** | 44,031 | 44,223 | 47,839 | 48,511 | 48,511 | 49,887 |
+| **Scry (base)** | 2,651 | 4,579 | 3,859 | 8,975 | 5,331 | 12,775 |
+| **Scry (events)** | 2,569 | 4,803 | 3,735 | 9,343 | 5,175 | 13,095 |
+| **Scry (full)** | 2,919 | 5,659 | 4,111 | 10,015 | 4,887 | 12,807 |
+
+### Proxy CPU Usage (% of available cores)
+
+| Proxy | 20 conn | 50 conn |
+|-------|---------|---------|
+| **PgBouncer** | 102% | 102% |
+| **PgCat** | 18% | 47% |
+| **Scry (base)** | 373% | 502% |
+| **Scry (events)** | 370% | 496% |
+| **Scry (full)** | 478% | 631% |
+
+### Proxy Memory Usage (MB)
+
+| Proxy | 20 conn | 50 conn |
+|-------|---------|---------|
+| **PgBouncer** | 3.6 | 3.6 |
+| **PgCat** | 11.6 | 13.4 |
+| **Scry (base)** | 22.4 | 28.0 |
+| **Scry (events)** | 12.7 | 18.9 |
+| **Scry (full)** | 16.8 | 24.2 |
+
+### Postgres CPU/Memory Under Each Proxy
+
+| Proxy | CPU (20c) | CPU (50c) | Mem (20c) | Mem (50c) |
+|-------|-----------|-----------|-----------|-----------|
+| **Direct** | 494% | 887% | 81 MB | 139 MB |
+| **PgBouncer** | 261% | 275% | 80 MB | 138 MB |
+| **PgCat** | 21% | 51% | 178 MB | 196 MB |
+| **Scry (base)** | 427% | 700% | 80 MB | 138 MB |
+| **Scry (events)** | 423% | 714% | 69 MB | 126 MB |
+| **Scry (full)** | 377% | 573% | 69 MB | 126 MB |
+
+### Analysis
+
+**Performance Summary:**
+- **Scry achieves ~89% of direct Postgres throughput** at 20 connections (7,203 vs 8,070 qps)
+- **Scry achieves ~92% of direct Postgres throughput** at 50 connections (9,810 vs 10,615 qps)
+- **Scry is 57% faster than PgBouncer** at 20 connections (7,203 vs 4,590 qps)
+- **Scry is 131% faster than PgBouncer** at 50 connections (9,810 vs 4,255 qps)
+- **Scry latency overhead is ~600µs p50** vs direct Postgres
+
+**Feature Impact on Scry:**
+- Events enabled: **negligible impact** on throughput (~3% variation)
+- Events + anonymization: **~8% throughput reduction** vs base (6,642 vs 7,203 qps at 20 conn)
+- Anonymization adds CPU overhead: +105% CPU at 20 conn (478% vs 373%)
+
+**Resource Efficiency:**
+- PgBouncer is most memory-efficient (3.6 MB)
+- PgBouncer CPU is capped at ~102% (single-threaded)
+- Scry uses multiple cores effectively (up to 631% CPU utilization)
+- Scry memory is reasonable at 12-28 MB depending on features
+
+**PgCat Observations:**
+- Very low CPU/memory usage because throughput is very low
+- ~44ms latency is intrinsic to PgCat architecture (not query parsing)
+- Postgres CPU is low because PgCat is the bottleneck
+
 ## Next Steps
 
-- [ ] Investigate remaining throughput gap vs direct Postgres (currently at 75%)
 - [x] ~~Fix connection pool warmup causing high max latency~~ **DONE** - Implemented `pool_min_idle` warmup
 - [x] ~~Re-run full comparison with PgBouncer under identical conditions~~ **DONE** - Scry outperforms PgBouncer
 - [x] ~~Test with higher connection counts (50, 100, 200)~~ **DONE** - Scale testing complete
 - [x] ~~Fix PgBouncer configuration for fair comparison~~ **DONE** - Both using transaction mode
+- [x] ~~Container-based resource benchmarking~~ **DONE** - CPU/memory measured via Docker stats
+- [ ] Investigate remaining throughput gap vs direct Postgres (currently at 89%)
 - [ ] Profile CPU usage to identify remaining bottlenecks
 - [ ] Investigate Scry p99 spike at 50 connections (DISCARD ALL overhead)

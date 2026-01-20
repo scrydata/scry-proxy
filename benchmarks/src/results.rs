@@ -57,7 +57,10 @@ pub struct BenchmarkResults {
     pub failed_queries: u64,
     pub throughput_qps: f64,
     pub latency_us: LatencyPercentiles,
-    pub resource_usage: Option<ResourceUsage>,
+    /// Resource usage for the proxy container (if monitored)
+    pub proxy_resource_usage: Option<ResourceUsage>,
+    /// Resource usage for the postgres container (if monitored)
+    pub postgres_resource_usage: Option<ResourceUsage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

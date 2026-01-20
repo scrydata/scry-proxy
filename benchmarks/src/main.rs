@@ -42,6 +42,14 @@ struct Args {
     /// Whether event publishing is enabled (for scry)
     #[arg(long)]
     events: Option<bool>,
+
+    /// Docker container name for proxy to monitor for resource usage
+    #[arg(long)]
+    proxy_container: Option<String>,
+
+    /// Docker container name for postgres to monitor for resource usage
+    #[arg(long)]
+    postgres_container: Option<String>,
 }
 
 #[tokio::main]
@@ -54,6 +62,12 @@ async fn main() -> Result<()> {
     eprintln!("Target: {}", args.database_url);
     eprintln!("Connections: {}", args.connections);
     eprintln!("Queries: {}", args.queries);
+    if let Some(ref container) = args.proxy_container {
+        eprintln!("Proxy Container: {}", container);
+    }
+    if let Some(ref container) = args.postgres_container {
+        eprintln!("Postgres Container: {}", container);
+    }
     eprintln!();
 
     let results = runner::run_benchmark(
@@ -64,6 +78,8 @@ async fn main() -> Result<()> {
         &args.proxy,
         args.anonymize,
         args.events,
+        args.proxy_container.as_deref(),
+        args.postgres_container.as_deref(),
     )
     .await?;
 
@@ -78,9 +94,16 @@ async fn main() -> Result<()> {
     eprintln!("  p99:  {:>8}", results.latency_us.p99);
     eprintln!("  max:  {:>8}", results.latency_us.max);
 
-    if let Some(ref usage) = results.resource_usage {
+    if let Some(ref usage) = results.proxy_resource_usage {
         eprintln!();
-        eprintln!("Resource Usage:");
+        eprintln!("Proxy Resource Usage:");
+        eprintln!("  CPU:    {:.1}%", usage.cpu_percent);
+        eprintln!("  Memory: {:.1} MB", usage.memory_mb);
+    }
+
+    if let Some(ref usage) = results.postgres_resource_usage {
+        eprintln!();
+        eprintln!("Postgres Resource Usage:");
         eprintln!("  CPU:    {:.1}%", usage.cpu_percent);
         eprintln!("  Memory: {:.1} MB", usage.memory_mb);
     }
