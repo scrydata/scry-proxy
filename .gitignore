@@ -18,6 +18,9 @@ Cargo.lock
 
 # Benchmarks
 /target/criterion/
+benchmarks/profiles/*.svg
+benchmarks/profiles/*.data
+benchmarks/profiles/perf.*
 
 # Environment
 .env
