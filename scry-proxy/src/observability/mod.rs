@@ -24,7 +24,7 @@ use crate::config::ObservabilityConfig;
 pub fn init(config: &ObservabilityConfig) -> Result<()> {
     // Set up tracing subscriber with env filter
     let env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,scry=debug"));
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
 
     let registry = tracing_subscriber::registry().with(env_filter);
 
