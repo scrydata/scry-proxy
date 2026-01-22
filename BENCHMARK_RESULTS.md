@@ -392,12 +392,91 @@ This explains why PgCat latency remains constant regardless of connection count 
 - ~44ms latency is intrinsic to PgCat architecture (not query parsing)
 - Postgres CPU is low because PgCat is the bottleneck
 
+## PgBouncer Configuration Fix: Session vs Transaction Mode
+
+**Date:** 2026-01-22
+**Issue:** Previous benchmarks showed PgBouncer throughput collapsing at 100+ connections (~82 qps)
+
+### Root Cause Analysis
+
+Two issues were discovered:
+
+1. **Pool Mode Misconfiguration**: The `docker-compose.yml` had `PGBOUNCER_POOL_MODE: session` instead of `transaction`. Session mode assigns one backend connection per client for the entire session, which doesn't scale and caused the throughput collapse.
+
+2. **Prepared Statement Conflicts**: The benchmark tool used `tokio-postgres`'s extended protocol with named prepared statements (`s0`, `s1`, etc.). In transaction mode, PgBouncer can route transactions to different backend connections, but prepared statements are server-side state that doesn't transfer. This caused errors like:
+   - `"prepared statement 's8' already exists"` - different client got same backend
+   - `"prepared statement 's13' does not exist"` - statement on different backend
+   - `"bind message supplies 1 parameters, but prepared statement 's10' requires 2"` - wrong statement
+
+### Fix Applied
+
+1. Changed `PGBOUNCER_POOL_MODE: session` → `PGBOUNCER_POOL_MODE: transaction` in docker-compose.yml
+2. Switched benchmark queries from extended protocol to `simple_query` (text protocol) for compatibility with transaction-mode poolers
+
+### Corrected Benchmark Results (50K queries each)
+
+#### Throughput Comparison (queries per second)
+
+| Connections | Direct PG | PgBouncer (session)* | PgBouncer (transaction) | Scry |
+|-------------|-----------|----------------------|-------------------------|------|
+| 20          | 18,140    | ~5,200               | **14,697**              | 14,146 |
+| 50          | 24,000    | ~5,200               | **14,906**              | 18,421 |
+| 100         | 28,006    | ~83 (collapsed)      | **14,654**              | 20,415 |
+| 200         | 20,209**  | ~82 (collapsed)      | **13,322**              | N/A*** |
+
+*Session mode results from previous flawed tests
+**Direct PG at 200 conn exceeded max_connections (817 failures out of 50K)
+***Scry max_connections was set to 100 for this test
+
+#### Latency Comparison at 50 Connections (microseconds)
+
+| Proxy | p50 | p95 | p99 | max |
+|-------|-----|-----|-----|-----|
+| **Direct Postgres** | 1,515 | 5,351 | 10,439 | 120,319 |
+| **PgBouncer (transaction)** | 3,209 | 4,759 | 5,923 | 55,103 |
+| **Scry** | 2,373 | 4,823 | 7,327 | 141,439 |
+
+### Key Findings
+
+**PgBouncer Transaction Mode Performance:**
+- Consistent 13-15K qps across all connection levels (no collapse)
+- ~3x improvement over the flawed session mode results at 100+ connections
+
+**Scry vs PgBouncer (Transaction Mode):**
+- At 20 conn: Scry slightly slower (14,146 vs 14,697 qps, -4%)
+- At 50 conn: **Scry 24% faster** (18,421 vs 14,906 qps)
+- At 100 conn: **Scry 39% faster** (20,415 vs 14,654 qps)
+- Scry scales better with connection count; PgBouncer plateaus around 14-15K qps
+
+**Why Scry Scales Better:**
+- Scry uses multi-threaded Tokio runtime (up to 631% CPU utilization)
+- PgBouncer is single-threaded (capped at ~102% CPU)
+- At higher connection counts, Scry's parallelism provides an advantage
+
+### Configuration Reference
+
+```yaml
+# docker-compose.yml - PgBouncer section
+pgbouncer:
+  image: pgbouncer/pgbouncer:latest
+  environment:
+    PGBOUNCER_POOL_MODE: transaction  # NOT session!
+    PGBOUNCER_MAX_CLIENT_CONN: 2000
+    PGBOUNCER_DEFAULT_POOL_SIZE: 250
+```
+
+```rust
+// Benchmark queries must use simple_query for transaction-mode poolers
+let results = client.simple_query(&query).await?;
+// NOT client.query("SELECT ... WHERE id = $1", &[&id]) - uses prepared statements
+```
+
 ## Next Steps
 
 - [x] ~~Fix connection pool warmup causing high max latency~~ **DONE** - Implemented `pool_min_idle` warmup
 - [x] ~~Re-run full comparison with PgBouncer under identical conditions~~ **DONE** - Scry outperforms PgBouncer
 - [x] ~~Test with higher connection counts (50, 100, 200)~~ **DONE** - Scale testing complete
-- [x] ~~Fix PgBouncer configuration for fair comparison~~ **DONE** - Both using transaction mode
+- [x] ~~Fix PgBouncer configuration for fair comparison~~ **DONE** - Fixed session→transaction mode
 - [x] ~~Container-based resource benchmarking~~ **DONE** - CPU/memory measured via Docker stats
 - [ ] Investigate remaining throughput gap vs direct Postgres (currently at 89%)
 - [ ] Profile CPU usage to identify remaining bottlenecks
