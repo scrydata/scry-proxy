@@ -106,19 +106,28 @@ impl ProtocolRegistry {
     ///
     /// This creates the appropriate Protocol implementation based on the
     /// DatabaseProtocol enum value from the configuration.
-    pub fn get(protocol: &crate::config::DatabaseProtocol) -> Result<Box<dyn Protocol>> {
+    ///
+    /// # Arguments
+    /// * `protocol` - The database protocol type (Postgres, MySQL, etc.)
+    /// * `reset_timeout_ms` - Timeout for connection reset operations (DISCARD ALL response)
+    pub fn get(
+        protocol: &crate::config::DatabaseProtocol,
+        reset_timeout_ms: u64,
+    ) -> Result<Box<dyn Protocol>> {
         use crate::config::DatabaseProtocol;
 
         match protocol {
-            DatabaseProtocol::Postgres => {
-                Ok(Box::new(crate::protocol::postgres::PostgresProtocol::new()))
-            } // Future protocol support - uncomment when implementing:
-              // DatabaseProtocol::Mysql => {
-              //     Err(anyhow::anyhow!("MySQL protocol not yet implemented"))
-              // }
-              // DatabaseProtocol::Mongodb => {
-              //     Err(anyhow::anyhow!("MongoDB protocol not yet implemented"))
-              // }
+            DatabaseProtocol::Postgres => Ok(Box::new(
+                crate::protocol::postgres::PostgresProtocol::new()
+                    .with_reset_timeout(reset_timeout_ms),
+            )),
+            // Future protocol support - uncomment when implementing:
+            // DatabaseProtocol::Mysql => {
+            //     Err(anyhow::anyhow!("MySQL protocol not yet implemented"))
+            // }
+            // DatabaseProtocol::Mongodb => {
+            //     Err(anyhow::anyhow!("MongoDB protocol not yet implemented"))
+            // }
         }
     }
 }

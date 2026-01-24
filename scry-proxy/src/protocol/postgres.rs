@@ -8,38 +8,83 @@ use super::traits::Protocol;
 use super::MessageExtractor;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::time::timeout;
 use tracing::{debug, warn};
 
 /// PostgreSQL protocol handler
 pub struct PostgresProtocol {
     extractor: MessageExtractor,
+    reset_timeout_ms: u64,
 }
 
 impl PostgresProtocol {
     pub fn new() -> Self {
-        Self { extractor: MessageExtractor::new() }
+        Self {
+            extractor: MessageExtractor::new(),
+            reset_timeout_ms: 5000, // Default 5 seconds
+        }
     }
 
-    /// Check if response contains CommandComplete message
-    fn contains_command_complete(data: &[u8]) -> bool {
-        for &byte in data {
-            if byte == b'C' {
-                return true;
-            }
-        }
-        false
+    /// Configure the timeout for DISCARD ALL response
+    pub fn with_reset_timeout(mut self, timeout_ms: u64) -> Self {
+        self.reset_timeout_ms = timeout_ms;
+        self
     }
 
-    /// Check if response contains ErrorResponse message
-    fn contains_error_response(data: &[u8]) -> bool {
-        for &byte in data {
-            if byte == b'E' {
-                return true;
+    /// Read from stream until ReadyForQuery message is received
+    ///
+    /// Returns Ok(true) if ReadyForQuery with 'I' (idle) status received
+    /// Returns Ok(false) if error response or unexpected state
+    /// Returns Err if I/O error
+    async fn read_until_ready_for_query(&self, stream: &mut TcpStream) -> Result<bool> {
+        let mut buffer = Vec::with_capacity(4096);
+        let mut temp = [0u8; 1024];
+
+        loop {
+            let n = stream.read(&mut temp).await.context("Failed to read response")?;
+
+            if n == 0 {
+                warn!("Connection closed while waiting for ReadyForQuery");
+                return Ok(false);
+            }
+
+            buffer.extend_from_slice(&temp[..n]);
+
+            // Check if we have a complete ReadyForQuery message
+            if let Some(status) = self.extractor.extract_ready_for_query(&buffer) {
+                match status {
+                    b'I' => return Ok(true), // Idle - success
+                    b'E' => {
+                        warn!("Connection in error state after DISCARD ALL");
+                        return Ok(false);
+                    }
+                    b'T' => {
+                        // Still in transaction? This shouldn't happen after DISCARD ALL
+                        warn!("Unexpected transaction state after DISCARD ALL");
+                        return Ok(false);
+                    }
+                    _ => {
+                        warn!(status = status, "Unknown ReadyForQuery status");
+                        return Ok(false);
+                    }
+                }
+            }
+
+            // Check for error response before ReadyForQuery
+            if let Some(error) = self.extractor.extract_error(&buffer) {
+                warn!(error = %error, "Error response during DISCARD ALL");
+                // Continue reading - error will be followed by ReadyForQuery
+            }
+
+            // Safety: prevent unbounded buffer growth
+            if buffer.len() > 64 * 1024 {
+                warn!("Response buffer exceeded 64KB without ReadyForQuery");
+                return Ok(false);
             }
         }
-        false
     }
 }
 
@@ -85,31 +130,26 @@ impl Protocol for PostgresProtocol {
         // Send the message
         stream.write_all(&message).await.context("Failed to send DISCARD ALL command")?;
 
-        // Read response - expect CommandComplete ('C') and ReadyForQuery ('Z')
-        let mut response_buffer = vec![0u8; 1024];
-        let n = stream
-            .read(&mut response_buffer)
-            .await
-            .context("Failed to read DISCARD ALL response")?;
+        // Read response with timeout, loop until ReadyForQuery received
+        let reset_timeout = Duration::from_millis(self.reset_timeout_ms);
 
-        if n == 0 {
-            warn!("Connection closed while reading DISCARD ALL response");
-            return Ok(false);
-        }
-
-        let response = &response_buffer[..n];
-
-        // Check for CommandComplete ('C') or ReadyForQuery ('Z')
-        // We're looking for successful completion
-        if Self::contains_command_complete(response) {
-            debug!("DISCARD ALL completed successfully");
-            Ok(true)
-        } else if Self::contains_error_response(response) {
-            warn!("DISCARD ALL returned error, connection will be recycled");
-            Ok(false)
-        } else {
-            warn!("Unexpected response to DISCARD ALL, connection will be recycled");
-            Ok(false)
+        match timeout(reset_timeout, self.read_until_ready_for_query(stream)).await {
+            Ok(Ok(true)) => {
+                debug!("DISCARD ALL completed successfully");
+                Ok(true)
+            }
+            Ok(Ok(false)) => {
+                warn!("DISCARD ALL failed or returned error");
+                Ok(false)
+            }
+            Ok(Err(e)) => {
+                warn!(error = %e, "Error reading DISCARD ALL response");
+                Ok(false)
+            }
+            Err(_) => {
+                warn!("Timeout waiting for DISCARD ALL response");
+                Ok(false)
+            }
         }
     }
 
@@ -151,6 +191,25 @@ mod tests {
         let proto = PostgresProtocol::new();
         assert_eq!(proto.name(), "postgres");
         assert_eq!(proto.default_port(), 5432);
+    }
+
+    #[test]
+    fn test_default_reset_timeout() {
+        let proto = PostgresProtocol::new();
+        assert_eq!(proto.reset_timeout_ms, 5000); // Default 5 seconds
+    }
+
+    #[test]
+    fn test_with_reset_timeout() {
+        let proto = PostgresProtocol::new().with_reset_timeout(10000);
+        assert_eq!(proto.reset_timeout_ms, 10000);
+    }
+
+    #[test]
+    fn test_with_reset_timeout_zero() {
+        // Edge case: zero timeout should be allowed
+        let proto = PostgresProtocol::new().with_reset_timeout(0);
+        assert_eq!(proto.reset_timeout_ms, 0);
     }
 
     #[test]

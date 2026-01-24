@@ -61,9 +61,12 @@ impl ProxyServer {
         );
 
         // Get protocol implementation for the configured backend
-        let protocol: Arc<dyn Protocol> = ProtocolRegistry::get(&config.backend.protocol)
-            .context("Failed to get protocol implementation")?
-            .into();
+        let protocol: Arc<dyn Protocol> = ProtocolRegistry::get(
+            &config.backend.protocol,
+            config.performance.pool_reset_timeout_ms,
+        )
+        .context("Failed to get protocol implementation")?
+        .into();
 
         info!(
             protocol = protocol.name(),

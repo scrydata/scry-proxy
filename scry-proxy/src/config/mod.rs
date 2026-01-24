@@ -270,6 +270,8 @@ pub struct PerformanceConfig {
     pub pool_idle_unpin_secs: u64,
     /// Use LIFO connection selection (true) or FIFO (false)
     pub pool_lifo: bool,
+    /// Timeout for DISCARD ALL response during connection reset (milliseconds)
+    pub pool_reset_timeout_ms: u64,
 }
 
 /// Resilience configuration - circuit breaking, retries, healthchecks
@@ -394,6 +396,7 @@ impl Default for Config {
                 pool_queue_depth: 50,
                 pool_idle_unpin_secs: 60,
                 pool_lifo: true,
+                pool_reset_timeout_ms: 5000,
             },
             resilience: ResilienceConfig {
                 circuit_breaker: CircuitBreakerConfig {

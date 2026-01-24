@@ -118,6 +118,7 @@ fn create_minimal_config() -> Config {
             pool_queue_depth: 50,
             pool_idle_unpin_secs: 60,
             pool_lifo: true,
+            pool_reset_timeout_ms: 5000,
         },
         resilience: ResilienceConfig {
             circuit_breaker: CircuitBreakerConfig {
