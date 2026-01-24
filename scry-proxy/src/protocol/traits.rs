@@ -6,13 +6,26 @@
 /// and forwarding logic.
 use anyhow::Result;
 use async_trait::async_trait;
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncWrite};
+
+/// Combined trait for async readable and writable streams
+///
+/// This trait combines AsyncRead + AsyncWrite into a single trait that can be
+/// used as a trait object, allowing the Protocol trait to remain object-safe
+/// (dyn-compatible) while accepting any stream type.
+pub trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send {}
+
+/// Blanket implementation for any type that implements the required traits
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncStream for T {}
 
 /// Database protocol handler trait
 ///
 /// Each database protocol (Postgres, MySQL, etc.) implements this trait
 /// to provide protocol-specific behavior like state reset, health checking,
 /// and message extraction.
+///
+/// The async methods accept any stream type that implements AsyncRead + AsyncWrite,
+/// allowing the same protocol logic to work with both plain TCP and TLS connections.
 #[async_trait]
 pub trait Protocol: Send + Sync + 'static {
     /// Get the protocol name (e.g., "postgres", "mysql", "mongodb")
@@ -39,7 +52,7 @@ pub trait Protocol: Send + Sync + 'static {
     /// - Ok(true) if reset succeeded (connection can be reused)
     /// - Ok(false) if reset not supported (connection will be closed)
     /// - Err(_) if reset failed (connection will be closed)
-    async fn reset_connection(&self, stream: &mut TcpStream) -> Result<bool>;
+    async fn reset_connection(&self, stream: &mut dyn AsyncStream) -> Result<bool>;
 
     /// Health check a connection
     ///
@@ -55,7 +68,7 @@ pub trait Protocol: Send + Sync + 'static {
     /// Returns:
     /// - Ok(true) if connection is healthy
     /// - Ok(false) or Err(_) if connection is dead
-    async fn health_check(&self, stream: &mut TcpStream) -> Result<bool>;
+    async fn health_check(&self, stream: &mut dyn AsyncStream) -> Result<bool>;
 
     /// Extract query information from client-to-backend messages
     ///
@@ -129,5 +142,30 @@ impl ProtocolRegistry {
             //     Err(anyhow::anyhow!("MongoDB protocol not yet implemented"))
             // }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::duplex;
+
+    // This test verifies Protocol works with a generic stream type (DuplexStream).
+    // DuplexStream implements AsyncRead + AsyncWrite, proving the Protocol trait
+    // is now generic over stream types (not hardcoded to TcpStream).
+    #[tokio::test]
+    async fn test_protocol_accepts_generic_stream() {
+        use crate::protocol::postgres::PostgresProtocol;
+
+        let proto = PostgresProtocol::new();
+        let (mut client, _server) = duplex(1024);
+
+        // This should compile - proving Protocol works with DuplexStream
+        // It will fail at runtime (no server response) but that's fine for this test
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            proto.reset_connection(&mut client),
+        )
+        .await;
     }
 }

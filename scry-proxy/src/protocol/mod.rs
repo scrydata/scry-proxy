@@ -15,7 +15,7 @@ pub use auth_messages::{
 pub use bind::decode_params;
 pub use command_detector::{CommandDetector, DetectedCommand};
 pub use extractor::MessageExtractor;
-pub use traits::{Protocol, ProtocolConfig, ProtocolRegistry};
+pub use traits::{AsyncStream, Protocol, ProtocolConfig, ProtocolRegistry};
 // Message enum is defined below and doesn't need re-export
 
 // Postgres wire protocol message types
