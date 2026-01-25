@@ -183,6 +183,12 @@ Main proxy server implementation.
   - ClientTransport and BackendTransport abstractions for unified I/O
   - Certificate loading with rustls and tokio-rustls
   - 7 TLS integration tests
+- ✅ max_connections enforcement (CRIT-3)
+  - Track active connection count with AtomicUsize
+  - Check against max_connections BEFORE accepting connection
+  - Reject connections at TCP level when at limit
+  - Send PostgreSQL ErrorResponse (SQLSTATE 53300: too_many_connections)
+  - Expose connection metrics via Prometheus endpoint
 
 **TODO:**
 - ✅ Backend connection pooling (complete)

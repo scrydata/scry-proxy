@@ -97,39 +97,15 @@ BackendTransport::Tls(_) => {
 
 ---
 
-### CRIT-3: No max_connections Enforcement
+### CRIT-3: No max_connections Enforcement ✅ COMPLETED
 
-**Location:** `scry-proxy/src/proxy/server.rs:574-588`
-
-**Current Behavior:**
-```rust
-*connection_count += 1;
-let conn_id = *connection_count;
-// Immediately spawns handler - NO CHECK against max_connections
-self.spawn_tcp_connection_handler(connection_tasks, ...);
-```
-
-**Problem:**
-- `max_connections` config value is logged but never enforced
-- Server accepts unlimited client connections
-- Creates unbounded number of async tasks
-- Memory exhaustion under sustained load
-- Downstream components (pool, wait queue) overwhelmed
-
-**Requirements:**
-- [ ] Track active connection count with AtomicUsize
-- [ ] Check against max_connections BEFORE accepting connection
-- [ ] Reject connections at TCP level when at limit (close immediately)
-- [ ] Provide clear error message to rejected clients
-- [ ] Expose current connection count in metrics
-- [ ] Consider graceful degradation (accept but delay response)
-
-**Test Case:**
-- Set max_connections = 100
-- Attempt 150 concurrent connections
-- Verify exactly 100 connections accepted
-- Verify 50 connections rejected cleanly
-- Verify no resource leaks from rejected connections
+**Implementation:**
+- Added AtomicUsize counter to ProxyServer for tracking active connections
+- Counter incremented before spawning connection handler, decremented via RAII guard on task completion
+- Connection limit checked BEFORE processing accepted connection
+- Rejected clients receive PostgreSQL ErrorResponse with SQLSTATE 53300 (too_many_connections)
+- Prometheus metrics exposed: `scry_active_connections`, `scry_max_connections`, `scry_connections_rejected_total`
+- Stress tests verify behavior under load (150 concurrent connections against 100 limit)
 
 ---
 
