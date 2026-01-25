@@ -33,6 +33,10 @@ pub struct ProxyMetrics {
     start_time: Instant,
     active_connections: Arc<AtomicUsize>,
     circuit_breaker: Arc<RwLock<Option<Arc<crate::resilience::CircuitBreaker>>>>,
+    /// Maximum connections limit (for Prometheus export)
+    max_connections: Arc<AtomicUsize>,
+    /// Counter of connections rejected due to limit
+    connections_rejected: Arc<AtomicU64>,
 }
 
 impl ProxyMetrics {
@@ -50,6 +54,8 @@ impl ProxyMetrics {
             start_time: Instant::now(),
             active_connections: Arc::new(AtomicUsize::new(0)),
             circuit_breaker: Arc::new(RwLock::new(None)),
+            max_connections: Arc::new(AtomicUsize::new(0)),
+            connections_rejected: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -107,6 +113,26 @@ impl ProxyMetrics {
     /// Get current active connection count
     pub fn get_active_connections(&self) -> usize {
         self.active_connections.load(Ordering::Relaxed)
+    }
+
+    /// Set the max connections limit (called at server startup)
+    pub fn set_max_connections(&self, max: usize) {
+        self.max_connections.store(max, Ordering::Relaxed);
+    }
+
+    /// Get max connections limit
+    pub fn get_max_connections(&self) -> usize {
+        self.max_connections.load(Ordering::Relaxed)
+    }
+
+    /// Record a rejected connection (over limit)
+    pub fn record_connection_rejected(&self) {
+        self.connections_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Get total rejected connections count
+    pub fn get_connections_rejected(&self) -> u64 {
+        self.connections_rejected.load(Ordering::Relaxed)
     }
 
     /// Run health check (called periodically from background task)

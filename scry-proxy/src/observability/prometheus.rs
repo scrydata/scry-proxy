@@ -269,11 +269,25 @@ fn export_pooling_metrics(output: &mut String, metrics: &ProxyMetrics) {
 
 fn export_connection_metrics(output: &mut String, metrics: &ProxyMetrics) {
     let active = metrics.get_active_connections();
+    let max = metrics.get_max_connections();
+    let rejected = metrics.get_connections_rejected();
 
     writeln!(output, "# HELP scry_active_connections Current number of active client connections")
         .unwrap();
     writeln!(output, "# TYPE scry_active_connections gauge").unwrap();
     writeln!(output, "scry_active_connections {}", active).unwrap();
+
+    writeln!(output, "# HELP scry_max_connections Maximum allowed client connections").unwrap();
+    writeln!(output, "# TYPE scry_max_connections gauge").unwrap();
+    writeln!(output, "scry_max_connections {}", max).unwrap();
+
+    writeln!(
+        output,
+        "# HELP scry_connections_rejected_total Total connections rejected due to max_connections limit"
+    )
+    .unwrap();
+    writeln!(output, "# TYPE scry_connections_rejected_total counter").unwrap();
+    writeln!(output, "scry_connections_rejected_total {}", rejected).unwrap();
 }
 
 fn export_uptime(output: &mut String, metrics: &ProxyMetrics) {
@@ -567,5 +581,34 @@ mod tests {
         assert!(output.contains("scry_pool_queue_depth 0"));
         assert!(output.contains("scry_pool_queue_rejected_total 0"));
         assert!(output.contains("scry_pool_wait_seconds_count 0"));
+    }
+
+    #[test]
+    fn test_export_connection_limit_metrics() {
+        let metrics = ProxyMetrics::new(100, HealthConfig::default());
+
+        // Set max connections
+        metrics.set_max_connections(500);
+
+        // Simulate some active connections
+        metrics.increment_active_connections();
+        metrics.increment_active_connections();
+        metrics.increment_active_connections();
+
+        // Simulate rejected connections
+        metrics.record_connection_rejected();
+        metrics.record_connection_rejected();
+
+        let output = export_metrics(&metrics);
+
+        // Should include max connections gauge
+        assert!(output.contains("# HELP scry_max_connections"));
+        assert!(output.contains("# TYPE scry_max_connections gauge"));
+        assert!(output.contains("scry_max_connections 500"));
+
+        // Should include connections rejected counter with value
+        assert!(output.contains("# HELP scry_connections_rejected_total"));
+        assert!(output.contains("# TYPE scry_connections_rejected_total counter"));
+        assert!(output.contains("scry_connections_rejected_total 2"));
     }
 }
