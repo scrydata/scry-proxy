@@ -488,3 +488,62 @@ async fn test_startup_handles_z_byte_in_parameter_data() {
     drop(client);
     conn_handle.abort();
 }
+
+/// Test that startup messages with many parameters are handled correctly
+///
+/// This verifies HIGH-4 fix: proper startup message reading for large messages.
+/// Clients with many connection parameters (application_name, client_encoding,
+/// options, etc.) can send startup messages exceeding typical buffer sizes.
+#[tokio::test]
+async fn test_large_startup_message_handling() {
+    let docker = Cli::default();
+    let postgres_image = RunnableImage::from(Postgres::default()).with_tag("16-alpine");
+    let postgres = docker.run(postgres_image);
+
+    let postgres_port = postgres.get_host_port_ipv4(5432);
+    let postgres_host = "127.0.0.1".to_string();
+
+    sleep(Duration::from_secs(2)).await;
+
+    let config = create_multiplexing_config(postgres_host, postgres_port, 1);
+    let test_publisher = TestPublisher::new();
+    let publisher = Arc::new(test_publisher.clone());
+
+    let proxy_port =
+        start_test_proxy(config.clone(), publisher).await.expect("Failed to start proxy");
+
+    sleep(Duration::from_millis(200)).await;
+
+    // Connect with many connection parameters to create a large startup message
+    // Each parameter adds overhead: key + null + value + null
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user={} password={} dbname={} \
+             application_name=test_app_with_a_very_long_name_to_increase_message_size \
+             options='-c search_path=public,pg_catalog -c timezone=UTC -c client_encoding=UTF8'",
+            proxy_port, config.backend.user, config.backend.password, config.backend.database
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("Failed to connect with large startup message");
+
+    let conn_handle = tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("Connection error: {}", e);
+        }
+    });
+
+    // Execute a simple query to verify the connection works
+    let rows = client
+        .query("SELECT 'large_startup_ok' as status", &[])
+        .await
+        .expect("Query after large startup should succeed");
+
+    assert_eq!(rows.len(), 1);
+    let status: &str = rows[0].get(0);
+    assert_eq!(status, "large_startup_ok");
+
+    drop(client);
+    conn_handle.abort();
+}
