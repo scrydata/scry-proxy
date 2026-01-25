@@ -131,18 +131,20 @@ impl Authenticator {
     }
 
     /// Read startup message from client
+    ///
+    /// Uses proper message framing to handle:
+    /// - Large startup messages (>8192 bytes)
+    /// - TCP fragmentation
+    /// - Malformed length fields
     async fn read_startup(
         &self,
         client: &mut ClientTransport,
     ) -> Result<(StartupMessage, Vec<u8>)> {
-        let mut buf = vec![0u8; 8192];
-        let n = client.read(&mut buf).await.context("Failed to read startup message")?;
+        use crate::protocol::read_startup_message;
 
-        if n < 8 {
-            anyhow::bail!("Startup message too short: {} bytes", n);
-        }
-
-        buf.truncate(n);
+        let buf = read_startup_message(client)
+            .await
+            .context("Failed to read startup message")?;
 
         let startup = StartupMessage::parse(&buf).context("Failed to parse startup message")?;
 
