@@ -38,18 +38,44 @@ impl MessageExtractor {
 
     /// Check if the data indicates a query is complete
     ///
-    /// Looks for CommandComplete or ReadyForQuery messages
+    /// Looks for CommandComplete ('C') or ReadyForQuery ('Z') messages
+    /// using proper PostgreSQL message framing. Only checks message type
+    /// bytes at actual message boundaries, not raw bytes in the stream.
+    ///
+    /// This prevents false positives from binary data containing 0x43 ('C')
+    /// or 0x5A ('Z') bytes in query results or error messages.
     pub fn is_query_complete(&self, data: &[u8]) -> bool {
         if data.is_empty() {
             return false;
         }
 
-        // Look for CommandComplete (C) or ReadyForQuery (Z) message
-        for &msg_type in data {
+        let mut offset = 0;
+
+        while offset + 5 <= data.len() {
+            let msg_type = data[offset];
+
+            // Check if this is a completion message
             if msg_type == MSG_COMMAND_COMPLETE || msg_type == MSG_READY_FOR_QUERY {
                 trace!(msg_type = msg_type, "Found query completion marker");
                 return true;
             }
+
+            // Read the length field to skip to next message
+            let length = i32::from_be_bytes([
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+                data[offset + 4],
+            ]) as usize;
+
+            // Validate length field
+            if length < 4 || offset + 1 + length > data.len() {
+                // Invalid or incomplete message, stop scanning
+                break;
+            }
+
+            // Advance to next message
+            offset += 1 + length;
         }
 
         false
@@ -863,5 +889,47 @@ mod tests {
         // Incomplete ReadyForQuery (missing status byte)
         let msg = vec![MSG_READY_FOR_QUERY, 0, 0, 0, 5];
         assert!(!extractor.contains_ready_for_query(&msg));
+    }
+
+    #[test]
+    fn test_is_query_complete_false_for_c_in_data() {
+        let extractor = MessageExtractor::new();
+        // DataRow containing 'C' byte in payload - should NOT match
+        let mut msg = vec![MSG_DATA_ROW, 0, 0, 0, 11];
+        msg.extend_from_slice(&[0, 1]); // 1 column
+        msg.extend_from_slice(&[0, 0, 0, 1]); // column length = 1
+        msg.push(b'C'); // 'C' as data value, not CommandComplete
+        assert!(!extractor.is_query_complete(&msg));
+    }
+
+    #[test]
+    fn test_is_query_complete_true_for_command_complete() {
+        let extractor = MessageExtractor::new();
+        // Valid CommandComplete message
+        let mut msg = vec![MSG_COMMAND_COMPLETE, 0, 0, 0, 13];
+        msg.extend_from_slice(b"SELECT 1\0");
+        assert!(extractor.is_query_complete(&msg));
+    }
+
+    #[test]
+    fn test_is_query_complete_true_for_ready_for_query() {
+        let extractor = MessageExtractor::new();
+        let msg = vec![MSG_READY_FOR_QUERY, 0, 0, 0, 5, b'I'];
+        assert!(extractor.is_query_complete(&msg));
+    }
+
+    #[test]
+    fn test_is_query_complete_after_data_rows() {
+        let extractor = MessageExtractor::new();
+        // DataRow with 'C' in data + actual CommandComplete
+        let mut msg = vec![];
+        // DataRow containing 'C'
+        msg.extend_from_slice(&[MSG_DATA_ROW, 0, 0, 0, 11]);
+        msg.extend_from_slice(&[0, 1, 0, 0, 0, 1, b'C']);
+        // CommandComplete
+        msg.extend_from_slice(&[MSG_COMMAND_COMPLETE, 0, 0, 0, 13]);
+        msg.extend_from_slice(b"SELECT 1\0");
+
+        assert!(extractor.is_query_complete(&msg));
     }
 }
