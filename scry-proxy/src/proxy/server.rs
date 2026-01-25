@@ -523,7 +523,8 @@ impl ProxyServer {
         }
 
         // Spawn queue saturation monitoring background task
-        let saturation_warn_threshold = self.config.performance.pool_queue_saturation_warn_threshold;
+        let saturation_warn_threshold =
+            self.config.performance.pool_queue_saturation_warn_threshold;
         if saturation_warn_threshold > 0.0 && saturation_warn_threshold < 1.0 {
             let metrics_clone = self.metrics.clone();
             let pool_managers_clone: Vec<_> = self
@@ -566,10 +567,7 @@ impl ProxyServer {
                 }
             });
 
-            debug!(
-                threshold = saturation_warn_threshold,
-                "Queue saturation monitoring started"
-            );
+            debug!(threshold = saturation_warn_threshold, "Queue saturation monitoring started");
         }
 
         let mut connection_count = 0u64;

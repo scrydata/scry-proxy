@@ -425,13 +425,13 @@ impl Default for Config {
             performance: PerformanceConfig {
                 target_latency_ms: 1,
                 connection_pooling: PoolingStrategy::Hybrid,
-                pool_size: 50,      // Sensible default; 10:1 with max_connections=500
-                pool_min_idle: 5,   // Keep low for dev/test, increase for production
+                pool_size: 50,    // Sensible default; 10:1 with max_connections=500
+                pool_min_idle: 5, // Keep low for dev/test, increase for production
                 pool_timeout_secs: 30,
                 pool_recycle_secs: 3600,
                 pool_aggressive_unpinning: false,
                 buffer_size: 8192,
-                pool_queue_depth: 500,  // Production needs larger queue for bursts
+                pool_queue_depth: 500, // Production needs larger queue for bursts
                 pool_idle_unpin_secs: 60,
                 pool_lifo: true,
                 pool_reset_timeout_ms: 5000,
@@ -533,15 +533,14 @@ impl Config {
                     "max_connections ({}) is {}x pool_size ({}). \
                      Clients may experience long wait times. \
                      Consider increasing pool_size or decreasing max_connections.",
-                    self.proxy.max_connections,
-                    ratio as usize,
-                    self.performance.pool_size
+                    self.proxy.max_connections, ratio as usize, self.performance.pool_size
                 ));
             }
         }
 
         // Check queue depth relative to multiplexing ratio
-        let expected_waiters = self.proxy.max_connections.saturating_sub(self.performance.pool_size);
+        let expected_waiters =
+            self.proxy.max_connections.saturating_sub(self.performance.pool_size);
         if expected_waiters > 0 && self.performance.pool_queue_depth < expected_waiters / 2 {
             warnings.push(format!(
                 "pool_queue_depth ({}) may be too small. \
@@ -561,8 +560,7 @@ impl Config {
             warnings.push(format!(
                 "pool_size ({}) exceeds max_connections ({}). \
                  Extra pool connections will never be used.",
-                self.performance.pool_size,
-                self.proxy.max_connections
+                self.performance.pool_size, self.proxy.max_connections
             ));
         }
 
@@ -668,11 +666,7 @@ mod validation_tests {
 
         let warnings = config.validate().unwrap();
         assert!(!warnings.is_empty(), "Should warn on 100:1 ratio");
-        assert!(
-            warnings[0].contains("100x"),
-            "Warning should mention 100x ratio: {}",
-            warnings[0]
-        );
+        assert!(warnings[0].contains("100x"), "Warning should mention 100x ratio: {}", warnings[0]);
     }
 
     #[test]
@@ -741,10 +735,7 @@ mod backpressure_tests {
     #[test]
     fn test_backpressure_mode_default() {
         let config = Config::default();
-        assert_eq!(
-            config.performance.pool_backpressure_mode,
-            BackpressureMode::RejectImmediate
-        );
+        assert_eq!(config.performance.pool_backpressure_mode, BackpressureMode::RejectImmediate);
     }
 
     #[test]

@@ -218,14 +218,20 @@ fn export_pooling_metrics(output: &mut String, metrics: &ProxyMetrics) {
     writeln!(output, "scry_pool_queue_depth {}", pool_metrics.get_queue_depth()).unwrap();
 
     // Max queue depth gauge
-    writeln!(output, "# HELP scry_pool_queue_max_depth Maximum wait queue depth (from config)").unwrap();
+    writeln!(output, "# HELP scry_pool_queue_max_depth Maximum wait queue depth (from config)")
+        .unwrap();
     writeln!(output, "# TYPE scry_pool_queue_max_depth gauge").unwrap();
     writeln!(output, "scry_pool_queue_max_depth {}", pool_metrics.get_max_queue_depth()).unwrap();
 
     // Queue saturation ratio (for alerting when queue is filling up)
-    writeln!(output, "# HELP scry_pool_queue_saturation_ratio Queue saturation (0.0-1.0, alert if >0.8)").unwrap();
+    writeln!(
+        output,
+        "# HELP scry_pool_queue_saturation_ratio Queue saturation (0.0-1.0, alert if >0.8)"
+    )
+    .unwrap();
     writeln!(output, "# TYPE scry_pool_queue_saturation_ratio gauge").unwrap();
-    writeln!(output, "scry_pool_queue_saturation_ratio {:.4}", pool_metrics.get_queue_saturation()).unwrap();
+    writeln!(output, "scry_pool_queue_saturation_ratio {:.4}", pool_metrics.get_queue_saturation())
+        .unwrap();
 
     // Queue rejected counter
     writeln!(
