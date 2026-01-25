@@ -266,12 +266,80 @@ Performance tuning settings.
 |-----------|------|---------|-------------|
 | `target_latency_ms` | u64 | `1` | Target added latency in milliseconds |
 | `buffer_size` | usize | `8192` | TCP buffer size in bytes |
+| `pool_size` | usize | `50` | Backend connection pool size |
+| `pool_min_idle` | usize | `5` | Minimum idle connections to maintain |
+| `pool_queue_depth` | usize | `500` | Maximum clients waiting for a connection |
+| `pool_timeout_secs` | u64 | `30` | Timeout for pool operations |
+| `pool_ratio_warning_threshold` | usize | `20` | Warn if max_connections/pool_size exceeds this |
 
 **Environment Variables**:
 ```bash
 SCRY_PERFORMANCE__TARGET_LATENCY_MS=1
 SCRY_PERFORMANCE__BUFFER_SIZE=16384
+SCRY_PERFORMANCE__POOL_SIZE=50
+SCRY_PERFORMANCE__POOL_QUEUE_DEPTH=500
+SCRY_PERFORMANCE__POOL_RATIO_WARNING_THRESHOLD=20
 ```
+
+### Pool Sizing Guidelines
+
+The relationship between `max_connections` and `pool_size` is critical for performance.
+Scry validates this relationship at startup and warns about potential misconfigurations.
+
+#### Recommended Ratios by Pooling Mode
+
+| Pooling Mode | Recommended Ratio | Example Configuration |
+|--------------|-------------------|----------------------|
+| Session | 1:1 | max_connections=100, pool_size=100 |
+| Transaction | 10:1 to 20:1 | max_connections=500, pool_size=50 |
+| Hybrid | 5:1 to 10:1 | max_connections=300, pool_size=50 |
+
+#### Sizing Formulas
+
+For **transaction mode** (highest multiplexing):
+```
+pool_size = expected_concurrent_queries + (max_connections / 20)
+pool_queue_depth = max_connections - pool_size
+```
+
+For **hybrid mode** (balanced):
+```
+pool_size = max_connections / 10
+pool_queue_depth = max_connections - pool_size
+```
+
+#### Warning Thresholds
+
+Scry automatically warns at startup if:
+- `max_connections > pool_size * pool_ratio_warning_threshold` (default 20:1)
+- `pool_queue_depth < (max_connections - pool_size) / 2`
+- `pool_size > max_connections` (wasteful configuration)
+
+Set `pool_ratio_warning_threshold = 0` to disable ratio warnings.
+
+#### Example Production Configuration
+
+```toml
+[proxy]
+max_connections = 500
+
+[performance]
+connection_pooling = "transaction"
+pool_size = 50
+pool_min_idle = 10
+pool_queue_depth = 500
+pool_timeout_secs = 30
+pool_ratio_warning_threshold = 20
+```
+
+#### Monitoring Pool Health
+
+Use Prometheus metrics to monitor pool saturation:
+- `scry_pool_queue_depth` - Current clients waiting
+- `scry_pool_queue_max_depth` - Maximum queue capacity
+- `scry_pool_queue_saturation_ratio` - Queue saturation (0.0-1.0)
+
+**Alert suggestion:** Fire alert if `scry_pool_queue_saturation_ratio > 0.8` for 5 minutes.
 
 ### ResilienceConfig
 

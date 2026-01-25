@@ -327,6 +327,8 @@ pub struct PoolMetrics {
     // New pooling metrics - gauges
     pinned: AtomicUsize,
     queue_depth: AtomicUsize,
+    /// Maximum queue depth (from configuration)
+    max_queue_depth: AtomicUsize,
 
     // New pooling metrics - counters
     queue_rejected_total: AtomicU64,
@@ -350,6 +352,7 @@ impl PoolMetrics {
             max_size: AtomicUsize::new(0),
             pinned: AtomicUsize::new(0),
             queue_depth: AtomicUsize::new(0),
+            max_queue_depth: AtomicUsize::new(0),
             queue_rejected_total: AtomicU64::new(0),
             pin_prepared_statement: AtomicU64::new(0),
             pin_session_variable: AtomicU64::new(0),
@@ -430,6 +433,27 @@ impl PoolMetrics {
     /// Get current queue depth
     pub fn get_queue_depth(&self) -> usize {
         self.queue_depth.load(Ordering::Relaxed)
+    }
+
+    /// Set the maximum queue depth (from configuration)
+    pub fn set_max_queue_depth(&self, max: usize) {
+        self.max_queue_depth.store(max, Ordering::Relaxed);
+    }
+
+    /// Get the maximum queue depth
+    pub fn get_max_queue_depth(&self) -> usize {
+        self.max_queue_depth.load(Ordering::Relaxed)
+    }
+
+    /// Get queue saturation ratio (0.0 - 1.0)
+    /// Returns 0.0 if max_queue_depth is 0 (unlimited)
+    pub fn get_queue_saturation(&self) -> f64 {
+        let max = self.max_queue_depth.load(Ordering::Relaxed);
+        if max == 0 {
+            return 0.0;
+        }
+        let current = self.queue_depth.load(Ordering::Relaxed);
+        (current as f64 / max as f64).min(1.0)
     }
 
     /// Get pin reason counts

@@ -483,6 +483,8 @@ impl ProxyServer {
     pub async fn run(mut self) -> Result<()> {
         // Set max_connections in metrics for Prometheus export
         self.metrics.set_max_connections(self.config.proxy.max_connections);
+        // Set max queue depth for saturation metrics
+        self.metrics.pool_metrics().set_max_queue_depth(self.config.performance.pool_queue_depth);
 
         info!(
             listen_address = %self.config.proxy.listen_address,

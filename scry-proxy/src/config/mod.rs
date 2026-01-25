@@ -268,6 +268,15 @@ pub struct PerformanceConfig {
     pub pool_lifo: bool,
     /// Timeout for DISCARD ALL response during connection reset (milliseconds)
     pub pool_reset_timeout_ms: u64,
+    /// Maximum ratio of max_connections to pool_size before warning.
+    /// Transaction pooling can handle 20:1 multiplexing; higher ratios
+    /// may cause excessive wait times. Set to 0 to disable warning.
+    #[serde(default = "default_pool_ratio_warning_threshold")]
+    pub pool_ratio_warning_threshold: usize,
+}
+
+fn default_pool_ratio_warning_threshold() -> usize {
+    20
 }
 
 /// Resilience configuration - circuit breaking, retries, healthchecks
@@ -383,16 +392,17 @@ impl Default for Config {
             performance: PerformanceConfig {
                 target_latency_ms: 1,
                 connection_pooling: PoolingStrategy::Hybrid,
-                pool_size: 100,
-                pool_min_idle: 10,
+                pool_size: 50,      // Sensible default; 10:1 with max_connections=500
+                pool_min_idle: 5,   // Keep low for dev/test, increase for production
                 pool_timeout_secs: 30,
                 pool_recycle_secs: 3600,
                 pool_aggressive_unpinning: false,
                 buffer_size: 8192,
-                pool_queue_depth: 50,
+                pool_queue_depth: 500,  // Production needs larger queue for bursts
                 pool_idle_unpin_secs: 60,
                 pool_lifo: true,
                 pool_reset_timeout_ms: 5000,
+                pool_ratio_warning_threshold: 20,
             },
             resilience: ResilienceConfig {
                 circuit_breaker: CircuitBreakerConfig {
@@ -471,6 +481,57 @@ impl Config {
 
         Ok(loaded)
     }
+
+    /// Validate configuration and return warnings
+    ///
+    /// Returns Ok(warnings) on success, Err on fatal errors.
+    /// Warnings are logged but don't prevent startup.
+    pub fn validate(&self) -> anyhow::Result<Vec<String>> {
+        let mut warnings = Vec::new();
+
+        // Check pool ratio (only if threshold is non-zero)
+        if self.performance.pool_ratio_warning_threshold > 0 && self.performance.pool_size > 0 {
+            let ratio = self.proxy.max_connections as f64 / self.performance.pool_size as f64;
+            if ratio > self.performance.pool_ratio_warning_threshold as f64 {
+                warnings.push(format!(
+                    "max_connections ({}) is {}x pool_size ({}). \
+                     Clients may experience long wait times. \
+                     Consider increasing pool_size or decreasing max_connections.",
+                    self.proxy.max_connections,
+                    ratio as usize,
+                    self.performance.pool_size
+                ));
+            }
+        }
+
+        // Check queue depth relative to multiplexing ratio
+        let expected_waiters = self.proxy.max_connections.saturating_sub(self.performance.pool_size);
+        if expected_waiters > 0 && self.performance.pool_queue_depth < expected_waiters / 2 {
+            warnings.push(format!(
+                "pool_queue_depth ({}) may be too small. \
+                 With {} max_connections and {} pool_size, \
+                 up to {} clients may need to queue. \
+                 Consider setting pool_queue_depth >= {}.",
+                self.performance.pool_queue_depth,
+                self.proxy.max_connections,
+                self.performance.pool_size,
+                expected_waiters,
+                expected_waiters
+            ));
+        }
+
+        // Warn if pool_size > max_connections (wasteful)
+        if self.performance.pool_size > self.proxy.max_connections {
+            warnings.push(format!(
+                "pool_size ({}) exceeds max_connections ({}). \
+                 Extra pool connections will never be used.",
+                self.performance.pool_size,
+                self.proxy.max_connections
+            ));
+        }
+
+        Ok(warnings)
+    }
 }
 
 #[cfg(test)]
@@ -486,7 +547,19 @@ mod tests {
     #[test]
     fn test_pool_queue_depth_default() {
         let config = Config::default();
-        assert_eq!(config.performance.pool_queue_depth, 50);
+        assert_eq!(config.performance.pool_queue_depth, 500);
+    }
+
+    #[test]
+    fn test_pool_size_default() {
+        let config = Config::default();
+        assert_eq!(config.performance.pool_size, 50);
+    }
+
+    #[test]
+    fn test_pool_ratio_warning_threshold_default() {
+        let config = Config::default();
+        assert_eq!(config.performance.pool_ratio_warning_threshold, 20);
     }
 
     #[test]
@@ -544,5 +617,83 @@ mod tests {
         assert_eq!(config.auth.auth_type, AuthType::Trust);
         assert!(config.auth.auth_file.is_none());
         assert!(config.auth.auth_query.is_none());
+    }
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_warns_on_high_ratio() {
+        let mut config = Config::default();
+        config.proxy.max_connections = 1000;
+        config.performance.pool_size = 10; // 100:1 ratio, exceeds 20:1 threshold
+
+        let warnings = config.validate().unwrap();
+        assert!(!warnings.is_empty(), "Should warn on 100:1 ratio");
+        assert!(
+            warnings[0].contains("100x"),
+            "Warning should mention 100x ratio: {}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn test_validate_warns_on_small_queue() {
+        let mut config = Config::default();
+        config.proxy.max_connections = 500;
+        config.performance.pool_size = 50;
+        config.performance.pool_queue_depth = 50; // Too small for 450 potential waiters
+        config.performance.pool_ratio_warning_threshold = 20; // 10:1 ratio is fine
+
+        let warnings = config.validate().unwrap();
+        assert!(
+            warnings.iter().any(|w| w.contains("pool_queue_depth")),
+            "Should warn about small queue depth: {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn test_validate_warns_on_wasteful_pool() {
+        let mut config = Config::default();
+        config.proxy.max_connections = 50;
+        config.performance.pool_size = 100; // Wasteful: more pool than clients
+
+        let warnings = config.validate().unwrap();
+        assert!(
+            warnings.iter().any(|w| w.contains("exceeds max_connections")),
+            "Should warn about wasteful pool: {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn test_validate_no_warnings_for_good_config() {
+        let mut config = Config::default();
+        config.proxy.max_connections = 500;
+        config.performance.pool_size = 50; // 10:1 ratio, within 20:1 threshold
+        config.performance.pool_queue_depth = 500; // Adequate for 450 potential waiters
+        config.performance.pool_ratio_warning_threshold = 20;
+
+        let warnings = config.validate().unwrap();
+        assert!(warnings.is_empty(), "Should have no warnings for good config: {:?}", warnings);
+    }
+
+    #[test]
+    fn test_validate_disabled_when_threshold_zero() {
+        let mut config = Config::default();
+        config.proxy.max_connections = 1000;
+        config.performance.pool_size = 10; // 100:1 ratio
+        config.performance.pool_ratio_warning_threshold = 0; // Disable warning
+
+        let warnings = config.validate().unwrap();
+        // Should not warn about ratio when threshold is 0
+        assert!(
+            !warnings.iter().any(|w| w.contains("100x")),
+            "Should not warn when threshold is 0: {:?}",
+            warnings
+        );
     }
 }

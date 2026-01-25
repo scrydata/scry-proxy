@@ -300,22 +300,38 @@ See [Health Checks](health-checks.md) for **active health checking** (periodic b
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `pool_size` | 10 | Maximum connections in pool |
+| `pool_size` | 50 | Maximum backend connections in pool |
+| `pool_min_idle` | 5 | Minimum idle connections to maintain |
+| `pool_queue_depth` | 500 | Maximum clients waiting for a connection |
 | `pool_timeout_secs` | 30 | Timeout waiting for available connection |
 | `connection_timeout_ms` | 5000 | Timeout for creating new connection |
+| `pool_ratio_warning_threshold` | 20 | Warn if max_connections/pool_size exceeds this |
 
 Configure via environment variables or config file:
 
 ```toml
-[backend]
+[performance]
 pool_size = 50
-connection_timeout_ms = 3000
+pool_min_idle = 10
+pool_queue_depth = 500
+pool_ratio_warning_threshold = 20
 ```
 
 ```bash
-export SCRY_BACKEND__POOL_SIZE=50
-export SCRY_BACKEND__CONNECTION_TIMEOUT_MS=3000
+export SCRY_PERFORMANCE__POOL_SIZE=50
+export SCRY_PERFORMANCE__POOL_MIN_IDLE=10
+export SCRY_PERFORMANCE__POOL_QUEUE_DEPTH=500
 ```
+
+### Startup Validation
+
+Scry automatically validates pool configuration at startup and warns about potential issues:
+
+- **High multiplexing ratio**: If `max_connections / pool_size > pool_ratio_warning_threshold`, Scry warns that clients may experience long wait times
+- **Small queue depth**: If `pool_queue_depth < (max_connections - pool_size) / 2`, Scry warns that the queue may be too small for expected demand
+- **Wasteful configuration**: If `pool_size > max_connections`, Scry warns that pool connections will be wasted
+
+Set `pool_ratio_warning_threshold = 0` to disable ratio warnings.
 
 ### Sizing Guidelines
 
