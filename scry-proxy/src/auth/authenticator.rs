@@ -142,9 +142,7 @@ impl Authenticator {
     ) -> Result<(StartupMessage, Vec<u8>)> {
         use crate::protocol::read_startup_message;
 
-        let buf = read_startup_message(client)
-            .await
-            .context("Failed to read startup message")?;
+        let buf = read_startup_message(client).await.context("Failed to read startup message")?;
 
         let startup = StartupMessage::parse(&buf).context("Failed to parse startup message")?;
 

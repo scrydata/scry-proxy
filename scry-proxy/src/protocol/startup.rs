@@ -49,10 +49,7 @@ where
 {
     // Step 1: Read the 4-byte length prefix
     let mut length_buf = [0u8; 4];
-    stream
-        .read_exact(&mut length_buf)
-        .await
-        .context("Failed to read startup message length")?;
+    stream.read_exact(&mut length_buf).await.context("Failed to read startup message length")?;
 
     let length = i32::from_be_bytes(length_buf) as usize;
 
@@ -83,16 +80,9 @@ where
 
     // Step 4: Read the remaining bytes
     let remaining = length - 4;
-    stream
-        .read_exact(&mut buffer[4..])
-        .await
-        .context("Failed to read startup message body")?;
+    stream.read_exact(&mut buffer[4..]).await.context("Failed to read startup message body")?;
 
-    debug!(
-        length = length,
-        remaining_read = remaining,
-        "Startup message read complete"
-    );
+    debug!(length = length, remaining_read = remaining, "Startup message read complete");
 
     Ok(buffer)
 }

@@ -68,10 +68,7 @@ pub async fn handle_ssl_startup(
         Ok(data) => data,
         Err(e) => {
             warn!(error = %e, "Failed to read initial startup message");
-            return Err(std::io::Error::other(format!(
-                "Failed to read startup message: {}",
-                e
-            )));
+            return Err(std::io::Error::other(format!("Failed to read startup message: {}", e)));
         }
     };
 
@@ -135,9 +132,7 @@ pub async fn handle_ssl_startup(
             let tls_stream = acceptor.accept(stream).await?;
 
             info!("TLS handshake completed");
-            Ok(SslStartupResult::Upgraded(ClientTransport::Tls(Box::new(
-                tls_stream,
-            ))))
+            Ok(SslStartupResult::Upgraded(ClientTransport::Tls(Box::new(tls_stream))))
         }
 
         (TlsSslMode::Require | TlsSslMode::VerifyCa | TlsSslMode::VerifyFull, None) => {

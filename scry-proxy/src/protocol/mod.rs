@@ -16,7 +16,10 @@ pub use auth_messages::{
 pub use bind::decode_params;
 pub use command_detector::{CommandDetector, DetectedCommand};
 pub use extractor::MessageExtractor;
-pub use startup::{read_startup_message, is_ssl_request as is_ssl_request_msg, MAX_STARTUP_MESSAGE_SIZE, MIN_STARTUP_MESSAGE_SIZE};
+pub use startup::{
+    is_ssl_request as is_ssl_request_msg, read_startup_message, MAX_STARTUP_MESSAGE_SIZE,
+    MIN_STARTUP_MESSAGE_SIZE,
+};
 pub use traits::{AsyncStream, Protocol, ProtocolConfig, ProtocolRegistry};
 // Message enum is defined below and doesn't need re-export
 
