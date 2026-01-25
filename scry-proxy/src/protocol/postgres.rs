@@ -4,13 +4,12 @@
 /// - State reset via DISCARD ALL
 /// - Health checking
 /// - Query/error extraction (delegating to existing MessageExtractor)
-use super::traits::Protocol;
+use super::traits::{AsyncStream, Protocol};
 use super::MessageExtractor;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
@@ -39,7 +38,7 @@ impl PostgresProtocol {
     /// Returns Ok(true) if ReadyForQuery with 'I' (idle) status received
     /// Returns Ok(false) if error response or unexpected state
     /// Returns Err if I/O error
-    async fn read_until_ready_for_query(&self, stream: &mut TcpStream) -> Result<bool> {
+    async fn read_until_ready_for_query(&self, stream: &mut dyn AsyncStream) -> Result<bool> {
         let mut buffer = Vec::with_capacity(4096);
         let mut temp = [0u8; 1024];
 
@@ -104,7 +103,7 @@ impl Protocol for PostgresProtocol {
         5432
     }
 
-    async fn reset_connection(&self, stream: &mut TcpStream) -> Result<bool> {
+    async fn reset_connection(&self, stream: &mut dyn AsyncStream) -> Result<bool> {
         // Send DISCARD ALL to reset connection state
         // DISCARD ALL resets:
         // - Temporary tables
@@ -129,6 +128,7 @@ impl Protocol for PostgresProtocol {
 
         // Send the message
         stream.write_all(&message).await.context("Failed to send DISCARD ALL command")?;
+        stream.flush().await.context("Failed to flush DISCARD ALL command")?;
 
         // Read response with timeout, loop until ReadyForQuery received
         let reset_timeout = Duration::from_millis(self.reset_timeout_ms);
@@ -153,19 +153,48 @@ impl Protocol for PostgresProtocol {
         }
     }
 
-    async fn health_check(&self, stream: &mut TcpStream) -> Result<bool> {
-        // Simple health check: verify socket is still connected
-        // We could implement a proper Postgres ping, but for now
-        // we rely on TCP-level checks and connection recycling
+    async fn health_check(&self, stream: &mut dyn AsyncStream) -> Result<bool> {
+        // For generic streams, we need an active health check since we can't
+        // use try_read (which is TcpStream-specific).
+        // Send an empty query (;) which is fast and returns ReadyForQuery.
 
-        // Check if the socket is readable (would indicate data or closure)
-        match stream.try_read(&mut [0u8; 1]) {
-            Ok(0) => Ok(false), // EOF - connection closed
-            Ok(_) => Ok(true),  // Data available - connection alive
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                Ok(true) // No data ready, but socket is open
+        debug!("Performing active health check with empty query");
+
+        // Construct Query message for ";" (empty query)
+        let query = b";\0";
+        let message_length = (4 + query.len()) as i32;
+
+        let mut message = Vec::with_capacity(1 + 4 + query.len());
+        message.push(b'Q');
+        message.extend_from_slice(&message_length.to_be_bytes());
+        message.extend_from_slice(query);
+
+        // Send with short timeout
+        let health_timeout = Duration::from_millis(1000);
+
+        match timeout(health_timeout, async {
+            stream.write_all(&message).await?;
+            stream.flush().await?;
+            self.read_until_ready_for_query(stream).await
+        })
+        .await
+        {
+            Ok(Ok(true)) => {
+                debug!("Health check passed");
+                Ok(true)
             }
-            Err(_) => Ok(false), // Other error - connection dead
+            Ok(Ok(false)) => {
+                warn!("Health check failed - connection in bad state");
+                Ok(false)
+            }
+            Ok(Err(e)) => {
+                warn!(error = %e, "Health check I/O error");
+                Ok(false)
+            }
+            Err(_) => {
+                warn!("Health check timed out");
+                Ok(false)
+            }
         }
     }
 
