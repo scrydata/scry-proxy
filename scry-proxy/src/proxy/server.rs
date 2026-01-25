@@ -552,6 +552,41 @@ impl ProxyServer {
         Ok(())
     }
 
+    /// Reject a connection that exceeds max_connections limit
+    ///
+    /// Sends a PostgreSQL ErrorResponse with SQLSTATE 53300 (too_many_connections)
+    /// then closes the connection.
+    async fn reject_connection_over_limit(mut stream: tokio::net::TcpStream) {
+        // Build PostgreSQL ErrorResponse
+        // Format: 'E' + length + fields + terminator
+        let mut response = Vec::new();
+        response.push(b'E');
+
+        let mut fields = Vec::new();
+        // Severity (S)
+        fields.push(b'S');
+        fields.extend_from_slice(b"FATAL");
+        fields.push(0);
+        // SQLSTATE (C) - 53300 = too_many_connections
+        fields.push(b'C');
+        fields.extend_from_slice(b"53300");
+        fields.push(0);
+        // Message (M)
+        fields.push(b'M');
+        fields.extend_from_slice(b"sorry, too many clients already");
+        fields.push(0);
+        // Terminator
+        fields.push(0);
+
+        let length = (fields.len() + 4) as i32;
+        response.extend_from_slice(&length.to_be_bytes());
+        response.extend_from_slice(&fields);
+
+        // Attempt to send error (best effort)
+        let _ = stream.write_all(&response).await;
+        let _ = stream.shutdown().await;
+    }
+
     /// Accept loop for Unix platforms (supports both TCP and UNIX sockets)
     #[cfg(unix)]
     async fn accept_loop_with_unix(
@@ -586,6 +621,21 @@ impl ProxyServer {
                 accept_result = self.listener.accept() => {
                     match accept_result {
                         Ok((client_stream, client_addr)) => {
+                            // Check connection limit BEFORE processing
+                            let current = self.active_connections.load(Ordering::Relaxed);
+                            if current >= self.config.proxy.max_connections {
+                                warn!(
+                                    client_addr = %client_addr,
+                                    current_connections = current,
+                                    max_connections = self.config.proxy.max_connections,
+                                    "Connection rejected: max_connections limit reached"
+                                );
+
+                                // Send PostgreSQL error and close
+                                Self::reject_connection_over_limit(client_stream).await;
+                                continue;
+                            }
+
                             // Disable Nagle's algorithm for lower latency
                             if let Err(e) = client_stream.set_nodelay(true) {
                                 warn!(error = %e, "Failed to set TCP_NODELAY on client connection");
@@ -597,6 +647,7 @@ impl ProxyServer {
                             info!(
                                 connection_id = conn_id,
                                 client_addr = %client_addr,
+                                active_connections = current + 1,
                                 "Accepted TCP client connection"
                             );
 
@@ -659,6 +710,21 @@ impl ProxyServer {
                 accept_result = self.listener.accept() => {
                     match accept_result {
                         Ok((client_stream, client_addr)) => {
+                            // Check connection limit BEFORE processing
+                            let current = self.active_connections.load(Ordering::Relaxed);
+                            if current >= self.config.proxy.max_connections {
+                                warn!(
+                                    client_addr = %client_addr,
+                                    current_connections = current,
+                                    max_connections = self.config.proxy.max_connections,
+                                    "Connection rejected: max_connections limit reached"
+                                );
+
+                                // Send PostgreSQL error and close
+                                Self::reject_connection_over_limit(client_stream).await;
+                                continue;
+                            }
+
                             // Disable Nagle's algorithm for lower latency
                             if let Err(e) = client_stream.set_nodelay(true) {
                                 warn!(error = %e, "Failed to set TCP_NODELAY on client connection");
@@ -670,6 +736,7 @@ impl ProxyServer {
                             info!(
                                 connection_id = conn_id,
                                 client_addr = %client_addr,
+                                active_connections = current + 1,
                                 "Accepted TCP client connection"
                             );
 
