@@ -486,6 +486,20 @@ impl MessageExtractor {
 
         last_status
     }
+
+    /// Check if the data contains a properly-framed ReadyForQuery message
+    ///
+    /// Unlike raw byte search (e.g., `data.contains(&b'Z')`), this method
+    /// correctly parses PostgreSQL message frames and only returns true
+    /// when a valid ReadyForQuery message is found at a message boundary.
+    ///
+    /// This prevents false positives from:
+    /// - Binary data in query results containing byte 0x5A
+    /// - Error messages containing the letter 'Z'
+    /// - Parameter data with the 'Z' byte
+    pub fn contains_ready_for_query(&self, data: &[u8]) -> bool {
+        self.extract_ready_for_query(data).is_some()
+    }
 }
 
 impl Default for MessageExtractor {
@@ -804,5 +818,50 @@ mod tests {
         let result = extractor.extract_ready_for_query(&msg);
         // Should return 'E' (the LAST), not 'T'
         assert_eq!(result, Some(b'E'));
+    }
+
+    #[test]
+    fn test_contains_ready_for_query_true() {
+        let extractor = MessageExtractor::new();
+        // Valid ReadyForQuery message: 'Z' + length(5) + status('I')
+        let msg = vec![MSG_READY_FOR_QUERY, 0, 0, 0, 5, b'I'];
+        assert!(extractor.contains_ready_for_query(&msg));
+    }
+
+    #[test]
+    fn test_contains_ready_for_query_false_for_z_in_data() {
+        let extractor = MessageExtractor::new();
+        // DataRow containing 'Z' byte in payload - should NOT match
+        // DataRow: 'D' + length + column_count + column_data
+        let mut msg = vec![MSG_DATA_ROW, 0, 0, 0, 11]; // length = 11
+        msg.extend_from_slice(&[0, 1]); // 1 column
+        msg.extend_from_slice(&[0, 0, 0, 1]); // column length = 1
+        msg.push(b'Z'); // 'Z' as data value, not message type
+        assert!(!extractor.contains_ready_for_query(&msg));
+    }
+
+    #[test]
+    fn test_contains_ready_for_query_in_stream() {
+        let extractor = MessageExtractor::new();
+        // DataRow + CommandComplete + ReadyForQuery
+        let mut msg = vec![];
+        // DataRow with 'Z' in data
+        msg.extend_from_slice(&[MSG_DATA_ROW, 0, 0, 0, 11]);
+        msg.extend_from_slice(&[0, 1, 0, 0, 0, 1, b'Z']);
+        // CommandComplete
+        msg.extend_from_slice(&[MSG_COMMAND_COMPLETE, 0, 0, 0, 13]);
+        msg.extend_from_slice(b"SELECT 1\0");
+        // ReadyForQuery
+        msg.extend_from_slice(&[MSG_READY_FOR_QUERY, 0, 0, 0, 5, b'I']);
+
+        assert!(extractor.contains_ready_for_query(&msg));
+    }
+
+    #[test]
+    fn test_contains_ready_for_query_incomplete_message() {
+        let extractor = MessageExtractor::new();
+        // Incomplete ReadyForQuery (missing status byte)
+        let msg = vec![MSG_READY_FOR_QUERY, 0, 0, 0, 5];
+        assert!(!extractor.contains_ready_for_query(&msg));
     }
 }
