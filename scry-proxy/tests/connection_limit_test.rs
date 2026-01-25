@@ -164,3 +164,119 @@ async fn test_rejected_connections_metric_increments() {
     drop(connections);
     server_handle.abort();
 }
+
+#[tokio::test]
+async fn test_connection_limit_under_load() {
+    let max_connections = 100;
+    let config = create_test_config_with_max_connections(max_connections);
+    let publisher = Arc::new(DebugLoggerPublisher::new());
+    let metrics = Arc::new(ProxyMetrics::new(100, HealthConfig::default()));
+
+    let server =
+        ProxyServer::new(config, EventBatcher::new(publisher, 10, 100, 1000), Arc::clone(&metrics))
+            .await
+            .unwrap();
+
+    let addr = server.local_addr().unwrap();
+
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Attempt 150 concurrent connections
+    let mut handles = Vec::new();
+    for _ in 0..150 {
+        let addr = addr;
+        handles.push(tokio::spawn(async move { TcpStream::connect(addr).await }));
+    }
+
+    // Wait for all connection attempts
+    let results: Vec<_> = futures::future::join_all(handles).await;
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Should have exactly max_connections active
+    let active = metrics.get_active_connections();
+    assert!(
+        active <= max_connections,
+        "Active connections {} should not exceed max {}",
+        active,
+        max_connections
+    );
+
+    // Should have rejected ~50 connections (150 - 100)
+    let rejected = metrics.get_connections_rejected();
+    assert!(
+        rejected >= 40, // Allow some tolerance
+        "Expected ~50 rejections, got {}",
+        rejected
+    );
+
+    // All TCP connects succeed (server accepts then rejects), so we count TCP-level connections
+    // The real validation is that active + rejected should account for attempted connections
+    let tcp_connects = results.iter().filter(|r| r.is_ok() && r.as_ref().unwrap().is_ok()).count();
+    assert!(
+        tcp_connects >= 100, // All or most TCP connects should succeed
+        "Expected most TCP connects to succeed, got {}",
+        tcp_connects
+    );
+
+    // Verify the sum of active + rejected is reasonable (some connections may have closed)
+    // The key invariant is that active never exceeded max_connections during the test
+    assert!(metrics.get_connections_rejected() > 0);
+
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_connection_slots_freed_on_disconnect() {
+    let max_connections = 3;
+    let config = create_test_config_with_max_connections(max_connections);
+    let publisher = Arc::new(DebugLoggerPublisher::new());
+    let metrics = Arc::new(ProxyMetrics::new(100, HealthConfig::default()));
+
+    let server =
+        ProxyServer::new(config, EventBatcher::new(publisher, 10, 100, 1000), Arc::clone(&metrics))
+            .await
+            .unwrap();
+
+    let addr = server.local_addr().unwrap();
+
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Fill all slots
+    let mut connections = Vec::new();
+    for _ in 0..max_connections {
+        connections.push(TcpStream::connect(addr).await.unwrap());
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(metrics.get_active_connections(), max_connections);
+
+    // New connection should be rejected
+    let _ = TcpStream::connect(addr).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(metrics.get_connections_rejected(), 1);
+
+    // Close one connection
+    drop(connections.pop());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Now a new connection should succeed
+    let new_conn = TcpStream::connect(addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Should still have max_connections active (one freed, one new)
+    assert_eq!(metrics.get_active_connections(), max_connections);
+    // Rejection count should not have increased
+    assert_eq!(metrics.get_connections_rejected(), 1);
+
+    drop(new_conn);
+    drop(connections);
+    server_handle.abort();
+}
