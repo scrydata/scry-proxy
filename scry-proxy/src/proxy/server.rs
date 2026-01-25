@@ -122,17 +122,11 @@ impl ProxyServer {
         }
 
         // Create database router for multi-database support
-        let router = DatabaseRouter::new(
-            &config.databases,
-            &config.backend,
-            config.performance.pool_size,
-        );
+        let router =
+            DatabaseRouter::new(&config.databases, &config.backend, config.performance.pool_size);
 
         if !config.databases.is_empty() {
-            info!(
-                database_count = config.databases.len(),
-                "Multi-database routing enabled"
-            );
+            info!(database_count = config.databases.len(), "Multi-database routing enabled");
         }
 
         // Create circuit breaker if enabled (shared across all pools)
@@ -179,54 +173,55 @@ impl ProxyServer {
             );
 
             // Helper to create a pool manager for a database config
-            let create_pool_manager = |db_config: &DatabaseConfig,
-                                       protocol: &Arc<dyn Protocol>,
-                                       tls_config: &crate::config::TlsConfig,
-                                       perf_config: &crate::config::PerformanceConfig,
-                                       circuit_breaker: &Option<Arc<CircuitBreaker>>,
-                                       retry_config: &Option<crate::config::ConnectionRetryConfig>|
-             -> Result<Arc<PoolManager>> {
-                let pool_size = db_config.pool_size.unwrap_or(perf_config.pool_size);
-                let min_idle = std::cmp::min(perf_config.pool_min_idle, pool_size);
+            let create_pool_manager =
+                |db_config: &DatabaseConfig,
+                 protocol: &Arc<dyn Protocol>,
+                 tls_config: &crate::config::TlsConfig,
+                 perf_config: &crate::config::PerformanceConfig,
+                 circuit_breaker: &Option<Arc<CircuitBreaker>>,
+                 retry_config: &Option<crate::config::ConnectionRetryConfig>|
+                 -> Result<Arc<PoolManager>> {
+                    let pool_size = db_config.pool_size.unwrap_or(perf_config.pool_size);
+                    let min_idle = std::cmp::min(perf_config.pool_min_idle, pool_size);
 
-                let protocol_config = ProtocolConfig {
-                    host: db_config.host.clone(),
-                    port: db_config.port,
-                    database: Some(db_config.database.clone()),
-                    user: Some(db_config.user.clone()),
-                    password: Some(db_config.password.clone()),
+                    let protocol_config = ProtocolConfig {
+                        host: db_config.host.clone(),
+                        port: db_config.port,
+                        database: Some(db_config.database.clone()),
+                        user: Some(db_config.user.clone()),
+                        password: Some(db_config.password.clone()),
+                    };
+
+                    let pool = TcpConnectionPool::new(
+                        Arc::clone(protocol),
+                        protocol_config,
+                        tls_config,
+                        pool_size,
+                        Some(min_idle),
+                        circuit_breaker.clone(),
+                        retry_config.clone(),
+                        perf_config.pool_lifo,
+                    )
+                    .context(format!("Failed to create pool for database '{}'", db_config.name))?;
+
+                    let wait_queue = WaitQueue::new(perf_config.pool_queue_depth);
+                    let pm_config = PoolManagerConfig {
+                        lifo: perf_config.pool_lifo,
+                        queue_depth: perf_config.pool_queue_depth,
+                        idle_unpin_secs: perf_config.pool_idle_unpin_secs,
+                        wait_timeout_ms: perf_config.pool_timeout_secs * 1000,
+                    };
+
+                    info!(
+                        database = %db_config.name,
+                        pool_size = pool_size,
+                        host = %db_config.host,
+                        port = db_config.port,
+                        "Created pool for database"
+                    );
+
+                    Ok(PoolManager::new(Arc::new(pool), wait_queue, pm_config))
                 };
-
-                let pool = TcpConnectionPool::new(
-                    Arc::clone(protocol),
-                    protocol_config,
-                    tls_config,
-                    pool_size,
-                    Some(min_idle),
-                    circuit_breaker.clone(),
-                    retry_config.clone(),
-                    perf_config.pool_lifo,
-                )
-                .context(format!("Failed to create pool for database '{}'", db_config.name))?;
-
-                let wait_queue = WaitQueue::new(perf_config.pool_queue_depth);
-                let pm_config = PoolManagerConfig {
-                    lifo: perf_config.pool_lifo,
-                    queue_depth: perf_config.pool_queue_depth,
-                    idle_unpin_secs: perf_config.pool_idle_unpin_secs,
-                    wait_timeout_ms: perf_config.pool_timeout_secs * 1000,
-                };
-
-                info!(
-                    database = %db_config.name,
-                    pool_size = pool_size,
-                    host = %db_config.host,
-                    port = db_config.port,
-                    "Created pool for database"
-                );
-
-                Ok(PoolManager::new(Arc::new(pool), wait_queue, pm_config))
-            };
 
             // Create pool for default backend ("*")
             let default_db_config = router.default_config();
@@ -260,10 +255,7 @@ impl ProxyServer {
                 );
             }
 
-            info!(
-                pool_count = pool_managers.len(),
-                "Connection pools created successfully"
-            );
+            info!(pool_count = pool_managers.len(), "Connection pools created successfully");
         } else {
             info!("Connection pooling disabled, using direct connections");
         }
@@ -363,9 +355,7 @@ impl ProxyServer {
 
     /// Get a pool manager for a specific database
     pub fn pool_manager_for(&self, database: &str) -> Option<&Arc<PoolManager>> {
-        self.pool_managers
-            .get(database)
-            .or_else(|| self.pool_managers.get("*"))
+        self.pool_managers.get(database).or_else(|| self.pool_managers.get("*"))
     }
 
     /// Get the database router
@@ -698,7 +688,7 @@ impl ProxyServer {
                 }
 
                 let remaining = connection_tasks.len();
-                if remaining % 10 == 0 || remaining < 10 {
+                if remaining.is_multiple_of(10) || remaining < 10 {
                     info!(
                         remaining_connections = remaining,
                         elapsed_secs = drain_start.elapsed().as_secs(),
@@ -750,36 +740,30 @@ impl ProxyServer {
 
         connection_tasks.spawn(async move {
             // Handle SSL startup handshake
-            let (transport, startup_data) = match handle_ssl_startup(
-                client_stream,
-                &config.tls.client_tls_sslmode,
-                tls_config,
-            )
-            .await
-            {
-                Ok(SslStartupResult::Upgraded(transport)) => {
-                    info!(connection_id = conn_id, "Connection upgraded to TLS");
-                    (transport, Vec::new())
-                }
-                Ok(SslStartupResult::Declined(stream, startup_data)) => {
-                    debug!(
-                        connection_id = conn_id,
-                        "SSL declined, continuing with plain TCP"
-                    );
-                    (ClientTransport::Plain(stream), startup_data)
-                }
-                Ok(SslStartupResult::NoSslRequest(stream, startup_data)) => {
-                    debug!(
-                        connection_id = conn_id,
-                        "No SSL request, continuing with plain TCP"
-                    );
-                    (ClientTransport::Plain(stream), startup_data)
-                }
-                Err(e) => {
-                    error!(connection_id = conn_id, error = %e, "SSL startup failed");
-                    return;
-                }
-            };
+            let (transport, startup_data) =
+                match handle_ssl_startup(client_stream, &config.tls.client_tls_sslmode, tls_config)
+                    .await
+                {
+                    Ok(SslStartupResult::Upgraded(transport)) => {
+                        info!(connection_id = conn_id, "Connection upgraded to TLS");
+                        (transport, Vec::new())
+                    }
+                    Ok(SslStartupResult::Declined(stream, startup_data)) => {
+                        debug!(connection_id = conn_id, "SSL declined, continuing with plain TCP");
+                        (ClientTransport::Plain(stream), startup_data)
+                    }
+                    Ok(SslStartupResult::NoSslRequest(stream, startup_data)) => {
+                        debug!(
+                            connection_id = conn_id,
+                            "No SSL request, continuing with plain TCP"
+                        );
+                        (ClientTransport::Plain(stream), startup_data)
+                    }
+                    Err(e) => {
+                        error!(connection_id = conn_id, error = %e, "SSL startup failed");
+                        return;
+                    }
+                };
 
             Self::handle_client_connection(
                 transport,
@@ -845,17 +829,13 @@ impl ProxyServer {
         startup_data: Vec<u8>,
         authenticator: Option<Arc<FileAuthenticator>>,
     ) {
-        let addr_str = client_addr
-            .map(|a| a.to_string())
-            .unwrap_or_else(|| "unix".to_string());
+        let addr_str = client_addr.map(|a| a.to_string()).unwrap_or_else(|| "unix".to_string());
 
         // Parse startup message to get database name and check for admin
         let (database_name, is_admin) = if !startup_data.is_empty() {
             if let Some(startup) = StartupMessage::parse(&startup_data) {
                 let db = startup.database().map(|s| s.to_string());
-                let is_admin = db
-                    .as_ref()
-                    .is_some_and(|d| d.eq_ignore_ascii_case(ADMIN_DATABASE));
+                let is_admin = db.as_ref().is_some_and(|d| d.eq_ignore_ascii_case(ADMIN_DATABASE));
                 (db, is_admin)
             } else {
                 (None, false)
@@ -963,7 +943,8 @@ async fn handle_admin_connection(
         if buffer[0] == b'Q' {
             // Parse query: 'Q' + length(4) + query_string (null-terminated)
             if n >= 5 {
-                let length = i32::from_be_bytes([buffer[1], buffer[2], buffer[3], buffer[4]]) as usize;
+                let length =
+                    i32::from_be_bytes([buffer[1], buffer[2], buffer[3], buffer[4]]) as usize;
                 if n >= 5 + length - 4 {
                     // Query string is null-terminated
                     let query_end = 5 + length - 4 - 1; // -4 for length already counted, -1 for null
@@ -973,13 +954,14 @@ async fn handle_admin_connection(
 
                     let response = match admin.execute(&query).await {
                         Ok(resp) => resp,
-                        Err(e) => AdminResponse::Error {
-                            message: e.to_string(),
-                        },
+                        Err(e) => AdminResponse::Error { message: e.to_string() },
                     };
 
                     let wire_response = response.to_wire();
-                    client.write_all(&wire_response).await.context("Failed to send admin response")?;
+                    client
+                        .write_all(&wire_response)
+                        .await
+                        .context("Failed to send admin response")?;
                 }
             }
         } else if buffer[0] == b'X' {
@@ -1154,11 +1136,8 @@ mod tests {
         assert!(!auth.has_user("user2"));
 
         // Update auth file with a new user
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(auth_file.path())
-            .unwrap();
+        let file =
+            std::fs::OpenOptions::new().write(true).truncate(true).open(auth_file.path()).unwrap();
         use std::io::Write as _;
         writeln!(&file, "\"user1\" \"pass1\"").unwrap();
         writeln!(&file, "\"user2\" \"pass2\"").unwrap();
@@ -1196,11 +1175,8 @@ mod tests {
         let reload_sender = server.reload_sender();
 
         // Update auth file
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(auth_file.path())
-            .unwrap();
+        let file =
+            std::fs::OpenOptions::new().write(true).truncate(true).open(auth_file.path()).unwrap();
         use std::io::Write as _;
         writeln!(&file, "\"newuser\" \"newpass\"").unwrap();
         drop(file);

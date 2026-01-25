@@ -12,6 +12,19 @@ use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 use tokio_postgres::NoTls;
 
+/// Configuration for running a benchmark.
+pub struct RunConfig<'a> {
+    pub database_url: &'a str,
+    pub connections: usize,
+    pub total_queries: usize,
+    pub label: &'a str,
+    pub proxy_name: &'a str,
+    pub anonymize: Option<bool>,
+    pub events_enabled: Option<bool>,
+    pub proxy_container: Option<&'a str>,
+    pub postgres_container: Option<&'a str>,
+}
+
 /// Create a connection pool from a database URL.
 pub fn create_pool(database_url: &str, pool_size: usize) -> Result<Pool> {
     let mut config = PoolConfig::new();
@@ -24,10 +37,7 @@ pub fn create_pool(database_url: &str, pool_size: usize) -> Result<Pool> {
     config.password = url.password().map(String::from);
     config.dbname = url.path().strip_prefix('/').map(String::from);
 
-    config.pool = Some(deadpool_postgres::PoolConfig {
-        max_size: pool_size,
-        ..Default::default()
-    });
+    config.pool = Some(deadpool_postgres::PoolConfig { max_size: pool_size, ..Default::default() });
 
     // Disable statement caching for compatibility with transaction-mode connection poolers
     // (PgBouncer, PgCat). Statement caching doesn't work when the backend connection
@@ -60,14 +70,14 @@ fn parse_memory_bytes(mem_str: &str) -> u64 {
     let usage_part = mem_str.split('/').next().unwrap_or("0").trim();
 
     // Parse value and unit (e.g., "10.5MiB")
-    let (value_str, unit) = if usage_part.ends_with("GiB") {
-        (&usage_part[..usage_part.len() - 3], "GiB")
-    } else if usage_part.ends_with("MiB") {
-        (&usage_part[..usage_part.len() - 3], "MiB")
-    } else if usage_part.ends_with("KiB") {
-        (&usage_part[..usage_part.len() - 3], "KiB")
-    } else if usage_part.ends_with("B") {
-        (&usage_part[..usage_part.len() - 1], "B")
+    let (value_str, unit) = if let Some(stripped) = usage_part.strip_suffix("GiB") {
+        (stripped, "GiB")
+    } else if let Some(stripped) = usage_part.strip_suffix("MiB") {
+        (stripped, "MiB")
+    } else if let Some(stripped) = usage_part.strip_suffix("KiB") {
+        (stripped, "KiB")
+    } else if let Some(stripped) = usage_part.strip_suffix("B") {
+        (stripped, "B")
     } else {
         (usage_part, "B")
     };
@@ -149,18 +159,8 @@ fn calculate_resource_usage(samples: &[(f32, u64)]) -> Option<ResourceUsage> {
 }
 
 /// Run the benchmark.
-pub async fn run_benchmark(
-    database_url: &str,
-    connections: usize,
-    total_queries: usize,
-    label: &str,
-    proxy_name: &str,
-    anonymize: Option<bool>,
-    events_enabled: Option<bool>,
-    proxy_container: Option<&str>,
-    postgres_container: Option<&str>,
-) -> Result<BenchmarkResults> {
-    let pool = create_pool(database_url, connections)?;
+pub async fn run_benchmark(config: RunConfig<'_>) -> Result<BenchmarkResults> {
+    let pool = create_pool(config.database_url, config.connections)?;
 
     // Wait for database to be ready with retries
     let mut attempts = 0;
@@ -176,7 +176,11 @@ pub async fn run_benchmark(
             Err(e) => {
                 attempts += 1;
                 if attempts >= max_attempts {
-                    anyhow::bail!("Failed to connect to database after {} attempts: {}", max_attempts, e);
+                    anyhow::bail!(
+                        "Failed to connect to database after {} attempts: {}",
+                        max_attempts,
+                        e
+                    );
                 }
                 eprintln!("Waiting for database... (attempt {}/{})", attempts, max_attempts);
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -195,15 +199,15 @@ pub async fn run_benchmark(
         histogram: Arc::new(LatencyHistogram::new()),
         successful: AtomicU64::new(0),
         failed: AtomicU64::new(0),
-        remaining: AtomicU64::new(total_queries as u64),
+        remaining: AtomicU64::new(config.total_queries as u64),
     });
 
     // Semaphore to limit concurrent queries
-    let semaphore = Arc::new(Semaphore::new(connections));
+    let semaphore = Arc::new(Semaphore::new(config.connections));
 
     // Start proxy container monitoring (if specified)
     let proxy_samples = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    let proxy_monitor_handle = proxy_container.map(|name| {
+    let proxy_monitor_handle = config.proxy_container.map(|name| {
         let container_name = name.to_string();
         let samples = proxy_samples.clone();
         tokio::spawn(async move {
@@ -213,7 +217,7 @@ pub async fn run_benchmark(
 
     // Start postgres container monitoring (if specified)
     let postgres_samples = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    let postgres_monitor_handle = postgres_container.map(|name| {
+    let postgres_monitor_handle = config.postgres_container.map(|name| {
         let container_name = name.to_string();
         let samples = postgres_samples.clone();
         tokio::spawn(async move {
@@ -225,7 +229,7 @@ pub async fn run_benchmark(
 
     // Spawn worker tasks
     let mut handles = Vec::new();
-    for _ in 0..connections {
+    for _ in 0..config.connections {
         let pool = pool.clone();
         let state = state.clone();
         let semaphore = semaphore.clone();
@@ -290,13 +294,13 @@ pub async fn run_benchmark(
     let throughput = successful as f64 / duration.as_secs_f64();
 
     Ok(BenchmarkResults {
-        label: label.to_string(),
-        proxy: proxy_name.to_string(),
+        label: config.label.to_string(),
+        proxy: config.proxy_name.to_string(),
         config: BenchmarkConfig {
-            connections,
-            target_queries: total_queries,
-            anonymize,
-            events_enabled,
+            connections: config.connections,
+            target_queries: config.total_queries,
+            anonymize: config.anonymize,
+            events_enabled: config.events_enabled,
         },
         timestamp: chrono::Utc::now().to_rfc3339(),
         duration_secs: duration.as_secs_f64(),

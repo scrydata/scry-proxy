@@ -70,17 +70,17 @@ async fn main() -> Result<()> {
     }
     eprintln!();
 
-    let results = runner::run_benchmark(
-        &args.database_url,
-        args.connections,
-        args.queries,
-        &args.label,
-        &args.proxy,
-        args.anonymize,
-        args.events,
-        args.proxy_container.as_deref(),
-        args.postgres_container.as_deref(),
-    )
+    let results = runner::run_benchmark(runner::RunConfig {
+        database_url: &args.database_url,
+        connections: args.connections,
+        total_queries: args.queries,
+        label: &args.label,
+        proxy_name: &args.proxy,
+        anonymize: args.anonymize,
+        events_enabled: args.events,
+        proxy_container: args.proxy_container.as_deref(),
+        postgres_container: args.postgres_container.as_deref(),
+    })
     .await?;
 
     eprintln!("=== Results ===");
