@@ -256,4 +256,75 @@ mod tests {
         assert!(result.is_some());
         assert_eq!(result.unwrap(), "SELECT 1");
     }
+
+    #[tokio::test]
+    async fn test_reset_connection_with_duplex_stream() {
+        use tokio::io::duplex;
+
+        let proto = PostgresProtocol::new().with_reset_timeout(100);
+        let (client, mut server) = duplex(1024);
+        let mut client = Box::new(client) as Box<dyn AsyncStream>;
+
+        // Spawn server that responds to DISCARD ALL
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            // Read the DISCARD ALL command
+            let mut buf = [0u8; 100];
+            let n = server.read(&mut buf).await.unwrap();
+            assert!(n > 0, "Should receive DISCARD ALL command");
+
+            // Verify it's a Query message with DISCARD ALL
+            assert_eq!(buf[0], b'Q', "Should be Query message");
+
+            // Send CommandComplete + ReadyForQuery
+            // CommandComplete: 'C' + len(16) + "DISCARD ALL\0"
+            let cc: [u8; 17] = [
+                b'C', 0, 0, 0, 16, b'D', b'I', b'S', b'C', b'A', b'R', b'D', b' ', b'A', b'L', b'L',
+                0,
+            ];
+            server.write_all(&cc).await.unwrap();
+
+            // ReadyForQuery: 'Z' + len(5) + 'I'
+            let rfq: [u8; 6] = [b'Z', 0, 0, 0, 5, b'I'];
+            server.write_all(&rfq).await.unwrap();
+        });
+
+        let result = proto.reset_connection(client.as_mut()).await.unwrap();
+        assert!(result, "reset_connection should succeed with mock server");
+    }
+
+    #[tokio::test]
+    async fn test_health_check_with_duplex_stream() {
+        use tokio::io::duplex;
+
+        let proto = PostgresProtocol::new();
+        let (client, mut server) = duplex(1024);
+        let mut client = Box::new(client) as Box<dyn AsyncStream>;
+
+        // Spawn server that responds to empty query health check
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            // Read the empty query command
+            let mut buf = [0u8; 100];
+            let n = server.read(&mut buf).await.unwrap();
+            assert!(n > 0, "Should receive health check query");
+
+            // Verify it's a Query message with ";"
+            assert_eq!(buf[0], b'Q', "Should be Query message");
+
+            // Send EmptyQueryResponse + ReadyForQuery
+            // EmptyQueryResponse: 'I' + len(4)
+            let eq: [u8; 5] = [b'I', 0, 0, 0, 4];
+            server.write_all(&eq).await.unwrap();
+
+            // ReadyForQuery: 'Z' + len(5) + 'I'
+            let rfq: [u8; 6] = [b'Z', 0, 0, 0, 5, b'I'];
+            server.write_all(&rfq).await.unwrap();
+        });
+
+        let result = proto.health_check(client.as_mut()).await.unwrap();
+        assert!(result, "health_check should succeed with mock server");
+    }
 }
