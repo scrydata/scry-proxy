@@ -349,13 +349,39 @@ impl Manager for BackendTransportManager {
                     }
                 }
             }
-            BackendTransport::Tls(_) => {
-                // For TLS connections, we can't easily run protocol health checks
-                // without making Protocol trait generic over AsyncRead+AsyncWrite.
-                // For now, assume TLS connections are healthy if they haven't errored.
-                // TODO: Make Protocol trait generic over AsyncRead+AsyncWrite
-                debug!("TLS connection recycled (limited health check)");
-                Ok(())
+            BackendTransport::Tls(stream) => {
+                // Health check for TLS connection
+                match self.protocol.health_check(stream.as_mut()).await {
+                    Ok(true) => debug!("TLS connection health check passed"),
+                    Ok(false) => {
+                        warn!("TLS connection failed health check, will be closed");
+                        return Err(deadpool::managed::RecycleError::Backend(anyhow::anyhow!(
+                            "TLS connection failed health check"
+                        )));
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "TLS connection health check error, will be closed");
+                        return Err(deadpool::managed::RecycleError::Backend(e));
+                    }
+                }
+
+                // Reset connection state with DISCARD ALL
+                match self.protocol.reset_connection(stream.as_mut()).await {
+                    Ok(true) => {
+                        debug!("TLS connection state reset successfully");
+                        Ok(())
+                    }
+                    Ok(false) => {
+                        debug!("TLS protocol doesn't support state reset, closing connection");
+                        Err(deadpool::managed::RecycleError::Backend(anyhow::anyhow!(
+                            "TLS protocol does not support connection reset"
+                        )))
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Failed to reset TLS connection state, will be closed");
+                        Err(deadpool::managed::RecycleError::Backend(e))
+                    }
+                }
             }
         }
     }
