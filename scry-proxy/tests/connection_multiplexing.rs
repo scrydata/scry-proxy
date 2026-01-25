@@ -547,3 +547,105 @@ async fn test_large_startup_message_handling() {
     drop(client);
     conn_handle.abort();
 }
+
+/// Test that the proxy handles startup message reading correctly
+/// under various conditions (this is more of a smoke test since we
+/// can't easily simulate TCP fragmentation in integration tests)
+#[tokio::test]
+async fn test_startup_message_roundtrip() {
+    let docker = Cli::default();
+    let postgres_image = RunnableImage::from(Postgres::default()).with_tag("16-alpine");
+    let postgres = docker.run(postgres_image);
+
+    let postgres_port = postgres.get_host_port_ipv4(5432);
+    let postgres_host = "127.0.0.1".to_string();
+
+    sleep(Duration::from_secs(2)).await;
+
+    let config = create_multiplexing_config(postgres_host, postgres_port, 1);
+    let test_publisher = TestPublisher::new();
+    let publisher = Arc::new(test_publisher.clone());
+
+    let proxy_port =
+        start_test_proxy(config.clone(), publisher).await.expect("Failed to start proxy");
+
+    sleep(Duration::from_millis(200)).await;
+
+    // Test 1: Minimal startup parameters
+    {
+        let (client, connection) = tokio_postgres::connect(
+            &format!(
+                "host=127.0.0.1 port={} user={} password={} dbname={}",
+                proxy_port, config.backend.user, config.backend.password, config.backend.database
+            ),
+            tokio_postgres::NoTls,
+        )
+        .await
+        .expect("Minimal startup should work");
+
+        let conn_handle = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        let rows = client.query("SELECT 1", &[]).await.expect("Query should work");
+        assert_eq!(rows.len(), 1);
+
+        drop(client);
+        sleep(Duration::from_millis(50)).await;
+        conn_handle.abort();
+    }
+
+    // Give time for connection to be recycled
+    sleep(Duration::from_millis(200)).await;
+
+    // Test 2: Startup with application_name
+    {
+        let (client, connection) = tokio_postgres::connect(
+            &format!(
+                "host=127.0.0.1 port={} user={} password={} dbname={} application_name=test_app",
+                proxy_port, config.backend.user, config.backend.password, config.backend.database
+            ),
+            tokio_postgres::NoTls,
+        )
+        .await
+        .expect("Startup with app name should work");
+
+        let conn_handle = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        let rows = client.query("SELECT 2", &[]).await.expect("Query should work");
+        assert_eq!(rows.len(), 1);
+
+        drop(client);
+        sleep(Duration::from_millis(50)).await;
+        conn_handle.abort();
+    }
+
+    // Give time for connection to be recycled
+    sleep(Duration::from_millis(200)).await;
+
+    // Test 3: Startup with options parameter
+    {
+        let (client, connection) = tokio_postgres::connect(
+            &format!(
+                "host=127.0.0.1 port={} user={} password={} dbname={} options='-c timezone=UTC'",
+                proxy_port, config.backend.user, config.backend.password, config.backend.database
+            ),
+            tokio_postgres::NoTls,
+        )
+        .await
+        .expect("Startup with options should work");
+
+        let conn_handle = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        let rows = client.query("SELECT 3", &[]).await.expect("Query should work");
+        assert_eq!(rows.len(), 1);
+
+        drop(client);
+        sleep(Duration::from_millis(50)).await;
+        conn_handle.abort();
+    }
+}
