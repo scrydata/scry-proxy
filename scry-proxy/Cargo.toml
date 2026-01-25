@@ -95,6 +95,10 @@ criterion = { workspace = true }
 proptest = { workspace = true }
 tempfile = "3.10"
 
+# TLS integration testing
+native-tls = "0.2"
+postgres-native-tls = "0.5"
+
 [[bench]]
 name = "proxy_throughput"
 harness = false
