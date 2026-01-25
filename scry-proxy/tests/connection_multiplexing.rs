@@ -107,6 +107,9 @@ fn create_multiplexing_config(backend_host: String, backend_port: u16, pool_size
             pool_lifo: true,
             pool_reset_timeout_ms: 5000,
             pool_ratio_warning_threshold: 20,
+            pool_backpressure_mode: scry::config::BackpressureMode::default(),
+            pool_retry_hint_ms: 200,
+            pool_queue_saturation_warn_threshold: 0.8,
         },
         resilience: ResilienceConfig {
             circuit_breaker: CircuitBreakerConfig {
@@ -418,4 +421,70 @@ async fn test_connection_recycling_with_discard_all() {
         let status: &str = rows[0].get(0);
         assert_eq!(status, "client2_ok");
     }
+}
+
+/// Test that binary data containing 'Z' byte doesn't break startup
+///
+/// This verifies the HIGH-3 fix: proper message framing during startup.
+/// The startup handshake should not be confused by binary data that
+/// happens to contain the byte 0x5A ('Z').
+#[tokio::test]
+async fn test_startup_handles_z_byte_in_parameter_data() {
+    let docker = Cli::default();
+    let postgres_image = RunnableImage::from(Postgres::default()).with_tag("16-alpine");
+    let postgres = docker.run(postgres_image);
+
+    let postgres_port = postgres.get_host_port_ipv4(5432);
+    let postgres_host = "127.0.0.1".to_string();
+
+    sleep(Duration::from_secs(2)).await;
+
+    let config = create_multiplexing_config(postgres_host, postgres_port, 1);
+    let test_publisher = TestPublisher::new();
+    let publisher = Arc::new(test_publisher.clone());
+
+    let proxy_port =
+        start_test_proxy(config.clone(), publisher).await.expect("Failed to start proxy");
+
+    sleep(Duration::from_millis(200)).await;
+
+    // Connect and execute query that returns binary data containing 'Z' (0x5A)
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user={} password={} dbname={}",
+            proxy_port, config.backend.user, config.backend.password, config.backend.database
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("Failed to connect through proxy");
+
+    let conn_handle = tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("Connection error: {}", e);
+        }
+    });
+
+    // Query that returns data with 'Z' byte (0x5A = 90 decimal)
+    // This exercises the message parsing to ensure 'Z' in data doesn't
+    // trigger false ReadyForQuery detection
+    let rows = client
+        .query("SELECT E'\\x5A5A5A'::bytea as binary_with_z", &[])
+        .await
+        .expect("Query with binary Z data should succeed");
+
+    assert_eq!(rows.len(), 1);
+
+    // Also test string containing 'Z'
+    let rows = client
+        .query("SELECT 'ZZZZZZ' as string_with_z", &[])
+        .await
+        .expect("Query with Z string should succeed");
+
+    assert_eq!(rows.len(), 1);
+    let value: &str = rows[0].get(0);
+    assert_eq!(value, "ZZZZZZ");
+
+    drop(client);
+    conn_handle.abort();
 }

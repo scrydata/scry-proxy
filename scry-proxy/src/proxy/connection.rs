@@ -225,10 +225,7 @@ impl ConnectionHandler {
             // Check if we need sticky connection (e.g., client has prior state)
             let needs_sticky = pool_manager.has_sticky(self.connection_id);
 
-            let managed_conn = match pool_manager
-                .acquire(self.connection_id, needs_sticky)
-                .await
-            {
+            let managed_conn = match pool_manager.acquire(self.connection_id, needs_sticky).await {
                 Ok(conn) => conn,
                 Err(e) => {
                     // Handle pool acquire errors with proper backpressure behavior
@@ -273,55 +270,51 @@ impl ConnectionHandler {
         let retry_hint_ms = self.config.performance.pool_retry_hint_ms;
 
         match error {
-            AcquireError::QueueFull(_) => {
-                match backpressure_mode {
-                    BackpressureMode::RejectImmediate => {
-                        debug!(
-                            connection_id = self.connection_id,
-                            "Queue full, rejecting connection (reject_immediate mode)"
-                        );
-                    }
-                    BackpressureMode::RetryHint => {
-                        debug!(
-                            connection_id = self.connection_id,
-                            retry_hint_ms = retry_hint_ms,
-                            "Queue full, sending error with retry hint"
-                        );
-                        let error_msg = Self::build_queue_full_error(retry_hint_ms);
-                        let _ = self.client_stream.write_all(&error_msg).await;
-                    }
-                    BackpressureMode::LogAndReject => {
-                        warn!(
-                            connection_id = self.connection_id,
-                            "Connection rejected: pool queue full"
-                        );
-                    }
+            AcquireError::QueueFull(_) => match backpressure_mode {
+                BackpressureMode::RejectImmediate => {
+                    debug!(
+                        connection_id = self.connection_id,
+                        "Queue full, rejecting connection (reject_immediate mode)"
+                    );
                 }
-            }
-            AcquireError::WaitTimeout => {
-                match backpressure_mode {
-                    BackpressureMode::RejectImmediate => {
-                        debug!(
-                            connection_id = self.connection_id,
-                            "Wait timeout, rejecting connection"
-                        );
-                    }
-                    BackpressureMode::RetryHint => {
-                        debug!(
-                            connection_id = self.connection_id,
-                            "Wait timeout, sending error with retry hint"
-                        );
-                        let error_msg = Self::build_wait_timeout_error();
-                        let _ = self.client_stream.write_all(&error_msg).await;
-                    }
-                    BackpressureMode::LogAndReject => {
-                        warn!(
-                            connection_id = self.connection_id,
-                            "Connection rejected: timeout waiting for pool connection"
-                        );
-                    }
+                BackpressureMode::RetryHint => {
+                    debug!(
+                        connection_id = self.connection_id,
+                        retry_hint_ms = retry_hint_ms,
+                        "Queue full, sending error with retry hint"
+                    );
+                    let error_msg = Self::build_queue_full_error(retry_hint_ms);
+                    let _ = self.client_stream.write_all(&error_msg).await;
                 }
-            }
+                BackpressureMode::LogAndReject => {
+                    warn!(
+                        connection_id = self.connection_id,
+                        "Connection rejected: pool queue full"
+                    );
+                }
+            },
+            AcquireError::WaitTimeout => match backpressure_mode {
+                BackpressureMode::RejectImmediate => {
+                    debug!(
+                        connection_id = self.connection_id,
+                        "Wait timeout, rejecting connection"
+                    );
+                }
+                BackpressureMode::RetryHint => {
+                    debug!(
+                        connection_id = self.connection_id,
+                        "Wait timeout, sending error with retry hint"
+                    );
+                    let error_msg = Self::build_wait_timeout_error();
+                    let _ = self.client_stream.write_all(&error_msg).await;
+                }
+                BackpressureMode::LogAndReject => {
+                    warn!(
+                        connection_id = self.connection_id,
+                        "Connection rejected: timeout waiting for pool connection"
+                    );
+                }
+            },
             AcquireError::PoolError(e) => {
                 // Pool errors are unexpected, always log them
                 error!(
@@ -409,6 +402,7 @@ impl ConnectionHandler {
         // Forward any remaining data and continue reading until ReadyForQuery
         let mut pending = remaining_data;
         let mut backend_buffer = vec![0u8; 8192];
+        let extractor = MessageExtractor::new();
 
         loop {
             // Check pending data first
@@ -419,8 +413,9 @@ impl ConnectionHandler {
                     .await
                     .context("Failed to forward startup data to client")?;
 
-                // Check for ReadyForQuery
-                if pending.contains(&b'Z') {
+                // Check for ReadyForQuery using proper message framing
+                // (not raw byte search which could false-positive on binary data)
+                if extractor.contains_ready_for_query(&pending) {
                     debug!(connection_id, "Backend startup complete (ReadyForQuery received)");
                     break;
                 }
@@ -445,8 +440,8 @@ impl ConnectionHandler {
                 .await
                 .context("Failed to forward startup data to client")?;
 
-            // Check for ReadyForQuery
-            if data.contains(&b'Z') {
+            // Check for ReadyForQuery using proper message framing
+            if extractor.contains_ready_for_query(data) {
                 debug!(connection_id, "Backend startup complete (ReadyForQuery received)");
                 break;
             }
@@ -1416,20 +1411,14 @@ mod tests {
         );
 
         // Should contain retry hint with the specified ms
-        assert!(
-            error_str.contains("200ms"),
-            "Should contain retry hint with 200ms"
-        );
+        assert!(error_str.contains("200ms"), "Should contain retry hint with 200ms");
     }
 
     #[test]
     fn test_build_queue_full_error_different_retry_hint() {
         let error = ConnectionHandler::build_queue_full_error(500);
         let error_str = String::from_utf8_lossy(&error);
-        assert!(
-            error_str.contains("500ms"),
-            "Should contain retry hint with 500ms"
-        );
+        assert!(error_str.contains("500ms"), "Should contain retry hint with 500ms");
     }
 
     #[test]
