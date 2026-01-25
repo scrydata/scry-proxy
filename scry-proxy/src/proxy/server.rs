@@ -12,6 +12,7 @@ use crate::tls::{handle_ssl_startup, load_client_tls_config, ClientTransport, Ss
 use anyhow::{Context, Result};
 use rustls::ServerConfig;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -42,6 +43,8 @@ pub struct ProxyServer {
     reload_trigger: watch::Receiver<()>,
     /// Sender side of reload channel, exposed for signal handlers
     reload_sender: watch::Sender<()>,
+    /// Current active connection count (atomic for lock-free access)
+    active_connections: Arc<AtomicUsize>,
 }
 
 impl ProxyServer {
@@ -339,6 +342,7 @@ impl ProxyServer {
             authenticator: std::sync::RwLock::new(authenticator),
             reload_trigger,
             reload_sender,
+            active_connections: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -374,6 +378,16 @@ impl ProxyServer {
     /// a config reload from external code (e.g., SIGHUP handler in main.rs).
     pub fn reload_sender(&self) -> watch::Sender<()> {
         self.reload_sender.clone()
+    }
+
+    /// Get current active connection count
+    pub fn active_connection_count(&self) -> usize {
+        self.active_connections.load(Ordering::Relaxed)
+    }
+
+    /// Get max connections limit from config
+    pub fn max_connections(&self) -> usize {
+        self.config.proxy.max_connections
     }
 
     /// Warm up all connection pools before accepting client connections
@@ -1188,5 +1202,20 @@ mod tests {
         // but for this test we just verify the sender works
         // In a full integration test, we'd run the server and verify
         assert!(reload_sender.send(()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_server_has_active_connection_counter() {
+        let config = create_test_config();
+        let publisher = Arc::new(DebugLoggerPublisher::new());
+        let metrics = Arc::new(ProxyMetrics::new(100, HealthConfig::default()));
+
+        let server = ProxyServer::new(config, EventBatcher::new(publisher, 10, 100, 1000), metrics)
+            .await
+            .unwrap();
+
+        // Server should expose active connection count
+        assert_eq!(server.active_connection_count(), 0);
+        assert_eq!(server.max_connections(), 100);
     }
 }
