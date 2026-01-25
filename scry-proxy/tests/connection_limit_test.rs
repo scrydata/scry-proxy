@@ -117,3 +117,50 @@ async fn test_connection_counter_decrements_on_close() {
 
     server_handle.abort();
 }
+
+#[tokio::test]
+async fn test_rejected_connections_metric_increments() {
+    let max_connections = 2;
+    let config = create_test_config_with_max_connections(max_connections);
+    let publisher = Arc::new(DebugLoggerPublisher::new());
+    let metrics = Arc::new(ProxyMetrics::new(100, HealthConfig::default()));
+
+    let server =
+        ProxyServer::new(config, EventBatcher::new(publisher, 10, 100, 1000), Arc::clone(&metrics))
+            .await
+            .unwrap();
+
+    let addr = server.local_addr().unwrap();
+
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Fill up connection slots
+    let mut connections = Vec::new();
+    for _ in 0..max_connections {
+        let stream = TcpStream::connect(addr).await.unwrap();
+        connections.push(stream);
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Initial rejected count should be 0
+    assert_eq!(metrics.get_connections_rejected(), 0);
+
+    // Try to connect 3 more times (should all be rejected)
+    for _ in 0..3 {
+        let _ = TcpStream::connect(addr).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Should have 3 rejected connections
+    assert_eq!(metrics.get_connections_rejected(), 3);
+
+    // Max connections metric should be set
+    assert_eq!(metrics.get_max_connections(), max_connections);
+
+    drop(connections);
+    server_handle.abort();
+}

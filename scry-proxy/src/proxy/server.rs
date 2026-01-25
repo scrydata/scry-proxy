@@ -481,6 +481,9 @@ impl ProxyServer {
 
     /// Run the proxy server, accepting connections until shutdown signal
     pub async fn run(mut self) -> Result<()> {
+        // Set max_connections in metrics for Prometheus export
+        self.metrics.set_max_connections(self.config.proxy.max_connections);
+
         info!(
             listen_address = %self.config.proxy.listen_address,
             max_connections = self.config.proxy.max_connections,
@@ -631,6 +634,9 @@ impl ProxyServer {
                                     "Connection rejected: max_connections limit reached"
                                 );
 
+                                // Record rejection in metrics
+                                self.metrics.record_connection_rejected();
+
                                 // Send PostgreSQL error and close
                                 Self::reject_connection_over_limit(client_stream).await;
                                 continue;
@@ -667,11 +673,30 @@ impl ProxyServer {
                 accept_result = unix_accept => {
                     match accept_result {
                         Ok((client_stream, _addr)) => {
+                            // Check connection limit BEFORE processing
+                            let current = self.active_connections.load(Ordering::Relaxed);
+                            if current >= self.config.proxy.max_connections {
+                                warn!(
+                                    current_connections = current,
+                                    max_connections = self.config.proxy.max_connections,
+                                    "UNIX connection rejected: max_connections limit reached"
+                                );
+
+                                // Record rejection in metrics
+                                self.metrics.record_connection_rejected();
+
+                                // For UNIX sockets, just drop the connection
+                                // (no client address to send error to since it's a local socket)
+                                drop(client_stream);
+                                continue;
+                            }
+
                             *connection_count += 1;
                             let conn_id = *connection_count;
 
                             info!(
                                 connection_id = conn_id,
+                                active_connections = current + 1,
                                 "Accepted UNIX socket client connection"
                             );
 
@@ -719,6 +744,9 @@ impl ProxyServer {
                                     max_connections = self.config.proxy.max_connections,
                                     "Connection rejected: max_connections limit reached"
                                 );
+
+                                // Record rejection in metrics
+                                self.metrics.record_connection_rejected();
 
                                 // Send PostgreSQL error and close
                                 Self::reject_connection_over_limit(client_stream).await;
