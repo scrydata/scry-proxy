@@ -306,10 +306,8 @@ async fn test_transaction_mode_sequential_clients() {
 
         // Execute a transaction
         client2.simple_query("BEGIN").await.expect("BEGIN failed");
-        let rows = client2
-            .query("SELECT 'client2_ok' as status", &[])
-            .await
-            .expect("SELECT failed");
+        let rows =
+            client2.query("SELECT 'client2_ok' as status", &[]).await.expect("SELECT failed");
         assert_eq!(rows.len(), 1);
         let status: &str = rows[0].get(0);
         assert_eq!(status, "client2_ok");
@@ -370,10 +368,8 @@ async fn test_connection_recycling_with_discard_all() {
             .expect("Client 1 SET failed");
 
         // Verify it was set
-        let rows = client1
-            .simple_query("SHOW application_name")
-            .await
-            .expect("Client 1 SHOW failed");
+        let rows =
+            client1.simple_query("SHOW application_name").await.expect("Client 1 SHOW failed");
         assert!(!rows.is_empty());
 
         // Disconnect Client 1 - connection returns to pool with DISCARD ALL
@@ -405,10 +401,8 @@ async fn test_connection_recycling_with_discard_all() {
 
         // Verify session variable was reset by DISCARD ALL
         // application_name should be empty or default, not 'client1_test'
-        let rows = client2
-            .simple_query("SHOW application_name")
-            .await
-            .expect("Client 2 SHOW failed");
+        let rows =
+            client2.simple_query("SHOW application_name").await.expect("Client 2 SHOW failed");
         assert!(!rows.is_empty());
 
         // The application_name should NOT be 'client1_test' if DISCARD ALL worked

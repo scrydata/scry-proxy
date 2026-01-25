@@ -434,17 +434,9 @@ mod tests {
         };
         let tls_config = TlsConfig::default();
 
-        let pool = TcpConnectionPool::new(
-            protocol,
-            config,
-            &tls_config,
-            10,
-            Some(0),
-            None,
-            None,
-            true,
-        )
-        .unwrap();
+        let pool =
+            TcpConnectionPool::new(protocol, config, &tls_config, 10, Some(0), None, None, true)
+                .unwrap();
 
         // Warmup with 0 should return immediately
         let created = pool.warmup(0).await;

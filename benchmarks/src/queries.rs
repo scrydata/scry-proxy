@@ -39,7 +39,8 @@ pub async fn browse_products(client: &Client, params: &QueryParams) -> Result<u6
     };
 
     let results = client.simple_query(&query).await?;
-    let row_count = results.iter().filter(|r| matches!(r, tokio_postgres::SimpleQueryMessage::Row(_))).count();
+    let row_count =
+        results.iter().filter(|r| matches!(r, tokio_postgres::SimpleQueryMessage::Row(_))).count();
     Ok(row_count as u64)
 }
 
@@ -52,7 +53,10 @@ pub async fn view_product(client: &Client, params: &QueryParams) -> Result<u64> 
     if let Some(product_id) = product_id {
         let query = format!("SELECT * FROM products WHERE id = {}", product_id);
         let results = client.simple_query(&query).await?;
-        let row_count = results.iter().filter(|r| matches!(r, tokio_postgres::SimpleQueryMessage::Row(_))).count();
+        let row_count = results
+            .iter()
+            .filter(|r| matches!(r, tokio_postgres::SimpleQueryMessage::Row(_)))
+            .count();
         Ok(row_count as u64)
     } else {
         Ok(0)
@@ -61,7 +65,8 @@ pub async fn view_product(client: &Client, params: &QueryParams) -> Result<u64> 
 
 /// Execute a "search products" query using simple query protocol.
 pub async fn search_products(client: &Client, _params: &QueryParams) -> Result<u64> {
-    let search_terms = ["laptop", "mouse", "keyboard", "monitor", "headset", "wireless", "gaming", "Product"];
+    let search_terms =
+        ["laptop", "mouse", "keyboard", "monitor", "headset", "wireless", "gaming", "Product"];
     let term = {
         let mut rng = rand::thread_rng();
         *search_terms.choose(&mut rng).unwrap_or(&"laptop")
@@ -75,7 +80,8 @@ pub async fn search_products(client: &Client, _params: &QueryParams) -> Result<u
         term.replace('\'', "''")
     );
     let results = client.simple_query(&query).await?;
-    let row_count = results.iter().filter(|r| matches!(r, tokio_postgres::SimpleQueryMessage::Row(_))).count();
+    let row_count =
+        results.iter().filter(|r| matches!(r, tokio_postgres::SimpleQueryMessage::Row(_))).count();
     Ok(row_count as u64)
 }
 
@@ -95,7 +101,10 @@ pub async fn order_history(client: &Client, params: &QueryParams) -> Result<u64>
             user_id
         );
         let results = client.simple_query(&query).await?;
-        let row_count = results.iter().filter(|r| matches!(r, tokio_postgres::SimpleQueryMessage::Row(_))).count();
+        let row_count = results
+            .iter()
+            .filter(|r| matches!(r, tokio_postgres::SimpleQueryMessage::Row(_)))
+            .count();
         Ok(row_count as u64)
     } else {
         Ok(0)
@@ -117,7 +126,10 @@ pub async fn order_details(client: &Client, params: &QueryParams) -> Result<u64>
             order_id
         );
         let results = client.simple_query(&query).await?;
-        let row_count = results.iter().filter(|r| matches!(r, tokio_postgres::SimpleQueryMessage::Row(_))).count();
+        let row_count = results
+            .iter()
+            .filter(|r| matches!(r, tokio_postgres::SimpleQueryMessage::Row(_)))
+            .count();
         Ok(row_count as u64)
     } else {
         Ok(0)

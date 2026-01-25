@@ -188,11 +188,7 @@ pub struct AuthConfig {
 
 impl Default for AuthConfig {
     fn default() -> Self {
-        Self {
-            auth_type: AuthType::Trust,
-            auth_file: None,
-            auth_query: None,
-        }
+        Self { auth_type: AuthType::Trust, auth_file: None, auth_query: None }
     }
 }
 

@@ -3,12 +3,12 @@
 //! These tests verify TLS functionality with the proxy server.
 
 use scry::config::*;
-use std::time::Duration as StdDuration;
 use scry::observability::{HealthConfig, ProxyMetrics};
 use scry::proxy::{EventBatcher, ProxyServer};
 use scry::publisher::{DebugLoggerPublisher, EventPublisher};
 use scry::tls::{load_server_tls_config, upgrade_backend_to_tls};
 use std::sync::Arc;
+use std::time::Duration as StdDuration;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};

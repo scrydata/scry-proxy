@@ -326,10 +326,7 @@ async fn test_md5_auth_multiple_users() {
 
     // Test user1
     let (client1, conn1) = tokio_postgres::connect(
-        &format!(
-            "host=127.0.0.1 port={} user=user1 password=pass1 dbname=postgres",
-            proxy_port
-        ),
+        &format!("host=127.0.0.1 port={} user=user1 password=pass1 dbname=postgres", proxy_port),
         tokio_postgres::NoTls,
     )
     .await
@@ -344,10 +341,7 @@ async fn test_md5_auth_multiple_users() {
 
     // Test user2
     let (client2, conn2) = tokio_postgres::connect(
-        &format!(
-            "host=127.0.0.1 port={} user=user2 password=pass2 dbname=postgres",
-            proxy_port
-        ),
+        &format!("host=127.0.0.1 port={} user=user2 password=pass2 dbname=postgres", proxy_port),
         tokio_postgres::NoTls,
     )
     .await
@@ -362,10 +356,7 @@ async fn test_md5_auth_multiple_users() {
 
     // Test user3
     let (client3, conn3) = tokio_postgres::connect(
-        &format!(
-            "host=127.0.0.1 port={} user=user3 password=pass3 dbname=postgres",
-            proxy_port
-        ),
+        &format!("host=127.0.0.1 port={} user=user3 password=pass3 dbname=postgres", proxy_port),
         tokio_postgres::NoTls,
     )
     .await
@@ -411,10 +402,7 @@ async fn test_proxy_with_md5_backend() {
     // Connect through proxy - no password needed (trust mode to proxy)
     // Proxy will authenticate to backend using configured credentials
     let (client, connection) = tokio_postgres::connect(
-        &format!(
-            "host=127.0.0.1 port={} user=testuser dbname=postgres",
-            proxy_port
-        ),
+        &format!("host=127.0.0.1 port={} user=testuser dbname=postgres", proxy_port),
         tokio_postgres::NoTls,
     )
     .await
@@ -432,9 +420,7 @@ async fn test_proxy_with_md5_backend() {
     assert_eq!(value, 1);
 
     // Run additional query to verify connection is fully working
-    let rows = client
-        .query("SELECT current_user, current_database()", &[])
-        .await
-        .expect("Query failed");
+    let rows =
+        client.query("SELECT current_user, current_database()", &[]).await.expect("Query failed");
     assert_eq!(rows.len(), 1);
 }

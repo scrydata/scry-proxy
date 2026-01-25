@@ -23,8 +23,7 @@ use crate::config::ObservabilityConfig;
 /// Initialize observability (tracing, metrics, OpenTelemetry)
 pub fn init(config: &ObservabilityConfig) -> Result<()> {
     // Set up tracing subscriber with env filter
-    let env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
 
     let registry = tracing_subscriber::registry().with(env_filter);
 

@@ -52,8 +52,8 @@ impl ScramClient {
 
     /// Process server-first-message and generate client-final-message
     pub fn client_final(&mut self, server_first: &[u8]) -> Result<Vec<u8>, ScramError> {
-        let server_first_str = std::str::from_utf8(server_first)
-            .map_err(|_| ScramError::InvalidServerMessage)?;
+        let server_first_str =
+            std::str::from_utf8(server_first).map_err(|_| ScramError::InvalidServerMessage)?;
         self.server_first = server_first_str.to_string();
 
         // Parse server-first: r=<nonce>,s=<salt>,i=<iterations>
@@ -85,12 +85,7 @@ impl ScramClient {
 
         // Compute SaltedPassword
         let mut salted_password = [0u8; 32];
-        pbkdf2_hmac::<Sha256>(
-            self.password.as_bytes(),
-            &salt,
-            iterations,
-            &mut salted_password,
-        );
+        pbkdf2_hmac::<Sha256>(self.password.as_bytes(), &salt, iterations, &mut salted_password);
         self.salted_password = Some(salted_password);
 
         // Build client-final-message-without-proof
@@ -116,15 +111,14 @@ impl ScramClient {
 
     /// Verify the server-final-message
     pub fn verify_server_final(&self, server_final: &[u8]) -> Result<(), ScramError> {
-        let server_final_str = std::str::from_utf8(server_final)
-            .map_err(|_| ScramError::InvalidServerMessage)?;
+        let server_final_str =
+            std::str::from_utf8(server_final).map_err(|_| ScramError::InvalidServerMessage)?;
 
-        let server_sig_b64 = server_final_str
-            .strip_prefix("v=")
-            .ok_or(ScramError::InvalidServerSignature)?;
+        let server_sig_b64 =
+            server_final_str.strip_prefix("v=").ok_or(ScramError::InvalidServerSignature)?;
 
-        let server_sig = BASE64.decode(server_sig_b64)
-            .map_err(|_| ScramError::InvalidServerSignature)?;
+        let server_sig =
+            BASE64.decode(server_sig_b64).map_err(|_| ScramError::InvalidServerSignature)?;
 
         let salted_password = self.salted_password.ok_or(ScramError::NotInitialized)?;
 
@@ -132,7 +126,8 @@ impl ScramClient {
         let server_key = hmac_sha256(&salted_password, b"Server Key");
 
         // Rebuild full nonce from server_first
-        let server_nonce = self.server_first
+        let server_nonce = self
+            .server_first
             .split(',')
             .find(|p| p.starts_with("r="))
             .and_then(|p| p.strip_prefix("r="))
@@ -180,7 +175,9 @@ impl std::fmt::Display for ScramError {
             ScramError::InvalidSalt => write!(f, "Invalid salt encoding"),
             ScramError::NotInitialized => write!(f, "SCRAM client not initialized"),
             ScramError::InvalidServerSignature => write!(f, "Invalid server signature format"),
-            ScramError::ServerSignatureMismatch => write!(f, "Server signature verification failed"),
+            ScramError::ServerSignatureMismatch => {
+                write!(f, "Server signature verification failed")
+            }
         }
     }
 }

@@ -2,7 +2,7 @@
 ///
 /// These tests spin up a real Postgres instance using testcontainers,
 /// start the proxy, and verify end-to-end query execution and event publishing.
-use scry::{config::*, config::DatabaseConfig, observability::*, proxy::*, publisher::*};
+use scry::{config::DatabaseConfig, config::*, observability::*, proxy::*, publisher::*};
 use scry_protocol::ParamValue;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

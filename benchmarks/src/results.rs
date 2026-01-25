@@ -79,8 +79,8 @@ pub struct LatencyHistogram {
 impl LatencyHistogram {
     pub fn new() -> Self {
         // Record latencies from 1us to 60 seconds with 3 significant figures
-        let hist = Histogram::new_with_bounds(1, 60_000_000, 3)
-            .expect("Failed to create histogram");
+        let hist =
+            Histogram::new_with_bounds(1, 60_000_000, 3).expect("Failed to create histogram");
         Self { hist: parking_lot::Mutex::new(hist) }
     }
 

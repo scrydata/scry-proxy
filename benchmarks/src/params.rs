@@ -27,7 +27,10 @@ impl QueryParams {
             .collect();
 
         let product_ids: Vec<i32> = client
-            .query("SELECT id FROM products WHERE is_active = true ORDER BY random() LIMIT 500", &[])
+            .query(
+                "SELECT id FROM products WHERE is_active = true ORDER BY random() LIMIT 500",
+                &[],
+            )
             .await
             .context("Failed to load product IDs")?
             .iter()

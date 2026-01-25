@@ -79,50 +79,20 @@ mod tests {
 
     #[test]
     fn test_parse_admin_command() {
-        assert_eq!(
-            AdminCommand::parse("SHOW POOLS"),
-            Some(AdminCommand::ShowPools)
-        );
-        assert_eq!(
-            AdminCommand::parse("SHOW STATS"),
-            Some(AdminCommand::ShowStats)
-        );
-        assert_eq!(
-            AdminCommand::parse("SHOW DATABASES"),
-            Some(AdminCommand::ShowDatabases)
-        );
-        assert_eq!(
-            AdminCommand::parse("SHOW CLIENTS"),
-            Some(AdminCommand::ShowClients)
-        );
-        assert_eq!(
-            AdminCommand::parse("SHOW SERVERS"),
-            Some(AdminCommand::ShowServers)
-        );
-        assert_eq!(
-            AdminCommand::parse("SHOW VERSION"),
-            Some(AdminCommand::ShowVersion)
-        );
-        assert_eq!(
-            AdminCommand::parse("PAUSE"),
-            Some(AdminCommand::Pause { database: None })
-        );
+        assert_eq!(AdminCommand::parse("SHOW POOLS"), Some(AdminCommand::ShowPools));
+        assert_eq!(AdminCommand::parse("SHOW STATS"), Some(AdminCommand::ShowStats));
+        assert_eq!(AdminCommand::parse("SHOW DATABASES"), Some(AdminCommand::ShowDatabases));
+        assert_eq!(AdminCommand::parse("SHOW CLIENTS"), Some(AdminCommand::ShowClients));
+        assert_eq!(AdminCommand::parse("SHOW SERVERS"), Some(AdminCommand::ShowServers));
+        assert_eq!(AdminCommand::parse("SHOW VERSION"), Some(AdminCommand::ShowVersion));
+        assert_eq!(AdminCommand::parse("PAUSE"), Some(AdminCommand::Pause { database: None }));
         assert_eq!(
             AdminCommand::parse("PAUSE mydb"),
             Some(AdminCommand::Pause { database: Some("mydb".to_string()) })
         );
-        assert_eq!(
-            AdminCommand::parse("RESUME"),
-            Some(AdminCommand::Resume { database: None })
-        );
-        assert_eq!(
-            AdminCommand::parse("RELOAD"),
-            Some(AdminCommand::Reload)
-        );
-        assert_eq!(
-            AdminCommand::parse("SHUTDOWN"),
-            Some(AdminCommand::Shutdown { wait: false })
-        );
+        assert_eq!(AdminCommand::parse("RESUME"), Some(AdminCommand::Resume { database: None }));
+        assert_eq!(AdminCommand::parse("RELOAD"), Some(AdminCommand::Reload));
+        assert_eq!(AdminCommand::parse("SHUTDOWN"), Some(AdminCommand::Shutdown { wait: false }));
         assert_eq!(
             AdminCommand::parse("SHUTDOWN WAIT"),
             Some(AdminCommand::Shutdown { wait: true })

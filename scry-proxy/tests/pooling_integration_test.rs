@@ -783,21 +783,14 @@ async fn test_pool_warmup_creates_connections() {
     // Get pool status before warmup
     let pool_manager = server.pool_manager().expect("Pool manager should exist");
     let status_before = pool_manager.pool().status();
-    assert_eq!(
-        status_before.size, 0,
-        "Pool should be empty before warmup"
-    );
+    assert_eq!(status_before.size, 0, "Pool should be empty before warmup");
 
     // Warm up the pools
     let min_idle = config.performance.pool_min_idle;
     let created = server.warmup_pools(min_idle).await;
 
     // Verify connections were created
-    assert_eq!(
-        created, min_idle,
-        "warmup_pools should create {} connections",
-        min_idle
-    );
+    assert_eq!(created, min_idle, "warmup_pools should create {} connections", min_idle);
 
     // Verify pool status reflects the warmed-up connections
     let status_after = pool_manager.pool().status();

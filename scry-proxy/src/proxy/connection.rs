@@ -11,13 +11,13 @@ use crate::protocol::{
 use crate::publisher::QueryEventBuilder;
 use crate::tls::ClientTransport;
 use anyhow::{Context, Result};
+use parking_lot::Mutex;
 use scry_protocol::ParamValue;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use parking_lot::Mutex;
 use tracing::{debug, error, info, instrument, warn};
 
 /// Handles a single client connection, forwarding messages to/from the backend
@@ -113,9 +113,7 @@ impl ConnectionHandler {
 
         // Move query into builder (no clone!)
         let mut builder = QueryEventBuilder::new(final_query);
-        builder = builder
-            .connection_id(connection_id)
-            .database(database);
+        builder = builder.connection_id(connection_id).database(database);
 
         if let Some(nq) = normalized {
             builder = builder.normalized_query(nq);
@@ -162,9 +160,8 @@ impl ConnectionHandler {
             return self.handle_with_managed_connection(managed_conn, &pool_manager).await;
         } else {
             info!(backend_addr = %backend_addr, "Creating direct backend connection");
-            let backend_stream = TcpStream::connect(&backend_addr)
-                .await
-                .context("Failed to connect to backend")?;
+            let backend_stream =
+                TcpStream::connect(&backend_addr).await.context("Failed to connect to backend")?;
 
             // Disable Nagle's algorithm for lower latency
             backend_stream
@@ -193,13 +190,15 @@ impl ConnectionHandler {
         debug!(connection_id, "Starting handshake");
 
         // Create authenticator for client auth
-        let authenticator = Authenticator::new(
-            Arc::clone(&self.config),
-            self.authenticator.clone(),
-        );
+        let authenticator =
+            Authenticator::new(Arc::clone(&self.config), self.authenticator.clone());
 
         // Perform client authentication and get startup bytes for backend
-        debug!(connection_id, startup_data_len = self.startup_data.len(), "Starting client authentication");
+        debug!(
+            connection_id,
+            startup_data_len = self.startup_data.len(),
+            "Starting client authentication"
+        );
         let auth_result = authenticator
             .authenticate(&mut self.client_stream, &self.startup_data)
             .await
@@ -214,7 +213,11 @@ impl ConnectionHandler {
         );
 
         // Forward startup to backend
-        debug!(connection_id, bytes = auth_result.startup_bytes.len(), "Forwarding startup to backend");
+        debug!(
+            connection_id,
+            bytes = auth_result.startup_bytes.len(),
+            "Forwarding startup to backend"
+        );
         backend_stream
             .write_all(&auth_result.startup_bytes)
             .await

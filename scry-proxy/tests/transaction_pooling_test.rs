@@ -819,15 +819,10 @@ async fn test_hybrid_mode_unpins_on_drop_temp_table() {
             .expect("CREATE TEMP TABLE failed");
 
         // Use the temp table
-        client1
-            .execute("INSERT INTO test_unpin VALUES (1)", &[])
-            .await
-            .expect("INSERT failed");
+        client1.execute("INSERT INTO test_unpin VALUES (1)", &[]).await.expect("INSERT failed");
 
-        let rows = client1
-            .query("SELECT COUNT(*) FROM test_unpin", &[])
-            .await
-            .expect("SELECT failed");
+        let rows =
+            client1.query("SELECT COUNT(*) FROM test_unpin", &[]).await.expect("SELECT failed");
         let count: i64 = rows[0].get(0);
         assert_eq!(count, 1);
 

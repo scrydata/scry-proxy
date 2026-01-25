@@ -6,10 +6,7 @@
 #[derive(Debug, Clone)]
 pub enum AdminResponse {
     /// Row set result (for SHOW commands)
-    RowSet {
-        columns: Vec<String>,
-        rows: Vec<Vec<String>>,
-    },
+    RowSet { columns: Vec<String>, rows: Vec<Vec<String>> },
     /// Command completion (for PAUSE, RESUME, etc.)
     CommandComplete { tag: String },
     /// Error response
@@ -246,9 +243,7 @@ mod tests {
 
     #[test]
     fn test_admin_response_to_wire_command_complete() {
-        let response = AdminResponse::CommandComplete {
-            tag: "PAUSE".to_string(),
-        };
+        let response = AdminResponse::CommandComplete { tag: "PAUSE".to_string() };
 
         let wire = response.to_wire();
 
@@ -262,9 +257,7 @@ mod tests {
 
     #[test]
     fn test_admin_response_to_wire_error() {
-        let response = AdminResponse::Error {
-            message: "Unknown command".to_string(),
-        };
+        let response = AdminResponse::Error { message: "Unknown command".to_string() };
 
         let wire = response.to_wire();
 

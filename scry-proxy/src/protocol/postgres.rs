@@ -280,8 +280,8 @@ mod tests {
             // Send CommandComplete + ReadyForQuery
             // CommandComplete: 'C' + len(16) + "DISCARD ALL\0"
             let cc: [u8; 17] = [
-                b'C', 0, 0, 0, 16, b'D', b'I', b'S', b'C', b'A', b'R', b'D', b' ', b'A', b'L', b'L',
-                0,
+                b'C', 0, 0, 0, 16, b'D', b'I', b'S', b'C', b'A', b'R', b'D', b' ', b'A', b'L',
+                b'L', 0,
             ];
             server.write_all(&cc).await.unwrap();
 

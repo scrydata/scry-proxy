@@ -385,10 +385,7 @@ mod tests {
         let parsed = StartupMessage::parse(&msg).unwrap();
         assert_eq!(parsed.user(), Some("testuser"));
         assert_eq!(parsed.database(), Some("testdb"));
-        assert_eq!(
-            parsed.parameters.get("application_name").map(|s| s.as_str()),
-            Some("myapp")
-        );
+        assert_eq!(parsed.parameters.get("application_name").map(|s| s.as_str()), Some("myapp"));
     }
 
     #[test]
