@@ -167,27 +167,20 @@ if waiters.len() >= self.max_depth {
 
 ---
 
-### HIGH-3: Message Framing Issues
+### HIGH-3: Message Framing Issues ✅ COMPLETED
 
-**Location:** `scry-proxy/src/proxy/connection.rs:243-286`
+**Implementation:**
+- Added `contains_ready_for_query()` method to `MessageExtractor` for proper message frame parsing
+- Fixed `is_query_complete()` to iterate through message boundaries instead of scanning all bytes
+- Updated startup handshake in `connection.rs` to use `contains_ready_for_query()` instead of `data.contains(&b'Z')`
+- All message type checks now verify the byte is at a valid message boundary
+- Integration test added to verify binary data containing 'Z' byte doesn't break connections
 
-**Current Behavior:**
-```rust
-if data.contains(&b'Z') { break; }  // Byte search, not message parsing
-```
-
-**Problem:**
-- Checks for byte 'Z' anywhere in data, not ReadyForQuery message
+**Previous Problem:**
+- Checked for byte 'Z' anywhere in data, not ReadyForQuery message
 - 'Z' could appear in error message text, query results, etc.
-- May break out of loop prematurely
-- May forward incomplete messages to client
-
-**Requirements:**
-- [ ] Implement proper PostgreSQL message framing
-- [ ] Parse message type byte + length prefix
-- [ ] Read exactly the bytes specified by length
-- [ ] Only act on complete, validated messages
-- [ ] Handle message spanning multiple TCP packets
+- Could break out of loop prematurely
+- Could forward incomplete messages to client
 
 **Message Format Reference:**
 ```
