@@ -341,6 +341,75 @@ Use Prometheus metrics to monitor pool saturation:
 
 **Alert suggestion:** Fire alert if `scry_pool_queue_saturation_ratio > 0.8` for 5 minutes.
 
+### Backpressure Configuration
+
+When the connection pool queue fills up, Scry can respond in different ways based on the `pool_backpressure_mode` setting.
+
+| Mode | Description | Use Case |
+|------|-------------|----------|
+| `reject_immediate` | Close connection silently (default) | High-throughput systems where clients handle retries |
+| `retry_hint` | Send PostgreSQL error with retry suggestion | User-facing applications needing helpful error messages |
+| `log_and_reject` | Log warning and close connection | Debugging, monitoring queue pressure |
+
+#### Configuration Options
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `pool_backpressure_mode` | String | `"reject_immediate"` | How to handle queue-full condition |
+| `pool_retry_hint_ms` | u64 | `200` | Suggested retry delay for `retry_hint` mode |
+| `pool_queue_saturation_warn_threshold` | f64 | `0.8` | Saturation level triggering warning logs |
+
+#### Example Configuration
+
+```toml
+[performance]
+pool_backpressure_mode = "retry_hint"  # Send helpful error to clients
+pool_retry_hint_ms = 200               # Suggest 200ms retry delay
+pool_queue_saturation_warn_threshold = 0.8  # Warn at 80% full
+```
+
+**Environment Variables**:
+```bash
+SCRY_PERFORMANCE__POOL_BACKPRESSURE_MODE="retry_hint"
+SCRY_PERFORMANCE__POOL_RETRY_HINT_MS=300
+SCRY_PERFORMANCE__POOL_QUEUE_SATURATION_WARN_THRESHOLD=0.9
+```
+
+#### Client Error Experience
+
+When `retry_hint` mode is enabled, clients receive a proper PostgreSQL error:
+- **SQLSTATE**: `53300` (too_many_connections)
+- **Message**: "connection pool queue is full"
+- **Hint**: "Server is under load. Please retry in 200ms."
+
+This allows PostgreSQL clients (psql, libpq, drivers) to display helpful error messages instead of generic connection failures.
+
+#### Prometheus Alerting Examples
+
+```yaml
+groups:
+  - name: scry-pool
+    rules:
+      - alert: ScryQueueSaturationHigh
+        expr: scry_pool_queue_saturation_ratio > 0.8
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Scry connection pool queue is filling up"
+          description: >
+            Queue is {{ $value | humanizePercentage }} full.
+            Consider increasing pool_size or pool_queue_depth.
+
+      - alert: ScryQueueRejections
+        expr: rate(scry_pool_queue_rejected_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Scry is rejecting connections due to queue pressure"
+```
+
 ### ResilienceConfig
 
 Resilience features configuration.

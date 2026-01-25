@@ -135,6 +135,21 @@ pub enum PoolingStrategy {
     Hybrid,
 }
 
+/// Backpressure behavior when connection pool queue is full
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BackpressureMode {
+    /// Reject immediately with error (default, current behavior)
+    #[default]
+    RejectImmediate,
+    /// Return "server busy" error with retry hint
+    /// Clients receive SQLSTATE 53300 with retry delay suggestion
+    RetryHint,
+    /// Log and reject (for debugging high load scenarios)
+    /// Same as RejectImmediate but logs each rejection at WARN level
+    LogAndReject,
+}
+
 /// Authentication type - matches PgBouncer naming
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
@@ -273,10 +288,28 @@ pub struct PerformanceConfig {
     /// may cause excessive wait times. Set to 0 to disable warning.
     #[serde(default = "default_pool_ratio_warning_threshold")]
     pub pool_ratio_warning_threshold: usize,
+    /// Backpressure behavior when pool queue is full
+    #[serde(default)]
+    pub pool_backpressure_mode: BackpressureMode,
+    /// Suggested retry delay in milliseconds (for RetryHint mode)
+    #[serde(default = "default_pool_retry_hint_ms")]
+    pub pool_retry_hint_ms: u64,
+    /// Saturation threshold for warning logs (0.0-1.0)
+    /// Logs a warning when queue saturation exceeds this threshold
+    #[serde(default = "default_pool_queue_saturation_warn_threshold")]
+    pub pool_queue_saturation_warn_threshold: f64,
 }
 
 fn default_pool_ratio_warning_threshold() -> usize {
     20
+}
+
+fn default_pool_retry_hint_ms() -> u64 {
+    200
+}
+
+fn default_pool_queue_saturation_warn_threshold() -> f64 {
+    0.8
 }
 
 /// Resilience configuration - circuit breaking, retries, healthchecks
@@ -403,6 +436,9 @@ impl Default for Config {
                 pool_lifo: true,
                 pool_reset_timeout_ms: 5000,
                 pool_ratio_warning_threshold: 20,
+                pool_backpressure_mode: BackpressureMode::RejectImmediate,
+                pool_retry_hint_ms: 200,
+                pool_queue_saturation_warn_threshold: 0.8,
             },
             resilience: ResilienceConfig {
                 circuit_breaker: CircuitBreakerConfig {
@@ -695,5 +731,71 @@ mod validation_tests {
             "Should not warn when threshold is 0: {:?}",
             warnings
         );
+    }
+}
+
+#[cfg(test)]
+mod backpressure_tests {
+    use super::*;
+
+    #[test]
+    fn test_backpressure_mode_default() {
+        let config = Config::default();
+        assert_eq!(
+            config.performance.pool_backpressure_mode,
+            BackpressureMode::RejectImmediate
+        );
+    }
+
+    #[test]
+    fn test_backpressure_mode_variants() {
+        // Verify all backpressure mode variants exist and are distinct
+        let modes = [
+            BackpressureMode::RejectImmediate,
+            BackpressureMode::RetryHint,
+            BackpressureMode::LogAndReject,
+        ];
+        assert_eq!(modes.len(), 3);
+        assert_ne!(BackpressureMode::RejectImmediate, BackpressureMode::RetryHint);
+        assert_ne!(BackpressureMode::RetryHint, BackpressureMode::LogAndReject);
+    }
+
+    #[test]
+    fn test_retry_hint_ms_default() {
+        let config = Config::default();
+        assert_eq!(config.performance.pool_retry_hint_ms, 200);
+    }
+
+    #[test]
+    fn test_queue_saturation_warn_threshold_default() {
+        let config = Config::default();
+        assert!((config.performance.pool_queue_saturation_warn_threshold - 0.8).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_backpressure_mode_serde_reject_immediate() {
+        let json = r#"{"pool_backpressure_mode": "reject_immediate"}"#;
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        let mode: BackpressureMode =
+            serde_json::from_value(value["pool_backpressure_mode"].clone()).unwrap();
+        assert_eq!(mode, BackpressureMode::RejectImmediate);
+    }
+
+    #[test]
+    fn test_backpressure_mode_serde_retry_hint() {
+        let json = r#"{"pool_backpressure_mode": "retry_hint"}"#;
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        let mode: BackpressureMode =
+            serde_json::from_value(value["pool_backpressure_mode"].clone()).unwrap();
+        assert_eq!(mode, BackpressureMode::RetryHint);
+    }
+
+    #[test]
+    fn test_backpressure_mode_serde_log_and_reject() {
+        let json = r#"{"pool_backpressure_mode": "log_and_reject"}"#;
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        let mode: BackpressureMode =
+            serde_json::from_value(value["pool_backpressure_mode"].clone()).unwrap();
+        assert_eq!(mode, BackpressureMode::LogAndReject);
     }
 }

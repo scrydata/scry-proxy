@@ -522,6 +522,56 @@ impl ProxyServer {
             );
         }
 
+        // Spawn queue saturation monitoring background task
+        let saturation_warn_threshold = self.config.performance.pool_queue_saturation_warn_threshold;
+        if saturation_warn_threshold > 0.0 && saturation_warn_threshold < 1.0 {
+            let metrics_clone = self.metrics.clone();
+            let pool_managers_clone: Vec<_> = self
+                .pool_managers
+                .iter()
+                .map(|(name, pm)| (name.clone(), Arc::clone(pm)))
+                .collect();
+
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(5));
+                let mut last_warned = std::time::Instant::now();
+                let warn_cooldown = Duration::from_secs(30); // Only warn every 30 seconds
+
+                loop {
+                    interval.tick().await;
+
+                    // Check pool queue saturation for each pool
+                    for (db_name, pm) in &pool_managers_clone {
+                        let queue_depth = pm.wait_queue_depth();
+                        let saturation = metrics_clone.pool_metrics().get_queue_saturation();
+
+                        // Update metrics
+                        metrics_clone.pool_metrics().set_queue_depth(queue_depth);
+
+                        // Warn if saturation exceeds threshold (with cooldown)
+                        if saturation >= saturation_warn_threshold
+                            && last_warned.elapsed() > warn_cooldown
+                        {
+                            warn!(
+                                database = %db_name,
+                                queue_depth = queue_depth,
+                                saturation_pct = format!("{:.1}%", saturation * 100.0),
+                                threshold_pct = format!("{:.0}%", saturation_warn_threshold * 100.0),
+                                "Pool wait queue saturation high - clients may be rejected soon. \
+                                 Consider increasing pool_size or pool_queue_depth."
+                            );
+                            last_warned = std::time::Instant::now();
+                        }
+                    }
+                }
+            });
+
+            debug!(
+                threshold = saturation_warn_threshold,
+                "Queue saturation monitoring started"
+            );
+        }
+
         let mut connection_count = 0u64;
         let mut connection_tasks = JoinSet::new();
 
