@@ -189,30 +189,32 @@ if waiters.len() >= self.max_depth {
 
 ---
 
-### HIGH-4: Startup Message Incomplete Reading
+### HIGH-4: Startup Message Incomplete Reading ✅ COMPLETED
 
-**Location:** `scry-proxy/src/tls/startup.rs:60-91`
+**Implementation:**
+- Added `read_startup_message()` helper in `scry-proxy/src/protocol/startup.rs`
+- Reads 4-byte length prefix first to determine exact message size
+- Loops with `read_exact()` until complete message received
+- Validates length bounds: minimum 8 bytes, maximum 64KB
+- Updated `tls/startup.rs` and `auth/authenticator.rs` to use the new helper
+- Integration tests verify large startup messages work correctly
 
-**Current Behavior:**
-```rust
-let mut buf = vec![0u8; 8192];
-let n = stream.read(&mut buf).await?;  // May be partial
-buf.truncate(n);
-// No validation that complete message was read
+**Previous Problem:**
+- Single `read()` call with 8192-byte buffer
+- Large StartupMessages could exceed buffer size
+- TCP fragmentation could split message across packets
+- Incomplete reads caused parsing failures
+
+**Solution Details:**
+- `read_startup_message()` is generic over any `AsyncReadExt + Unpin`
+- Works with both TcpStream and ClientTransport (TLS)
+- Clear error messages for malformed messages
+- Memory-safe with maximum size limit
+
+**Message Format Reference:**
 ```
-
-**Problem:**
-- StartupMessage could exceed 8192 bytes (many connection parameters)
-- No loop to read complete message
-- Truncated startup causes incorrect database routing
-- May cause authentication failures
-
-**Requirements:**
-- [ ] Read startup message length prefix first (4 bytes)
-- [ ] Allocate buffer for exact message size
-- [ ] Loop reading until complete message received
-- [ ] Validate message structure before parsing
-- [ ] Reject malformed startup messages with clear error
+| Length (4 bytes, includes self) | Protocol Version (4 bytes) | Parameters... | \0 |
+```
 
 ---
 
