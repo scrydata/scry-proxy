@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: postgres:16-alpine
+    image: docker.io/library/postgres:16-alpine
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -9,7 +9,7 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - ./sql:/docker-entrypoint-initdb.d:ro
+      - ./sql:/docker-entrypoint-initdb.d:ro,Z
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 2s
@@ -17,7 +17,7 @@ services:
       retries: 10
 
   pgbouncer:
-    image: pgbouncer/pgbouncer:latest
+    image: docker.io/pgbouncer/pgbouncer:latest
     depends_on:
       postgres:
         condition: service_healthy
@@ -42,7 +42,7 @@ services:
     ports:
       - "6433:6433"
     volumes:
-      - ./pgcat/pgcat.toml:/etc/pgcat/pgcat.toml:ro
+      - ./pgcat/pgcat.toml:/etc/pgcat/pgcat.toml:ro,Z
     command: ["/usr/bin/pgcat", "/etc/pgcat/pgcat.toml"]
 
   # Scry proxy - single service with runtime-configurable features
