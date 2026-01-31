@@ -2,7 +2,7 @@
 ///
 /// These tests spin up a real Postgres instance using testcontainers,
 /// start the proxy, and verify end-to-end query execution and event publishing.
-use scry::{config::*, config::DatabaseConfig, observability::*, proxy::*, publisher::*};
+use scry::{config::DatabaseConfig, config::*, observability::*, proxy::*, publisher::*};
 use scry_protocol::ParamValue;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -106,6 +106,8 @@ fn create_test_config(backend_host: String, backend_port: u16) -> Config {
             pool_queue_depth: 50,
             pool_idle_unpin_secs: 60,
             pool_lifo: true,
+            pool_reset_timeout_ms: 5000,
+            pool_ratio_warning_threshold: 20,
         },
         resilience: ResilienceConfig {
             circuit_breaker: CircuitBreakerConfig {

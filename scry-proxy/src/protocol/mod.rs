@@ -4,18 +4,23 @@ pub mod bind;
 mod command_detector;
 mod extractor;
 pub mod postgres;
+mod startup;
 pub mod traits;
 
 pub use anonymize::{AnonymizedQuery, QueryAnonymizer};
 pub use auth_messages::{
     build_auth_cleartext_password, build_auth_md5_password, build_auth_ok, build_error_response,
-    build_password_message, build_sasl_initial_response, build_sasl_response,
-    compute_md5_response, parse_password_message, verify_md5_response, AuthRequest, StartupMessage,
+    build_password_message, build_sasl_initial_response, build_sasl_response, compute_md5_response,
+    parse_password_message, verify_md5_response, AuthRequest, StartupMessage,
 };
 pub use bind::decode_params;
 pub use command_detector::{CommandDetector, DetectedCommand};
 pub use extractor::MessageExtractor;
-pub use traits::{Protocol, ProtocolConfig, ProtocolRegistry};
+pub use startup::{
+    is_ssl_request as is_ssl_request_msg, read_startup_message, MAX_STARTUP_MESSAGE_SIZE,
+    MIN_STARTUP_MESSAGE_SIZE,
+};
+pub use traits::{AsyncStream, Protocol, ProtocolConfig, ProtocolRegistry};
 // Message enum is defined below and doesn't need re-export
 
 // Postgres wire protocol message types

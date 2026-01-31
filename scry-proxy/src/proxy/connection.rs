@@ -1,9 +1,9 @@
 use super::{
-    ConnectionState, EventBatcher, ModeEnforcer, PendingExecution, PoolManager, PoolingMode,
-    PreparedStatement, PreparedStatementCache, StateReplayer, TransactionTracker,
+    AcquireError, ConnectionState, EventBatcher, ModeEnforcer, PendingExecution, PoolManager,
+    PoolingMode, PreparedStatement, PreparedStatementCache, StateReplayer, TransactionTracker,
 };
 use crate::auth::{Authenticator, FileAuthenticator};
-use crate::config::{Config, PoolingStrategy};
+use crate::config::{BackpressureMode, Config, PoolingStrategy};
 use crate::observability::{ProxyMetrics, QueryTimeline};
 use crate::protocol::{
     decode_params, CommandDetector, DetectedCommand, Message, MessageExtractor, QueryAnonymizer,
@@ -11,13 +11,13 @@ use crate::protocol::{
 use crate::publisher::QueryEventBuilder;
 use crate::tls::ClientTransport;
 use anyhow::{Context, Result};
+use parking_lot::Mutex;
 use scry_protocol::ParamValue;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
 use tracing::{debug, error, info, instrument, warn};
 
 /// Handles a single client connection, forwarding messages to/from the backend
@@ -87,34 +87,128 @@ impl ConnectionHandler {
 
     /// Build a QueryEventBuilder with anonymization if enabled
     /// Returns (builder, value_fingerprints) for hot data tracking
+    ///
+    /// Optimized to minimize allocations:
+    /// - Takes ownership of query (no clone)
+    /// - Uses Arc<str> for connection_id and database (cheap pointer copy)
     fn build_query_event(
         query: String,
-        connection_id: u64,
-        database: String,
+        connection_id: &str,
+        database: &str,
         anonymize: bool,
     ) -> (QueryEventBuilder, Vec<String>) {
-        let mut builder = QueryEventBuilder::new(query.clone());
-        builder = builder.connection_id(connection_id.to_string()).database(database);
-
-        let mut fingerprints = Vec::new();
-
-        // Apply anonymization if enabled
-        if anonymize {
+        // Process anonymization first (needs to borrow query)
+        let (final_query, normalized, fingerprints) = if anonymize {
             let anonymizer = QueryAnonymizer::new();
             if let Some(anon) = anonymizer.anonymize(&query) {
-                fingerprints = anon.value_fingerprints.clone();
-                builder = builder
-                    .normalized_query(anon.normalized_query)
-                    .value_fingerprints(anon.value_fingerprints);
+                // Clone fingerprints for builder, move original for return
+                let fps = anon.value_fingerprints;
+                (query, Some(anon.normalized_query), fps)
+            } else {
+                (query, None, Vec::new())
             }
+        } else {
+            (query, None, Vec::new())
+        };
+
+        // Move query into builder (no clone!)
+        let mut builder = QueryEventBuilder::new(final_query);
+        builder = builder.connection_id(connection_id).database(database);
+
+        if let Some(nq) = normalized {
+            builder = builder.normalized_query(nq);
+        }
+        if !fingerprints.is_empty() {
+            // Clone for builder, return original
+            builder = builder.value_fingerprints(fingerprints.clone());
         }
 
         (builder, fingerprints)
     }
 
+    /// Build PostgreSQL ErrorResponse for queue full condition
+    ///
+    /// Returns a properly formatted PostgreSQL wire protocol error message
+    /// with SQLSTATE 53300 (too_many_connections) and a retry hint.
+    fn build_queue_full_error(retry_hint_ms: u64) -> Vec<u8> {
+        let mut response = Vec::new();
+        response.push(b'E'); // ErrorResponse
+
+        let mut fields = Vec::new();
+
+        // Severity (S)
+        fields.push(b'S');
+        fields.extend_from_slice(b"ERROR");
+        fields.push(0);
+
+        // SQLSTATE (C) - 53300 = too_many_connections
+        fields.push(b'C');
+        fields.extend_from_slice(b"53300");
+        fields.push(0);
+
+        // Message (M)
+        fields.push(b'M');
+        fields.extend_from_slice(b"connection pool queue is full");
+        fields.push(0);
+
+        // Hint (H) with retry suggestion
+        fields.push(b'H');
+        let hint = format!("Server is under load. Please retry in {}ms.", retry_hint_ms);
+        fields.extend_from_slice(hint.as_bytes());
+        fields.push(0);
+
+        // Terminator
+        fields.push(0);
+
+        // Length (including self, 4 bytes)
+        let length = (fields.len() + 4) as i32;
+        response.extend_from_slice(&length.to_be_bytes());
+        response.extend_from_slice(&fields);
+
+        response
+    }
+
+    /// Build PostgreSQL ErrorResponse for wait timeout condition
+    fn build_wait_timeout_error() -> Vec<u8> {
+        let mut response = Vec::new();
+        response.push(b'E'); // ErrorResponse
+
+        let mut fields = Vec::new();
+
+        // Severity (S)
+        fields.push(b'S');
+        fields.extend_from_slice(b"ERROR");
+        fields.push(0);
+
+        // SQLSTATE (C) - 53300 = too_many_connections
+        fields.push(b'C');
+        fields.extend_from_slice(b"53300");
+        fields.push(0);
+
+        // Message (M)
+        fields.push(b'M');
+        fields.extend_from_slice(b"timeout waiting for connection from pool");
+        fields.push(0);
+
+        // Hint (H)
+        fields.push(b'H');
+        fields.extend_from_slice(b"Server is under load. Please retry later.");
+        fields.push(0);
+
+        // Terminator
+        fields.push(0);
+
+        // Length (including self, 4 bytes)
+        let length = (fields.len() + 4) as i32;
+        response.extend_from_slice(&length.to_be_bytes());
+        response.extend_from_slice(&fields);
+
+        response
+    }
+
     /// Handle the connection, forwarding messages until completion
     #[instrument(skip(self), fields(connection_id = self.connection_id, client_addr = %self.client_addr))]
-    pub async fn handle(self) -> Result<()> {
+    pub async fn handle(mut self) -> Result<()> {
         info!("Starting connection handler");
 
         // Get backend connection - either from pool manager or create direct connection
@@ -131,10 +225,13 @@ impl ConnectionHandler {
             // Check if we need sticky connection (e.g., client has prior state)
             let needs_sticky = pool_manager.has_sticky(self.connection_id);
 
-            let managed_conn = pool_manager
-                .acquire(self.connection_id, needs_sticky)
-                .await
-                .context("Failed to acquire connection from pool")?;
+            let managed_conn = match pool_manager.acquire(self.connection_id, needs_sticky).await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    // Handle pool acquire errors with proper backpressure behavior
+                    return self.handle_acquire_error(e).await;
+                }
+            };
 
             info!(
                 backend_addr = %backend_addr,
@@ -146,13 +243,91 @@ impl ConnectionHandler {
             return self.handle_with_managed_connection(managed_conn, &pool_manager).await;
         } else {
             info!(backend_addr = %backend_addr, "Creating direct backend connection");
-            let backend_stream = TcpStream::connect(&backend_addr)
-                .await
-                .context("Failed to connect to backend")?;
+            let backend_stream =
+                TcpStream::connect(&backend_addr).await.context("Failed to connect to backend")?;
+
+            // Disable Nagle's algorithm for lower latency
+            backend_stream
+                .set_nodelay(true)
+                .context("Failed to set TCP_NODELAY on backend connection")?;
 
             // Use direct connection
             return self.handle_with_owned_backend(backend_stream).await;
         }
+    }
+
+    /// Handle pool acquire errors with proper backpressure behavior
+    ///
+    /// Depending on the configured backpressure mode, this method will:
+    /// - RejectImmediate: Close the connection silently
+    /// - RetryHint: Send a PostgreSQL error with retry suggestion
+    /// - LogAndReject: Log the rejection and close the connection
+    async fn handle_acquire_error(&mut self, error: AcquireError) -> Result<()> {
+        // Record rejection metric
+        self.metrics.pool_metrics().record_queue_rejected();
+
+        let backpressure_mode = &self.config.performance.pool_backpressure_mode;
+        let retry_hint_ms = self.config.performance.pool_retry_hint_ms;
+
+        match error {
+            AcquireError::QueueFull(_) => match backpressure_mode {
+                BackpressureMode::RejectImmediate => {
+                    debug!(
+                        connection_id = self.connection_id,
+                        "Queue full, rejecting connection (reject_immediate mode)"
+                    );
+                }
+                BackpressureMode::RetryHint => {
+                    debug!(
+                        connection_id = self.connection_id,
+                        retry_hint_ms = retry_hint_ms,
+                        "Queue full, sending error with retry hint"
+                    );
+                    let error_msg = Self::build_queue_full_error(retry_hint_ms);
+                    let _ = self.client_stream.write_all(&error_msg).await;
+                }
+                BackpressureMode::LogAndReject => {
+                    warn!(
+                        connection_id = self.connection_id,
+                        "Connection rejected: pool queue full"
+                    );
+                }
+            },
+            AcquireError::WaitTimeout => match backpressure_mode {
+                BackpressureMode::RejectImmediate => {
+                    debug!(
+                        connection_id = self.connection_id,
+                        "Wait timeout, rejecting connection"
+                    );
+                }
+                BackpressureMode::RetryHint => {
+                    debug!(
+                        connection_id = self.connection_id,
+                        "Wait timeout, sending error with retry hint"
+                    );
+                    let error_msg = Self::build_wait_timeout_error();
+                    let _ = self.client_stream.write_all(&error_msg).await;
+                }
+                BackpressureMode::LogAndReject => {
+                    warn!(
+                        connection_id = self.connection_id,
+                        "Connection rejected: timeout waiting for pool connection"
+                    );
+                }
+            },
+            AcquireError::PoolError(e) => {
+                // Pool errors are unexpected, always log them
+                error!(
+                    connection_id = self.connection_id,
+                    error = %e,
+                    "Pool error while acquiring connection"
+                );
+                return Err(e.context("Failed to acquire connection from pool"));
+            }
+        }
+
+        // For queue full and wait timeout, return Ok to close connection gracefully
+        Ok(())
     }
 
     /// Perform the startup/authentication handshake
@@ -172,13 +347,15 @@ impl ConnectionHandler {
         debug!(connection_id, "Starting handshake");
 
         // Create authenticator for client auth
-        let authenticator = Authenticator::new(
-            Arc::clone(&self.config),
-            self.authenticator.clone(),
-        );
+        let authenticator =
+            Authenticator::new(Arc::clone(&self.config), self.authenticator.clone());
 
         // Perform client authentication and get startup bytes for backend
-        debug!(connection_id, startup_data_len = self.startup_data.len(), "Starting client authentication");
+        debug!(
+            connection_id,
+            startup_data_len = self.startup_data.len(),
+            "Starting client authentication"
+        );
         let auth_result = authenticator
             .authenticate(&mut self.client_stream, &self.startup_data)
             .await
@@ -193,7 +370,11 @@ impl ConnectionHandler {
         );
 
         // Forward startup to backend
-        debug!(connection_id, bytes = auth_result.startup_bytes.len(), "Forwarding startup to backend");
+        debug!(
+            connection_id,
+            bytes = auth_result.startup_bytes.len(),
+            "Forwarding startup to backend"
+        );
         backend_stream
             .write_all(&auth_result.startup_bytes)
             .await
@@ -221,6 +402,7 @@ impl ConnectionHandler {
         // Forward any remaining data and continue reading until ReadyForQuery
         let mut pending = remaining_data;
         let mut backend_buffer = vec![0u8; 8192];
+        let extractor = MessageExtractor::new();
 
         loop {
             // Check pending data first
@@ -231,8 +413,9 @@ impl ConnectionHandler {
                     .await
                     .context("Failed to forward startup data to client")?;
 
-                // Check for ReadyForQuery
-                if pending.contains(&b'Z') {
+                // Check for ReadyForQuery using proper message framing
+                // (not raw byte search which could false-positive on binary data)
+                if extractor.contains_ready_for_query(&pending) {
                     debug!(connection_id, "Backend startup complete (ReadyForQuery received)");
                     break;
                 }
@@ -257,8 +440,8 @@ impl ConnectionHandler {
                 .await
                 .context("Failed to forward startup data to client")?;
 
-            // Check for ReadyForQuery
-            if data.contains(&b'Z') {
+            // Check for ReadyForQuery using proper message framing
+            if extractor.contains_ready_for_query(data) {
                 debug!(connection_id, "Backend startup complete (ReadyForQuery received)");
                 break;
             }
@@ -281,7 +464,10 @@ impl ConnectionHandler {
         pool_manager: &Arc<PoolManager>,
     ) -> Result<()> {
         let connection_id = self.connection_id;
-        let database = self.config.backend.database.clone();
+        // Pre-format connection_id once to avoid repeated u64::to_string() calls
+        let connection_id_str: Arc<str> = Arc::from(connection_id.to_string());
+        // Use Arc<str> for database to avoid repeated String clones
+        let database: Arc<str> = Arc::from(self.config.backend.database.as_str());
         let batcher = Arc::clone(&self.batcher);
         let anonymize = self.config.publisher.anonymize;
         let metrics = Arc::clone(&self.metrics);
@@ -441,7 +627,7 @@ impl ConnectionHandler {
                                     let duration = pending.started_at.elapsed();
                                     warn!(query = %pending.query, error = %error_msg, duration_ms = duration.as_millis(), "Query failed");
 
-                                    let (builder, fingerprints) = Self::build_query_event(pending.query, connection_id, database.clone(), anonymize);
+                                    let (builder, fingerprints) = Self::build_query_event(pending.query, &connection_id_str, &database, anonymize);
                                     let event = builder
                                         .params(pending.params)
                                         .params_incomplete(pending.params_incomplete)
@@ -466,7 +652,7 @@ impl ConnectionHandler {
                                     let duration = pending.started_at.elapsed();
                                     debug!(query = %pending.query, duration_ms = duration.as_millis(), "Query completed successfully");
 
-                                    let (builder, fingerprints) = Self::build_query_event(pending.query, connection_id, database.clone(), anonymize);
+                                    let (builder, fingerprints) = Self::build_query_event(pending.query, &connection_id_str, &database, anonymize);
                                     let event = builder
                                         .params(pending.params)
                                         .params_incomplete(pending.params_incomplete)
@@ -684,7 +870,10 @@ impl ConnectionHandler {
         let (mut backend_read, mut backend_write) = backend_stream.split();
 
         let connection_id = self.connection_id;
-        let database = self.config.backend.database.clone();
+        // Pre-format connection_id once to avoid repeated u64::to_string() calls
+        let connection_id_str: Arc<str> = Arc::from(connection_id.to_string());
+        // Use Arc<str> for database to avoid repeated String clones
+        let database: Arc<str> = Arc::from(self.config.backend.database.as_str());
         let batcher_clone = Arc::clone(&self.batcher);
         let config_clone = Arc::clone(&self.config);
         let anonymize = self.config.publisher.anonymize;
@@ -713,7 +902,7 @@ impl ConnectionHandler {
                         // Process ALL protocol messages in buffer
                         let messages = extractor.extract_messages(data);
                         if !messages.is_empty() {
-                            let mut cache = cache_writer.lock().await;
+                            let mut cache = cache_writer.lock();
                             for msg in messages {
                                 match msg {
                                     Message::Parse { name, query, param_oids } => {
@@ -830,7 +1019,7 @@ impl ConnectionHandler {
 
                         // Check for error response first
                         if let Some(error_msg) = extractor.extract_error(data) {
-                            let mut cache = cache_reader.lock().await;
+                            let mut cache = cache_reader.lock();
                             if let Some(pending) = cache.take_pending("") {
                                 let duration = pending.started_at.elapsed();
                                 warn!(
@@ -842,8 +1031,8 @@ impl ConnectionHandler {
 
                                 let (builder, fingerprints) = Self::build_query_event(
                                     pending.query,
-                                    connection_id,
-                                    database.clone(),
+                                    &connection_id_str,
+                                    &database,
                                     anonymize,
                                 );
                                 let event = builder
@@ -866,7 +1055,7 @@ impl ConnectionHandler {
                         }
                         // Check if this is a successful query completion
                         else if extractor.is_query_complete(data) {
-                            let mut cache = cache_reader.lock().await;
+                            let mut cache = cache_reader.lock();
                             if let Some(pending) = cache.take_pending("") {
                                 let duration = pending.started_at.elapsed();
                                 debug!(
@@ -877,8 +1066,8 @@ impl ConnectionHandler {
 
                                 let (builder, fingerprints) = Self::build_query_event(
                                     pending.query,
-                                    connection_id,
-                                    database.clone(),
+                                    &connection_id_str,
+                                    &database,
                                     anonymize,
                                 );
                                 let event = builder
@@ -1196,5 +1385,57 @@ mod tests {
 
         ConnectionHandler::update_connection_state(&mut conn_state, "DROP TABLE tmp_users");
         assert!(!conn_state.has_unsafe_state());
+    }
+
+    // Tests for queue full error message format
+
+    #[test]
+    fn test_build_queue_full_error_format() {
+        let error = ConnectionHandler::build_queue_full_error(200);
+
+        // Should start with 'E' (ErrorResponse)
+        assert_eq!(error[0], b'E');
+
+        // Length is bytes 1-4 (big-endian i32)
+        let length = i32::from_be_bytes([error[1], error[2], error[3], error[4]]);
+        assert_eq!(length as usize, error.len() - 1); // Length includes itself but not the 'E'
+
+        // Should contain SQLSTATE 53300
+        let error_str = String::from_utf8_lossy(&error);
+        assert!(error_str.contains("53300"), "Should contain SQLSTATE 53300");
+
+        // Should contain queue full message
+        assert!(
+            error_str.contains("connection pool queue is full"),
+            "Should contain queue full message"
+        );
+
+        // Should contain retry hint with the specified ms
+        assert!(error_str.contains("200ms"), "Should contain retry hint with 200ms");
+    }
+
+    #[test]
+    fn test_build_queue_full_error_different_retry_hint() {
+        let error = ConnectionHandler::build_queue_full_error(500);
+        let error_str = String::from_utf8_lossy(&error);
+        assert!(error_str.contains("500ms"), "Should contain retry hint with 500ms");
+    }
+
+    #[test]
+    fn test_build_wait_timeout_error_format() {
+        let error = ConnectionHandler::build_wait_timeout_error();
+
+        // Should start with 'E' (ErrorResponse)
+        assert_eq!(error[0], b'E');
+
+        // Should contain SQLSTATE 53300
+        let error_str = String::from_utf8_lossy(&error);
+        assert!(error_str.contains("53300"), "Should contain SQLSTATE 53300");
+
+        // Should contain timeout message
+        assert!(
+            error_str.contains("timeout waiting for connection"),
+            "Should contain timeout message"
+        );
     }
 }

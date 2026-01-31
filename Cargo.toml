@@ -1,5 +1,5 @@
 [workspace]
-members = ["scry-proxy"]
+members = ["scry-proxy", "benchmarks"]
 resolver = "2"
 
 [workspace.package]

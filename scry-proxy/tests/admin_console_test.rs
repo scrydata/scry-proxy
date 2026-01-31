@@ -192,10 +192,7 @@ fn test_admin_command_parsing() {
     assert_eq!(AdminCommand::parse("RELOAD"), Some(AdminCommand::Reload));
 
     assert_eq!(AdminCommand::parse("SHUTDOWN"), Some(AdminCommand::Shutdown { wait: false }));
-    assert_eq!(
-        AdminCommand::parse("SHUTDOWN WAIT"),
-        Some(AdminCommand::Shutdown { wait: true })
-    );
+    assert_eq!(AdminCommand::parse("SHUTDOWN WAIT"), Some(AdminCommand::Shutdown { wait: true }));
 
     // Regular SQL should not be parsed as admin command
     assert_eq!(AdminCommand::parse("SELECT 1"), None);

@@ -92,6 +92,8 @@ fn create_pooled_config(backend_host: String, backend_port: u16, pool_size: usiz
             pool_queue_depth: 50,
             pool_idle_unpin_secs: 60,
             pool_lifo: true,
+            pool_reset_timeout_ms: 5000,
+            pool_ratio_warning_threshold: 20,
         },
         resilience: ResilienceConfig {
             circuit_breaker: CircuitBreakerConfig {

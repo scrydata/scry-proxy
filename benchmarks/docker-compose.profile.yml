@@ -1,0 +1,29 @@
+# Profiling overlay for scry-proxy
+#
+# Usage:
+#   cd benchmarks
+#   docker compose -f docker-compose.yml -f docker-compose.profile.yml up -d
+#
+# Then attach to profile:
+#   docker compose -f docker-compose.yml -f docker-compose.profile.yml exec scry bash
+#   # Inside container:
+#   perf record -g -p $(pgrep scry-proxy) -- sleep 30
+#   perf script | inferno-collapse-perf | inferno-flamegraph > flamegraph.svg
+
+services:
+  scry:
+    build:
+      context: ../..
+      dockerfile: scry-proxy/benchmarks/Dockerfile.profile
+    # Required for perf to access performance counters
+    privileged: true
+    # Alternative to privileged (more restrictive):
+    # cap_add:
+    #   - SYS_ADMIN
+    #   - SYS_PTRACE
+    # security_opt:
+    #   - seccomp:unconfined
+    volumes:
+      # Mount a local directory to save profiles
+      - ./profiles:/profiles
+    # Keep the default environment from base compose

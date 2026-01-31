@@ -26,7 +26,8 @@ COPY scry-proxy/scry-proxy ./scry-proxy
 
 # Update the crate's Cargo.toml to use absolute path for scry-protocol
 # The dependency is in scry-proxy/Cargo.toml (the crate, not workspace root)
-RUN sed -i 's|path = "../../scry-protocol"|path = "/scry-protocol"|g' scry-proxy/Cargo.toml
+RUN sed -i 's|path = "../../scry-protocol"|path = "/scry-protocol"|g' scry-proxy/Cargo.toml && \
+    sed -i 's|members = \["scry-proxy", "benchmarks"\]|members = ["scry-proxy"]|g' Cargo.toml
 
 # Build release binary
 RUN cargo build --release --package scry

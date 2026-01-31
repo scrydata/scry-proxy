@@ -12,6 +12,7 @@ use crate::tls::{handle_ssl_startup, load_client_tls_config, ClientTransport, Ss
 use anyhow::{Context, Result};
 use rustls::ServerConfig;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -21,6 +22,19 @@ use tokio::net::UnixListener;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
+
+/// RAII guard to decrement connection counter on drop
+struct ConnectionCountGuard {
+    counter: Arc<AtomicUsize>,
+    metrics: Arc<ProxyMetrics>,
+}
+
+impl Drop for ConnectionCountGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+        self.metrics.decrement_active_connections();
+    }
+}
 
 /// The main proxy server that accepts client connections
 pub struct ProxyServer {
@@ -42,6 +56,8 @@ pub struct ProxyServer {
     reload_trigger: watch::Receiver<()>,
     /// Sender side of reload channel, exposed for signal handlers
     reload_sender: watch::Sender<()>,
+    /// Current active connection count (atomic for lock-free access)
+    active_connections: Arc<AtomicUsize>,
 }
 
 impl ProxyServer {
@@ -61,9 +77,12 @@ impl ProxyServer {
         );
 
         // Get protocol implementation for the configured backend
-        let protocol: Arc<dyn Protocol> = ProtocolRegistry::get(&config.backend.protocol)
-            .context("Failed to get protocol implementation")?
-            .into();
+        let protocol: Arc<dyn Protocol> = ProtocolRegistry::get(
+            &config.backend.protocol,
+            config.performance.pool_reset_timeout_ms,
+        )
+        .context("Failed to get protocol implementation")?
+        .into();
 
         info!(
             protocol = protocol.name(),
@@ -119,17 +138,11 @@ impl ProxyServer {
         }
 
         // Create database router for multi-database support
-        let router = DatabaseRouter::new(
-            &config.databases,
-            &config.backend,
-            config.performance.pool_size,
-        );
+        let router =
+            DatabaseRouter::new(&config.databases, &config.backend, config.performance.pool_size);
 
         if !config.databases.is_empty() {
-            info!(
-                database_count = config.databases.len(),
-                "Multi-database routing enabled"
-            );
+            info!(database_count = config.databases.len(), "Multi-database routing enabled");
         }
 
         // Create circuit breaker if enabled (shared across all pools)
@@ -176,54 +189,55 @@ impl ProxyServer {
             );
 
             // Helper to create a pool manager for a database config
-            let create_pool_manager = |db_config: &DatabaseConfig,
-                                       protocol: &Arc<dyn Protocol>,
-                                       tls_config: &crate::config::TlsConfig,
-                                       perf_config: &crate::config::PerformanceConfig,
-                                       circuit_breaker: &Option<Arc<CircuitBreaker>>,
-                                       retry_config: &Option<crate::config::ConnectionRetryConfig>|
-             -> Result<Arc<PoolManager>> {
-                let pool_size = db_config.pool_size.unwrap_or(perf_config.pool_size);
-                let min_idle = std::cmp::min(perf_config.pool_min_idle, pool_size);
+            let create_pool_manager =
+                |db_config: &DatabaseConfig,
+                 protocol: &Arc<dyn Protocol>,
+                 tls_config: &crate::config::TlsConfig,
+                 perf_config: &crate::config::PerformanceConfig,
+                 circuit_breaker: &Option<Arc<CircuitBreaker>>,
+                 retry_config: &Option<crate::config::ConnectionRetryConfig>|
+                 -> Result<Arc<PoolManager>> {
+                    let pool_size = db_config.pool_size.unwrap_or(perf_config.pool_size);
+                    let min_idle = std::cmp::min(perf_config.pool_min_idle, pool_size);
 
-                let protocol_config = ProtocolConfig {
-                    host: db_config.host.clone(),
-                    port: db_config.port,
-                    database: Some(db_config.database.clone()),
-                    user: Some(db_config.user.clone()),
-                    password: Some(db_config.password.clone()),
+                    let protocol_config = ProtocolConfig {
+                        host: db_config.host.clone(),
+                        port: db_config.port,
+                        database: Some(db_config.database.clone()),
+                        user: Some(db_config.user.clone()),
+                        password: Some(db_config.password.clone()),
+                    };
+
+                    let pool = TcpConnectionPool::new(
+                        Arc::clone(protocol),
+                        protocol_config,
+                        tls_config,
+                        pool_size,
+                        Some(min_idle),
+                        circuit_breaker.clone(),
+                        retry_config.clone(),
+                        perf_config.pool_lifo,
+                    )
+                    .context(format!("Failed to create pool for database '{}'", db_config.name))?;
+
+                    let wait_queue = WaitQueue::new(perf_config.pool_queue_depth);
+                    let pm_config = PoolManagerConfig {
+                        lifo: perf_config.pool_lifo,
+                        queue_depth: perf_config.pool_queue_depth,
+                        idle_unpin_secs: perf_config.pool_idle_unpin_secs,
+                        wait_timeout_ms: perf_config.pool_timeout_secs * 1000,
+                    };
+
+                    info!(
+                        database = %db_config.name,
+                        pool_size = pool_size,
+                        host = %db_config.host,
+                        port = db_config.port,
+                        "Created pool for database"
+                    );
+
+                    Ok(PoolManager::new(Arc::new(pool), wait_queue, pm_config))
                 };
-
-                let pool = TcpConnectionPool::new(
-                    Arc::clone(protocol),
-                    protocol_config,
-                    tls_config,
-                    pool_size,
-                    Some(min_idle),
-                    circuit_breaker.clone(),
-                    retry_config.clone(),
-                    perf_config.pool_lifo,
-                )
-                .context(format!("Failed to create pool for database '{}'", db_config.name))?;
-
-                let wait_queue = WaitQueue::new(perf_config.pool_queue_depth);
-                let pm_config = PoolManagerConfig {
-                    lifo: perf_config.pool_lifo,
-                    queue_depth: perf_config.pool_queue_depth,
-                    idle_unpin_secs: perf_config.pool_idle_unpin_secs,
-                    wait_timeout_ms: perf_config.pool_timeout_secs * 1000,
-                };
-
-                info!(
-                    database = %db_config.name,
-                    pool_size = pool_size,
-                    host = %db_config.host,
-                    port = db_config.port,
-                    "Created pool for database"
-                );
-
-                Ok(PoolManager::new(Arc::new(pool), wait_queue, pm_config))
-            };
 
             // Create pool for default backend ("*")
             let default_db_config = router.default_config();
@@ -257,10 +271,7 @@ impl ProxyServer {
                 );
             }
 
-            info!(
-                pool_count = pool_managers.len(),
-                "Connection pools created successfully"
-            );
+            info!(pool_count = pool_managers.len(), "Connection pools created successfully");
         } else {
             info!("Connection pooling disabled, using direct connections");
         }
@@ -344,6 +355,7 @@ impl ProxyServer {
             authenticator: std::sync::RwLock::new(authenticator),
             reload_trigger,
             reload_sender,
+            active_connections: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -360,9 +372,7 @@ impl ProxyServer {
 
     /// Get a pool manager for a specific database
     pub fn pool_manager_for(&self, database: &str) -> Option<&Arc<PoolManager>> {
-        self.pool_managers
-            .get(database)
-            .or_else(|| self.pool_managers.get("*"))
+        self.pool_managers.get(database).or_else(|| self.pool_managers.get("*"))
     }
 
     /// Get the database router
@@ -381,6 +391,48 @@ impl ProxyServer {
     /// a config reload from external code (e.g., SIGHUP handler in main.rs).
     pub fn reload_sender(&self) -> watch::Sender<()> {
         self.reload_sender.clone()
+    }
+
+    /// Get current active connection count
+    pub fn active_connection_count(&self) -> usize {
+        self.active_connections.load(Ordering::Relaxed)
+    }
+
+    /// Get max connections limit from config
+    pub fn max_connections(&self) -> usize {
+        self.config.proxy.max_connections
+    }
+
+    /// Warm up all connection pools before accepting client connections
+    ///
+    /// This pre-creates backend connections to avoid cold-start latency.
+    /// Should be called between `new()` and `run()`.
+    ///
+    /// # Arguments
+    /// * `min_idle` - Number of connections to pre-create per pool
+    ///
+    /// # Returns
+    /// Total number of connections created across all pools
+    pub async fn warmup_pools(&self, min_idle: usize) -> usize {
+        if self.pool_managers.is_empty() || min_idle == 0 {
+            return 0;
+        }
+
+        info!(
+            pool_count = self.pool_managers.len(),
+            min_idle = min_idle,
+            "Warming up connection pools"
+        );
+
+        let mut total_created = 0;
+        for (db_name, pool_manager) in &self.pool_managers {
+            let created = pool_manager.warmup(min_idle).await;
+            info!(database = %db_name, created = created, "Pool warmup complete");
+            total_created += created;
+        }
+
+        info!(total_created = total_created, "All pools warmed up");
+        total_created
     }
 
     /// Apply a config reload, updating hot-reloadable settings
@@ -429,6 +481,11 @@ impl ProxyServer {
 
     /// Run the proxy server, accepting connections until shutdown signal
     pub async fn run(mut self) -> Result<()> {
+        // Set max_connections in metrics for Prometheus export
+        self.metrics.set_max_connections(self.config.proxy.max_connections);
+        // Set max queue depth for saturation metrics
+        self.metrics.pool_metrics().set_max_queue_depth(self.config.performance.pool_queue_depth);
+
         info!(
             listen_address = %self.config.proxy.listen_address,
             max_connections = self.config.proxy.max_connections,
@@ -463,6 +520,54 @@ impl ProxyServer {
                 pool_count = self.pool_managers.len(),
                 "Idle cleanup background tasks started"
             );
+        }
+
+        // Spawn queue saturation monitoring background task
+        let saturation_warn_threshold =
+            self.config.performance.pool_queue_saturation_warn_threshold;
+        if saturation_warn_threshold > 0.0 && saturation_warn_threshold < 1.0 {
+            let metrics_clone = self.metrics.clone();
+            let pool_managers_clone: Vec<_> = self
+                .pool_managers
+                .iter()
+                .map(|(name, pm)| (name.clone(), Arc::clone(pm)))
+                .collect();
+
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(5));
+                let mut last_warned = std::time::Instant::now();
+                let warn_cooldown = Duration::from_secs(30); // Only warn every 30 seconds
+
+                loop {
+                    interval.tick().await;
+
+                    // Check pool queue saturation for each pool
+                    for (db_name, pm) in &pool_managers_clone {
+                        let queue_depth = pm.wait_queue_depth();
+                        let saturation = metrics_clone.pool_metrics().get_queue_saturation();
+
+                        // Update metrics
+                        metrics_clone.pool_metrics().set_queue_depth(queue_depth);
+
+                        // Warn if saturation exceeds threshold (with cooldown)
+                        if saturation >= saturation_warn_threshold
+                            && last_warned.elapsed() > warn_cooldown
+                        {
+                            warn!(
+                                database = %db_name,
+                                queue_depth = queue_depth,
+                                saturation_pct = format!("{:.1}%", saturation * 100.0),
+                                threshold_pct = format!("{:.0}%", saturation_warn_threshold * 100.0),
+                                "Pool wait queue saturation high - clients may be rejected soon. \
+                                 Consider increasing pool_size or pool_queue_depth."
+                            );
+                            last_warned = std::time::Instant::now();
+                        }
+                    }
+                }
+            });
+
+            debug!(threshold = saturation_warn_threshold, "Queue saturation monitoring started");
         }
 
         let mut connection_count = 0u64;
@@ -500,6 +605,41 @@ impl ProxyServer {
         Ok(())
     }
 
+    /// Reject a connection that exceeds max_connections limit
+    ///
+    /// Sends a PostgreSQL ErrorResponse with SQLSTATE 53300 (too_many_connections)
+    /// then closes the connection.
+    async fn reject_connection_over_limit(mut stream: tokio::net::TcpStream) {
+        // Build PostgreSQL ErrorResponse
+        // Format: 'E' + length + fields + terminator
+        let mut response = Vec::new();
+        response.push(b'E');
+
+        let mut fields = Vec::new();
+        // Severity (S)
+        fields.push(b'S');
+        fields.extend_from_slice(b"FATAL");
+        fields.push(0);
+        // SQLSTATE (C) - 53300 = too_many_connections
+        fields.push(b'C');
+        fields.extend_from_slice(b"53300");
+        fields.push(0);
+        // Message (M)
+        fields.push(b'M');
+        fields.extend_from_slice(b"sorry, too many clients already");
+        fields.push(0);
+        // Terminator
+        fields.push(0);
+
+        let length = (fields.len() + 4) as i32;
+        response.extend_from_slice(&length.to_be_bytes());
+        response.extend_from_slice(&fields);
+
+        // Attempt to send error (best effort)
+        let _ = stream.write_all(&response).await;
+        let _ = stream.shutdown().await;
+    }
+
     /// Accept loop for Unix platforms (supports both TCP and UNIX sockets)
     #[cfg(unix)]
     async fn accept_loop_with_unix(
@@ -534,12 +674,36 @@ impl ProxyServer {
                 accept_result = self.listener.accept() => {
                     match accept_result {
                         Ok((client_stream, client_addr)) => {
+                            // Check connection limit BEFORE processing
+                            let current = self.active_connections.load(Ordering::Relaxed);
+                            if current >= self.config.proxy.max_connections {
+                                warn!(
+                                    client_addr = %client_addr,
+                                    current_connections = current,
+                                    max_connections = self.config.proxy.max_connections,
+                                    "Connection rejected: max_connections limit reached"
+                                );
+
+                                // Record rejection in metrics
+                                self.metrics.record_connection_rejected();
+
+                                // Send PostgreSQL error and close
+                                Self::reject_connection_over_limit(client_stream).await;
+                                continue;
+                            }
+
+                            // Disable Nagle's algorithm for lower latency
+                            if let Err(e) = client_stream.set_nodelay(true) {
+                                warn!(error = %e, "Failed to set TCP_NODELAY on client connection");
+                            }
+
                             *connection_count += 1;
                             let conn_id = *connection_count;
 
                             info!(
                                 connection_id = conn_id,
                                 client_addr = %client_addr,
+                                active_connections = current + 1,
                                 "Accepted TCP client connection"
                             );
 
@@ -559,11 +723,30 @@ impl ProxyServer {
                 accept_result = unix_accept => {
                     match accept_result {
                         Ok((client_stream, _addr)) => {
+                            // Check connection limit BEFORE processing
+                            let current = self.active_connections.load(Ordering::Relaxed);
+                            if current >= self.config.proxy.max_connections {
+                                warn!(
+                                    current_connections = current,
+                                    max_connections = self.config.proxy.max_connections,
+                                    "UNIX connection rejected: max_connections limit reached"
+                                );
+
+                                // Record rejection in metrics
+                                self.metrics.record_connection_rejected();
+
+                                // For UNIX sockets, just drop the connection
+                                // (no client address to send error to since it's a local socket)
+                                drop(client_stream);
+                                continue;
+                            }
+
                             *connection_count += 1;
                             let conn_id = *connection_count;
 
                             info!(
                                 connection_id = conn_id,
+                                active_connections = current + 1,
                                 "Accepted UNIX socket client connection"
                             );
 
@@ -602,12 +785,36 @@ impl ProxyServer {
                 accept_result = self.listener.accept() => {
                     match accept_result {
                         Ok((client_stream, client_addr)) => {
+                            // Check connection limit BEFORE processing
+                            let current = self.active_connections.load(Ordering::Relaxed);
+                            if current >= self.config.proxy.max_connections {
+                                warn!(
+                                    client_addr = %client_addr,
+                                    current_connections = current,
+                                    max_connections = self.config.proxy.max_connections,
+                                    "Connection rejected: max_connections limit reached"
+                                );
+
+                                // Record rejection in metrics
+                                self.metrics.record_connection_rejected();
+
+                                // Send PostgreSQL error and close
+                                Self::reject_connection_over_limit(client_stream).await;
+                                continue;
+                            }
+
+                            // Disable Nagle's algorithm for lower latency
+                            if let Err(e) = client_stream.set_nodelay(true) {
+                                warn!(error = %e, "Failed to set TCP_NODELAY on client connection");
+                            }
+
                             *connection_count += 1;
                             let conn_id = *connection_count;
 
                             info!(
                                 connection_id = conn_id,
                                 client_addr = %client_addr,
+                                active_connections = current + 1,
                                 "Accepted TCP client connection"
                             );
 
@@ -702,39 +909,42 @@ impl ProxyServer {
         let tls_config = self.tls_config.clone();
         // Read current authenticator from RwLock (allows hot-reload via SIGHUP)
         let authenticator = self.authenticator.read().unwrap().clone();
+        let active_connections = Arc::clone(&self.active_connections);
+
+        // Increment connection counter BEFORE spawning
+        active_connections.fetch_add(1, Ordering::Relaxed);
+        // Also update ProxyMetrics for observability
+        metrics.increment_active_connections();
 
         connection_tasks.spawn(async move {
+            // Ensure counter is decremented on exit (drop guard pattern)
+            let _guard =
+                ConnectionCountGuard { counter: active_connections, metrics: Arc::clone(&metrics) };
             // Handle SSL startup handshake
-            let (transport, startup_data) = match handle_ssl_startup(
-                client_stream,
-                &config.tls.client_tls_sslmode,
-                tls_config,
-            )
-            .await
-            {
-                Ok(SslStartupResult::Upgraded(transport)) => {
-                    info!(connection_id = conn_id, "Connection upgraded to TLS");
-                    (transport, Vec::new())
-                }
-                Ok(SslStartupResult::Declined(stream, startup_data)) => {
-                    debug!(
-                        connection_id = conn_id,
-                        "SSL declined, continuing with plain TCP"
-                    );
-                    (ClientTransport::Plain(stream), startup_data)
-                }
-                Ok(SslStartupResult::NoSslRequest(stream, startup_data)) => {
-                    debug!(
-                        connection_id = conn_id,
-                        "No SSL request, continuing with plain TCP"
-                    );
-                    (ClientTransport::Plain(stream), startup_data)
-                }
-                Err(e) => {
-                    error!(connection_id = conn_id, error = %e, "SSL startup failed");
-                    return;
-                }
-            };
+            let (transport, startup_data) =
+                match handle_ssl_startup(client_stream, &config.tls.client_tls_sslmode, tls_config)
+                    .await
+                {
+                    Ok(SslStartupResult::Upgraded(transport)) => {
+                        info!(connection_id = conn_id, "Connection upgraded to TLS");
+                        (transport, Vec::new())
+                    }
+                    Ok(SslStartupResult::Declined(stream, startup_data)) => {
+                        debug!(connection_id = conn_id, "SSL declined, continuing with plain TCP");
+                        (ClientTransport::Plain(stream), startup_data)
+                    }
+                    Ok(SslStartupResult::NoSslRequest(stream, startup_data)) => {
+                        debug!(
+                            connection_id = conn_id,
+                            "No SSL request, continuing with plain TCP"
+                        );
+                        (ClientTransport::Plain(stream), startup_data)
+                    }
+                    Err(e) => {
+                        error!(connection_id = conn_id, error = %e, "SSL startup failed");
+                        return;
+                    }
+                };
 
             Self::handle_client_connection(
                 transport,
@@ -765,8 +975,17 @@ impl ProxyServer {
         let metrics = Arc::clone(&self.metrics);
         // Read current authenticator from RwLock (allows hot-reload via SIGHUP)
         let authenticator = self.authenticator.read().unwrap().clone();
+        let active_connections = Arc::clone(&self.active_connections);
+
+        // Increment connection counter BEFORE spawning
+        active_connections.fetch_add(1, Ordering::Relaxed);
+        // Also update ProxyMetrics for observability
+        metrics.increment_active_connections();
 
         connection_tasks.spawn(async move {
+            // Ensure counter is decremented on exit (drop guard pattern)
+            let _guard =
+                ConnectionCountGuard { counter: active_connections, metrics: Arc::clone(&metrics) };
             // UNIX sockets don't use SSL, so wrap directly
             let transport = ClientTransport::Unix(client_stream);
 
@@ -800,17 +1019,13 @@ impl ProxyServer {
         startup_data: Vec<u8>,
         authenticator: Option<Arc<FileAuthenticator>>,
     ) {
-        let addr_str = client_addr
-            .map(|a| a.to_string())
-            .unwrap_or_else(|| "unix".to_string());
+        let addr_str = client_addr.map(|a| a.to_string()).unwrap_or_else(|| "unix".to_string());
 
         // Parse startup message to get database name and check for admin
         let (database_name, is_admin) = if !startup_data.is_empty() {
             if let Some(startup) = StartupMessage::parse(&startup_data) {
                 let db = startup.database().map(|s| s.to_string());
-                let is_admin = db
-                    .as_ref()
-                    .is_some_and(|d| d.eq_ignore_ascii_case(ADMIN_DATABASE));
+                let is_admin = db.as_ref().is_some_and(|d| d.eq_ignore_ascii_case(ADMIN_DATABASE));
                 (db, is_admin)
             } else {
                 (None, false)
@@ -918,7 +1133,8 @@ async fn handle_admin_connection(
         if buffer[0] == b'Q' {
             // Parse query: 'Q' + length(4) + query_string (null-terminated)
             if n >= 5 {
-                let length = i32::from_be_bytes([buffer[1], buffer[2], buffer[3], buffer[4]]) as usize;
+                let length =
+                    i32::from_be_bytes([buffer[1], buffer[2], buffer[3], buffer[4]]) as usize;
                 if n >= 5 + length - 4 {
                     // Query string is null-terminated
                     let query_end = 5 + length - 4 - 1; // -4 for length already counted, -1 for null
@@ -928,13 +1144,14 @@ async fn handle_admin_connection(
 
                     let response = match admin.execute(&query).await {
                         Ok(resp) => resp,
-                        Err(e) => AdminResponse::Error {
-                            message: e.to_string(),
-                        },
+                        Err(e) => AdminResponse::Error { message: e.to_string() },
                     };
 
                     let wire_response = response.to_wire();
-                    client.write_all(&wire_response).await.context("Failed to send admin response")?;
+                    client
+                        .write_all(&wire_response)
+                        .await
+                        .context("Failed to send admin response")?;
                 }
             }
         } else if buffer[0] == b'X' {
@@ -1109,11 +1326,8 @@ mod tests {
         assert!(!auth.has_user("user2"));
 
         // Update auth file with a new user
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(auth_file.path())
-            .unwrap();
+        let file =
+            std::fs::OpenOptions::new().write(true).truncate(true).open(auth_file.path()).unwrap();
         use std::io::Write as _;
         writeln!(&file, "\"user1\" \"pass1\"").unwrap();
         writeln!(&file, "\"user2\" \"pass2\"").unwrap();
@@ -1151,11 +1365,8 @@ mod tests {
         let reload_sender = server.reload_sender();
 
         // Update auth file
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(auth_file.path())
-            .unwrap();
+        let file =
+            std::fs::OpenOptions::new().write(true).truncate(true).open(auth_file.path()).unwrap();
         use std::io::Write as _;
         writeln!(&file, "\"newuser\" \"newpass\"").unwrap();
         drop(file);
@@ -1167,5 +1378,40 @@ mod tests {
         // but for this test we just verify the sender works
         // In a full integration test, we'd run the server and verify
         assert!(reload_sender.send(()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_server_has_active_connection_counter() {
+        let config = create_test_config();
+        let publisher = Arc::new(DebugLoggerPublisher::new());
+        let metrics = Arc::new(ProxyMetrics::new(100, HealthConfig::default()));
+
+        let server = ProxyServer::new(config, EventBatcher::new(publisher, 10, 100, 1000), metrics)
+            .await
+            .unwrap();
+
+        // Server should expose active connection count
+        assert_eq!(server.active_connection_count(), 0);
+        assert_eq!(server.max_connections(), 100);
+    }
+
+    #[tokio::test]
+    async fn test_connection_counter_increments_on_spawn() {
+        let config = create_test_config();
+        let publisher = Arc::new(DebugLoggerPublisher::new());
+        let metrics = Arc::new(ProxyMetrics::new(100, HealthConfig::default()));
+
+        let server = ProxyServer::new(config, EventBatcher::new(publisher, 10, 100, 1000), metrics)
+            .await
+            .unwrap();
+
+        // Simulate what happens when a connection is spawned
+        // The counter should increment when connection starts
+        // and decrement when connection ends (handled in spawned task)
+
+        // For this unit test, we verify the counter is accessible and starts at 0
+        assert_eq!(server.active_connection_count(), 0);
+
+        // Integration test will verify actual increment/decrement behavior
     }
 }

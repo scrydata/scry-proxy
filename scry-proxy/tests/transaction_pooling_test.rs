@@ -102,6 +102,8 @@ fn create_test_config(host: String, port: u16, pooling: PoolingStrategy) -> Conf
             pool_queue_depth: 50,
             pool_idle_unpin_secs: 60,
             pool_lifo: true,
+            pool_reset_timeout_ms: 5000,
+            pool_ratio_warning_threshold: 20,
         },
         resilience: ResilienceConfig {
             circuit_breaker: CircuitBreakerConfig {
@@ -818,15 +820,10 @@ async fn test_hybrid_mode_unpins_on_drop_temp_table() {
             .expect("CREATE TEMP TABLE failed");
 
         // Use the temp table
-        client1
-            .execute("INSERT INTO test_unpin VALUES (1)", &[])
-            .await
-            .expect("INSERT failed");
+        client1.execute("INSERT INTO test_unpin VALUES (1)", &[]).await.expect("INSERT failed");
 
-        let rows = client1
-            .query("SELECT COUNT(*) FROM test_unpin", &[])
-            .await
-            .expect("SELECT failed");
+        let rows =
+            client1.query("SELECT COUNT(*) FROM test_unpin", &[]).await.expect("SELECT failed");
         let count: i64 = rows[0].get(0);
         assert_eq!(count, 1);
 

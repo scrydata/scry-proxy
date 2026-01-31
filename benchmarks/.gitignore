@@ -1,0 +1,16 @@
+# Benchmark results (generated)
+results/
+*.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Charts (generated)
+*.png
+*.svg
+
+# Temporary files
+*.tmp

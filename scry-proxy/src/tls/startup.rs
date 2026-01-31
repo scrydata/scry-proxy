@@ -1,7 +1,8 @@
 use crate::config::TlsSslMode;
+use crate::protocol::read_startup_message;
 use rustls::ServerConfig;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
@@ -47,26 +48,29 @@ pub enum SslStartupResult {
 ///
 /// PostgreSQL clients can send an SSLRequest before the normal StartupMessage.
 /// We need to:
-/// 1. Read the first message
+/// 1. Read the first message (could be SSLRequest or StartupMessage)
 /// 2. If it's an SSLRequest, respond with 'S' (yes) or 'N' (no)
 /// 3. If 'S', upgrade the connection to TLS
 /// 4. Return the (possibly upgraded) transport and any buffered data
+///
+/// This implementation properly handles:
+/// - Large startup messages (>8192 bytes) via read_startup_message()
+/// - TCP fragmentation (loops until complete message received)
+/// - Malformed messages (validates length bounds)
 pub async fn handle_ssl_startup(
     mut stream: TcpStream,
     sslmode: &TlsSslMode,
     tls_config: Option<Arc<ServerConfig>>,
 ) -> Result<SslStartupResult, std::io::Error> {
-    // Read the first message (at least 8 bytes for SSLRequest or StartupMessage length)
-    let mut buf = vec![0u8; 8192];
-    let n = stream.read(&mut buf).await?;
-
-    if n < 8 {
-        // Not enough data for any valid startup message
-        buf.truncate(n);
-        return Ok(SslStartupResult::NoSslRequest(stream, buf));
-    }
-
-    buf.truncate(n);
+    // Read the first message using proper framing
+    // This handles large messages and TCP fragmentation correctly
+    let buf = match read_startup_message(&mut stream).await {
+        Ok(data) => data,
+        Err(e) => {
+            warn!(error = %e, "Failed to read initial startup message");
+            return Err(std::io::Error::other(format!("Failed to read startup message: {}", e)));
+        }
+    };
 
     // Check if it's an SSL request
     if !is_ssl_request(&buf) {
@@ -83,10 +87,17 @@ pub async fn handle_ssl_startup(
             debug!("TLS disabled, declining SSLRequest");
             stream.write_all(&[SSL_RESPONSE_NO]).await?;
 
-            // Client should send StartupMessage next
-            let mut startup_buf = vec![0u8; 8192];
-            let n = stream.read(&mut startup_buf).await?;
-            startup_buf.truncate(n);
+            // Client should send StartupMessage next - read it properly
+            let startup_buf = match read_startup_message(&mut stream).await {
+                Ok(data) => data,
+                Err(e) => {
+                    warn!(error = %e, "Failed to read startup message after SSL decline");
+                    return Err(std::io::Error::other(format!(
+                        "Failed to read startup message: {}",
+                        e
+                    )));
+                }
+            };
 
             Ok(SslStartupResult::Declined(stream, startup_buf))
         }
@@ -96,9 +107,17 @@ pub async fn handle_ssl_startup(
             debug!("TLS allowed but not configured, declining SSLRequest");
             stream.write_all(&[SSL_RESPONSE_NO]).await?;
 
-            let mut startup_buf = vec![0u8; 8192];
-            let n = stream.read(&mut startup_buf).await?;
-            startup_buf.truncate(n);
+            // Read startup message properly
+            let startup_buf = match read_startup_message(&mut stream).await {
+                Ok(data) => data,
+                Err(e) => {
+                    warn!(error = %e, "Failed to read startup message after SSL decline");
+                    return Err(std::io::Error::other(format!(
+                        "Failed to read startup message: {}",
+                        e
+                    )));
+                }
+            };
 
             Ok(SslStartupResult::Declined(stream, startup_buf))
         }

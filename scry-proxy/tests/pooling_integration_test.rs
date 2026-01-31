@@ -1,7 +1,8 @@
-/// Integration tests for connection pooling with transaction-based release
-///
-/// These tests verify that connections are properly released back to the pool
-/// after transactions complete, enabling efficient connection reuse.
+#![allow(clippy::needless_return)]
+//! Integration tests for connection pooling with transaction-based release
+//!
+//! These tests verify that connections are properly released back to the pool
+//! after transactions complete, enabling efficient connection reuse.
 use scry::{config::*, observability::*, proxy::*, publisher::*};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -98,6 +99,8 @@ fn create_test_config(backend_host: String, backend_port: u16) -> Config {
             pool_queue_depth: 50,
             pool_idle_unpin_secs: 60,
             pool_lifo: true,
+            pool_reset_timeout_ms: 5000,
+            pool_ratio_warning_threshold: 20,
         },
         resilience: ResilienceConfig {
             circuit_breaker: CircuitBreakerConfig {
@@ -741,4 +744,134 @@ async fn test_prepared_statement_persists_across_transactions_hybrid() {
     assert_eq!(rows.len(), 1);
     let sum: i32 = rows[0].get(0);
     assert_eq!(sum, 2, "Prepared statement should work throughout session");
+}
+
+/// Test that pool warmup pre-creates connections
+///
+/// This test verifies that calling warmup_pools() creates the requested number
+/// of connections in the pool before accepting client connections, reducing
+/// cold-start latency.
+#[tokio::test]
+async fn test_pool_warmup_creates_connections() {
+    let docker = Cli::default();
+    let postgres_image = RunnableImage::from(Postgres::default()).with_tag("16-alpine");
+    let postgres = docker.run(postgres_image);
+
+    let postgres_port = postgres.get_host_port_ipv4(5432);
+    let postgres_host = "127.0.0.1".to_string();
+
+    sleep(Duration::from_secs(2)).await;
+
+    let mut config = create_test_config(postgres_host, postgres_port);
+    config.performance.connection_pooling = PoolingStrategy::Session;
+    config.performance.pool_size = 10;
+    config.performance.pool_min_idle = 5; // Request 5 pre-warmed connections
+
+    let test_publisher = TestPublisher::new();
+    let publisher = Arc::new(test_publisher.clone());
+
+    let batcher = EventBatcher::new(
+        publisher,
+        config.publisher.batch_size,
+        config.publisher.flush_interval_ms,
+        config.publisher.max_queue_size,
+    );
+
+    let metrics = Arc::new(ProxyMetrics::new(100, HealthConfig::default()));
+    let server =
+        ProxyServer::new(config.clone(), batcher, metrics).await.expect("Failed to create server");
+
+    // Get pool status before warmup
+    let pool_manager = server.pool_manager().expect("Pool manager should exist");
+    let status_before = pool_manager.pool().status();
+    assert_eq!(status_before.size, 0, "Pool should be empty before warmup");
+
+    // Warm up the pools
+    let min_idle = config.performance.pool_min_idle;
+    let created = server.warmup_pools(min_idle).await;
+
+    // Verify connections were created
+    assert_eq!(created, min_idle, "warmup_pools should create {} connections", min_idle);
+
+    // Verify pool status reflects the warmed-up connections
+    let status_after = pool_manager.pool().status();
+    assert!(
+        status_after.size >= min_idle,
+        "Pool should have at least {} connections after warmup, got {}",
+        min_idle,
+        status_after.size
+    );
+
+    // Verify the connections work by connecting a client
+    let proxy_port = server.local_addr().expect("Failed to get local address").port();
+
+    // Spawn server in background
+    tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    sleep(Duration::from_millis(200)).await;
+
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user={} password={} dbname={}",
+            proxy_port, config.backend.user, config.backend.password, config.backend.database
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("Failed to connect to proxy");
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("Connection error: {}", e);
+        }
+    });
+
+    // Execute a query to verify the warmed-up connection works
+    let rows = client.query("SELECT 1 as num", &[]).await.expect("Query failed");
+    assert_eq!(rows.len(), 1);
+    let num: i32 = rows[0].get(0);
+    assert_eq!(num, 1);
+}
+
+/// Test that warmup with zero min_idle is a no-op
+#[tokio::test]
+async fn test_pool_warmup_zero_is_noop() {
+    let docker = Cli::default();
+    let postgres_image = RunnableImage::from(Postgres::default()).with_tag("16-alpine");
+    let postgres = docker.run(postgres_image);
+
+    let postgres_port = postgres.get_host_port_ipv4(5432);
+    let postgres_host = "127.0.0.1".to_string();
+
+    sleep(Duration::from_secs(2)).await;
+
+    let mut config = create_test_config(postgres_host, postgres_port);
+    config.performance.connection_pooling = PoolingStrategy::Session;
+    config.performance.pool_size = 10;
+    config.performance.pool_min_idle = 0; // No warmup requested
+
+    let test_publisher = TestPublisher::new();
+    let publisher = Arc::new(test_publisher.clone());
+
+    let batcher = EventBatcher::new(
+        publisher,
+        config.publisher.batch_size,
+        config.publisher.flush_interval_ms,
+        config.publisher.max_queue_size,
+    );
+
+    let metrics = Arc::new(ProxyMetrics::new(100, HealthConfig::default()));
+    let server =
+        ProxyServer::new(config.clone(), batcher, metrics).await.expect("Failed to create server");
+
+    // Warm up with 0 should return 0
+    let created = server.warmup_pools(0).await;
+    assert_eq!(created, 0, "warmup_pools(0) should return 0");
+
+    // Pool should still be empty
+    let pool_manager = server.pool_manager().expect("Pool manager should exist");
+    let status = pool_manager.pool().status();
+    assert_eq!(status.size, 0, "Pool should be empty after warmup(0)");
 }

@@ -340,6 +340,17 @@ impl PoolManager {
         &self.pool
     }
 
+    /// Pre-warm the underlying connection pool
+    ///
+    /// # Arguments
+    /// * `count` - Number of connections to pre-create
+    ///
+    /// # Returns
+    /// The number of connections successfully created
+    pub async fn warmup(&self, count: usize) -> usize {
+        self.pool.warmup(count).await
+    }
+
     /// Get the wait queue depth
     pub fn wait_queue_depth(&self) -> usize {
         self.wait_queue.depth()

@@ -1,0 +1,26 @@
+[general]
+host = "0.0.0.0"
+port = 6433
+connect_timeout = 5000
+idle_timeout = 30000
+admin_username = "admin"
+admin_password = "admin"
+
+[pools.postgres]
+pool_mode = "transaction"
+default_role = "primary"
+query_parser_enabled = false
+query_parser_read_write_splitting = false
+primary_reads_enabled = true
+sharding_function = "pg_bigint_hash"
+prepared_statements_cache_size = 500
+
+[pools.postgres.users.0]
+username = "postgres"
+password = "postgres"
+pool_size = 250
+min_pool_size = 50
+
+[pools.postgres.shards.0]
+database = "postgres"
+servers = [["postgres", 5432, "primary"]]

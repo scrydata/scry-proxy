@@ -1,0 +1,85 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./sql:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  pgbouncer:
+    image: pgbouncer/pgbouncer:latest
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASES_HOST: postgres
+      DATABASES_PORT: 5432
+      DATABASES_USER: postgres
+      DATABASES_PASSWORD: postgres
+      DATABASES_DBNAME: postgres
+      PGBOUNCER_POOL_MODE: transaction
+      PGBOUNCER_MAX_CLIENT_CONN: 2000
+      PGBOUNCER_DEFAULT_POOL_SIZE: 250
+      PGBOUNCER_AUTH_TYPE: any
+    ports:
+      - "6432:6432"
+
+  pgcat:
+    image: ghcr.io/postgresml/pgcat:main
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "6433:6433"
+    volumes:
+      - ./pgcat/pgcat.toml:/etc/pgcat/pgcat.toml:ro
+    command: ["/usr/bin/pgcat", "/etc/pgcat/pgcat.toml"]
+
+  # Scry proxy - single service with runtime-configurable features
+  # Override with: docker compose run -e SCRY_PUBLISHER__ENABLED=true scry
+  scry:
+    build:
+      context: ../..
+      dockerfile: scry-proxy/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      SCRY_PROXY__LISTEN_ADDRESS: "0.0.0.0:5433"
+      SCRY_BACKEND__HOST: postgres
+      SCRY_BACKEND__PORT: 5432
+      SCRY_BACKEND__DATABASE: postgres
+      SCRY_BACKEND__USER: postgres
+      SCRY_BACKEND__PASSWORD: postgres
+      SCRY_BACKEND__POOL_SIZE: 250
+      SCRY_PERFORMANCE__POOL_SIZE: 250
+      SCRY_PERFORMANCE__POOL_MIN_IDLE: 50
+      # These can be overridden at runtime via docker compose run -e
+      SCRY_PUBLISHER__ENABLED: "false"
+      SCRY_PUBLISHER__ANONYMIZE: "false"
+      SCRY_PUBLISHER__PUBLISHER_TYPE: debug
+      SCRY_OBSERVABILITY__ENABLE_TRACING: "false"
+      SCRY_OBSERVABILITY__ENABLE_METRICS_SERVER: "true"
+    ports:
+      - "5434:5433"
+      - "9094:9090"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9090/health"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+networks:
+  default:
+    name: scry-bench

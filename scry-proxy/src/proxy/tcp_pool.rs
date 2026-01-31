@@ -179,6 +179,56 @@ impl TcpConnectionPool {
     pub fn protocol(&self) -> &dyn Protocol {
         self.protocol.as_ref()
     }
+
+    /// Pre-warm the pool by creating connections up to min_idle count
+    ///
+    /// This should be called after pool creation but before accepting client
+    /// connections. Connections are created in parallel for faster warmup.
+    ///
+    /// # Arguments
+    /// * `count` - Number of connections to pre-create (typically pool_min_idle)
+    ///
+    /// # Returns
+    /// The number of connections successfully created
+    pub async fn warmup(&self, count: usize) -> usize {
+        if count == 0 {
+            return 0;
+        }
+
+        info!(target_count = count, "Warming up connection pool");
+
+        // Create connections in parallel using join_all
+        let futures: Vec<_> = (0..count)
+            .map(|_| async {
+                match self.pool.get().await {
+                    Ok(conn) => {
+                        // Connection is created and will be returned to pool when dropped
+                        drop(conn);
+                        true
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Failed to create warmup connection");
+                        false
+                    }
+                }
+            })
+            .collect();
+
+        let results = futures::future::join_all(futures).await;
+        let created = results.iter().filter(|&&success| success).count();
+
+        if created < count {
+            warn!(
+                created = created,
+                target = count,
+                "Pool warmup incomplete - some connections failed"
+            );
+        } else {
+            info!(created = created, "Pool warmup complete");
+        }
+
+        created
+    }
 }
 
 /// Pool status information for monitoring/metrics
@@ -221,6 +271,9 @@ impl Manager for BackendTransportManager {
         // First, establish TCP connection
         let stream =
             TcpStream::connect(&self.backend_addr).await.context("Failed to connect to backend")?;
+
+        // Disable Nagle's algorithm for lower latency
+        stream.set_nodelay(true).context("Failed to set TCP_NODELAY on backend connection")?;
 
         debug!(backend_addr = %self.backend_addr, "TCP connection established");
 
@@ -296,13 +349,39 @@ impl Manager for BackendTransportManager {
                     }
                 }
             }
-            BackendTransport::Tls(_) => {
-                // For TLS connections, we can't easily run protocol health checks
-                // without making Protocol trait generic over AsyncRead+AsyncWrite.
-                // For now, assume TLS connections are healthy if they haven't errored.
-                // TODO: Make Protocol trait generic over AsyncRead+AsyncWrite
-                debug!("TLS connection recycled (limited health check)");
-                Ok(())
+            BackendTransport::Tls(stream) => {
+                // Health check for TLS connection
+                match self.protocol.health_check(stream.as_mut()).await {
+                    Ok(true) => debug!("TLS connection health check passed"),
+                    Ok(false) => {
+                        warn!("TLS connection failed health check, will be closed");
+                        return Err(deadpool::managed::RecycleError::Backend(anyhow::anyhow!(
+                            "TLS connection failed health check"
+                        )));
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "TLS connection health check error, will be closed");
+                        return Err(deadpool::managed::RecycleError::Backend(e));
+                    }
+                }
+
+                // Reset connection state with DISCARD ALL
+                match self.protocol.reset_connection(stream.as_mut()).await {
+                    Ok(true) => {
+                        debug!("TLS connection state reset successfully");
+                        Ok(())
+                    }
+                    Ok(false) => {
+                        debug!("TLS protocol doesn't support state reset, closing connection");
+                        Err(deadpool::managed::RecycleError::Backend(anyhow::anyhow!(
+                            "TLS protocol does not support connection reset"
+                        )))
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Failed to reset TLS connection state, will be closed");
+                        Err(deadpool::managed::RecycleError::Backend(e))
+                    }
+                }
             }
         }
     }
@@ -341,5 +420,26 @@ mod tests {
         assert_eq!(status.max_size, 10);
         assert_eq!(status.protocol, "postgres");
         assert_eq!(status.backend_addr, "localhost:5432");
+    }
+
+    #[tokio::test]
+    async fn test_warmup_zero_count() {
+        let protocol = Arc::new(PostgresProtocol::new()) as Arc<dyn Protocol>;
+        let config = ProtocolConfig {
+            host: "localhost".to_string(),
+            port: 5432,
+            database: Some("test".to_string()),
+            user: Some("postgres".to_string()),
+            password: Some("password".to_string()),
+        };
+        let tls_config = TlsConfig::default();
+
+        let pool =
+            TcpConnectionPool::new(protocol, config, &tls_config, 10, Some(0), None, None, true)
+                .unwrap();
+
+        // Warmup with 0 should return immediately
+        let created = pool.warmup(0).await;
+        assert_eq!(created, 0);
     }
 }

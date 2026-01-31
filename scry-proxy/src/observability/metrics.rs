@@ -33,6 +33,10 @@ pub struct ProxyMetrics {
     start_time: Instant,
     active_connections: Arc<AtomicUsize>,
     circuit_breaker: Arc<RwLock<Option<Arc<crate::resilience::CircuitBreaker>>>>,
+    /// Maximum connections limit (for Prometheus export)
+    max_connections: Arc<AtomicUsize>,
+    /// Counter of connections rejected due to limit
+    connections_rejected: Arc<AtomicU64>,
 }
 
 impl ProxyMetrics {
@@ -50,6 +54,8 @@ impl ProxyMetrics {
             start_time: Instant::now(),
             active_connections: Arc::new(AtomicUsize::new(0)),
             circuit_breaker: Arc::new(RwLock::new(None)),
+            max_connections: Arc::new(AtomicUsize::new(0)),
+            connections_rejected: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -107,6 +113,26 @@ impl ProxyMetrics {
     /// Get current active connection count
     pub fn get_active_connections(&self) -> usize {
         self.active_connections.load(Ordering::Relaxed)
+    }
+
+    /// Set the max connections limit (called at server startup)
+    pub fn set_max_connections(&self, max: usize) {
+        self.max_connections.store(max, Ordering::Relaxed);
+    }
+
+    /// Get max connections limit
+    pub fn get_max_connections(&self) -> usize {
+        self.max_connections.load(Ordering::Relaxed)
+    }
+
+    /// Record a rejected connection (over limit)
+    pub fn record_connection_rejected(&self) {
+        self.connections_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Get total rejected connections count
+    pub fn get_connections_rejected(&self) -> u64 {
+        self.connections_rejected.load(Ordering::Relaxed)
     }
 
     /// Run health check (called periodically from background task)
@@ -301,6 +327,8 @@ pub struct PoolMetrics {
     // New pooling metrics - gauges
     pinned: AtomicUsize,
     queue_depth: AtomicUsize,
+    /// Maximum queue depth (from configuration)
+    max_queue_depth: AtomicUsize,
 
     // New pooling metrics - counters
     queue_rejected_total: AtomicU64,
@@ -324,6 +352,7 @@ impl PoolMetrics {
             max_size: AtomicUsize::new(0),
             pinned: AtomicUsize::new(0),
             queue_depth: AtomicUsize::new(0),
+            max_queue_depth: AtomicUsize::new(0),
             queue_rejected_total: AtomicU64::new(0),
             pin_prepared_statement: AtomicU64::new(0),
             pin_session_variable: AtomicU64::new(0),
@@ -404,6 +433,27 @@ impl PoolMetrics {
     /// Get current queue depth
     pub fn get_queue_depth(&self) -> usize {
         self.queue_depth.load(Ordering::Relaxed)
+    }
+
+    /// Set the maximum queue depth (from configuration)
+    pub fn set_max_queue_depth(&self, max: usize) {
+        self.max_queue_depth.store(max, Ordering::Relaxed);
+    }
+
+    /// Get the maximum queue depth
+    pub fn get_max_queue_depth(&self) -> usize {
+        self.max_queue_depth.load(Ordering::Relaxed)
+    }
+
+    /// Get queue saturation ratio (0.0 - 1.0)
+    /// Returns 0.0 if max_queue_depth is 0 (unlimited)
+    pub fn get_queue_saturation(&self) -> f64 {
+        let max = self.max_queue_depth.load(Ordering::Relaxed);
+        if max == 0 {
+            return 0.0;
+        }
+        let current = self.queue_depth.load(Ordering::Relaxed);
+        (current as f64 / max as f64).min(1.0)
     }
 
     /// Get pin reason counts

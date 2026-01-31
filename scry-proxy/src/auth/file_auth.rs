@@ -22,21 +22,18 @@ pub struct FileAuthenticator {
 impl FileAuthenticator {
     /// Create a new empty authenticator
     pub fn new() -> Self {
-        Self {
-            users: HashMap::new(),
-        }
+        Self { users: HashMap::new() }
     }
 
     /// Load credentials from a file
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, AuthError> {
-        let content = std::fs::read_to_string(path.as_ref())
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    AuthError::AuthFileNotFound(path.as_ref().display().to_string())
-                } else {
-                    AuthError::AuthFileReadError(e)
-                }
-            })?;
+        let content = std::fs::read_to_string(path.as_ref()).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                AuthError::AuthFileNotFound(path.as_ref().display().to_string())
+            } else {
+                AuthError::AuthFileReadError(e)
+            }
+        })?;
         Self::from_string(&content)
     }
 

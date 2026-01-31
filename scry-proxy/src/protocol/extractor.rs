@@ -38,18 +38,44 @@ impl MessageExtractor {
 
     /// Check if the data indicates a query is complete
     ///
-    /// Looks for CommandComplete or ReadyForQuery messages
+    /// Looks for CommandComplete ('C') or ReadyForQuery ('Z') messages
+    /// using proper PostgreSQL message framing. Only checks message type
+    /// bytes at actual message boundaries, not raw bytes in the stream.
+    ///
+    /// This prevents false positives from binary data containing 0x43 ('C')
+    /// or 0x5A ('Z') bytes in query results or error messages.
     pub fn is_query_complete(&self, data: &[u8]) -> bool {
         if data.is_empty() {
             return false;
         }
 
-        // Look for CommandComplete (C) or ReadyForQuery (Z) message
-        for &msg_type in data {
+        let mut offset = 0;
+
+        while offset + 5 <= data.len() {
+            let msg_type = data[offset];
+
+            // Check if this is a completion message
             if msg_type == MSG_COMMAND_COMPLETE || msg_type == MSG_READY_FOR_QUERY {
                 trace!(msg_type = msg_type, "Found query completion marker");
                 return true;
             }
+
+            // Read the length field to skip to next message
+            let length = i32::from_be_bytes([
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+                data[offset + 4],
+            ]) as usize;
+
+            // Validate length field
+            if length < 4 || offset + 1 + length > data.len() {
+                // Invalid or incomplete message, stop scanning
+                break;
+            }
+
+            // Advance to next message
+            offset += 1 + length;
         }
 
         false
@@ -486,6 +512,20 @@ impl MessageExtractor {
 
         last_status
     }
+
+    /// Check if the data contains a properly-framed ReadyForQuery message
+    ///
+    /// Unlike raw byte search (e.g., `data.contains(&b'Z')`), this method
+    /// correctly parses PostgreSQL message frames and only returns true
+    /// when a valid ReadyForQuery message is found at a message boundary.
+    ///
+    /// This prevents false positives from:
+    /// - Binary data in query results containing byte 0x5A
+    /// - Error messages containing the letter 'Z'
+    /// - Parameter data with the 'Z' byte
+    pub fn contains_ready_for_query(&self, data: &[u8]) -> bool {
+        self.extract_ready_for_query(data).is_some()
+    }
 }
 
 impl Default for MessageExtractor {
@@ -804,5 +844,92 @@ mod tests {
         let result = extractor.extract_ready_for_query(&msg);
         // Should return 'E' (the LAST), not 'T'
         assert_eq!(result, Some(b'E'));
+    }
+
+    #[test]
+    fn test_contains_ready_for_query_true() {
+        let extractor = MessageExtractor::new();
+        // Valid ReadyForQuery message: 'Z' + length(5) + status('I')
+        let msg = vec![MSG_READY_FOR_QUERY, 0, 0, 0, 5, b'I'];
+        assert!(extractor.contains_ready_for_query(&msg));
+    }
+
+    #[test]
+    fn test_contains_ready_for_query_false_for_z_in_data() {
+        let extractor = MessageExtractor::new();
+        // DataRow containing 'Z' byte in payload - should NOT match
+        // DataRow: 'D' + length + column_count + column_data
+        let mut msg = vec![MSG_DATA_ROW, 0, 0, 0, 11]; // length = 11
+        msg.extend_from_slice(&[0, 1]); // 1 column
+        msg.extend_from_slice(&[0, 0, 0, 1]); // column length = 1
+        msg.push(b'Z'); // 'Z' as data value, not message type
+        assert!(!extractor.contains_ready_for_query(&msg));
+    }
+
+    #[test]
+    fn test_contains_ready_for_query_in_stream() {
+        let extractor = MessageExtractor::new();
+        // DataRow + CommandComplete + ReadyForQuery
+        let mut msg = vec![];
+        // DataRow with 'Z' in data
+        msg.extend_from_slice(&[MSG_DATA_ROW, 0, 0, 0, 11]);
+        msg.extend_from_slice(&[0, 1, 0, 0, 0, 1, b'Z']);
+        // CommandComplete
+        msg.extend_from_slice(&[MSG_COMMAND_COMPLETE, 0, 0, 0, 13]);
+        msg.extend_from_slice(b"SELECT 1\0");
+        // ReadyForQuery
+        msg.extend_from_slice(&[MSG_READY_FOR_QUERY, 0, 0, 0, 5, b'I']);
+
+        assert!(extractor.contains_ready_for_query(&msg));
+    }
+
+    #[test]
+    fn test_contains_ready_for_query_incomplete_message() {
+        let extractor = MessageExtractor::new();
+        // Incomplete ReadyForQuery (missing status byte)
+        let msg = vec![MSG_READY_FOR_QUERY, 0, 0, 0, 5];
+        assert!(!extractor.contains_ready_for_query(&msg));
+    }
+
+    #[test]
+    fn test_is_query_complete_false_for_c_in_data() {
+        let extractor = MessageExtractor::new();
+        // DataRow containing 'C' byte in payload - should NOT match
+        let mut msg = vec![MSG_DATA_ROW, 0, 0, 0, 11];
+        msg.extend_from_slice(&[0, 1]); // 1 column
+        msg.extend_from_slice(&[0, 0, 0, 1]); // column length = 1
+        msg.push(b'C'); // 'C' as data value, not CommandComplete
+        assert!(!extractor.is_query_complete(&msg));
+    }
+
+    #[test]
+    fn test_is_query_complete_true_for_command_complete() {
+        let extractor = MessageExtractor::new();
+        // Valid CommandComplete message
+        let mut msg = vec![MSG_COMMAND_COMPLETE, 0, 0, 0, 13];
+        msg.extend_from_slice(b"SELECT 1\0");
+        assert!(extractor.is_query_complete(&msg));
+    }
+
+    #[test]
+    fn test_is_query_complete_true_for_ready_for_query() {
+        let extractor = MessageExtractor::new();
+        let msg = vec![MSG_READY_FOR_QUERY, 0, 0, 0, 5, b'I'];
+        assert!(extractor.is_query_complete(&msg));
+    }
+
+    #[test]
+    fn test_is_query_complete_after_data_rows() {
+        let extractor = MessageExtractor::new();
+        // DataRow with 'C' in data + actual CommandComplete
+        let mut msg = vec![];
+        // DataRow containing 'C'
+        msg.extend_from_slice(&[MSG_DATA_ROW, 0, 0, 0, 11]);
+        msg.extend_from_slice(&[0, 1, 0, 0, 0, 1, b'C']);
+        // CommandComplete
+        msg.extend_from_slice(&[MSG_COMMAND_COMPLETE, 0, 0, 0, 13]);
+        msg.extend_from_slice(b"SELECT 1\0");
+
+        assert!(extractor.is_query_complete(&msg));
     }
 }

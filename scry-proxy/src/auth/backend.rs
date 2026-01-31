@@ -5,8 +5,8 @@
 
 use super::scram::ScramClient;
 use crate::protocol::{
-    build_password_message, build_sasl_initial_response, build_sasl_response,
-    compute_md5_response, AuthRequest,
+    build_password_message, build_sasl_initial_response, build_sasl_response, compute_md5_response,
+    AuthRequest,
 };
 use anyhow::{Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -31,11 +31,7 @@ impl BackendAuthenticator {
     ///
     /// The buffer should contain any already-read data from the backend.
     /// Any non-auth messages at the end will be left in the returned buffer.
-    pub async fn authenticate<S>(
-        &self,
-        stream: &mut S,
-        initial_data: &[u8],
-    ) -> Result<Vec<u8>>
+    pub async fn authenticate<S>(&self, stream: &mut S, initial_data: &[u8]) -> Result<Vec<u8>>
     where
         S: AsyncReadExt + AsyncWriteExt + Unpin,
     {
@@ -50,7 +46,9 @@ impl BackendAuthenticator {
                     Some((req, len)) => (req, len),
                     None => {
                         // Need more data
-                        let n = stream.read(&mut buffer).await
+                        let n = stream
+                            .read(&mut buffer)
+                            .await
                             .context("Failed to read from backend")?;
                         if n == 0 {
                             anyhow::bail!("Backend closed connection during authentication");
@@ -61,8 +59,7 @@ impl BackendAuthenticator {
                 }
             } else {
                 // No pending data, read from stream
-                let n = stream.read(&mut buffer).await
-                    .context("Failed to read from backend")?;
+                let n = stream.read(&mut buffer).await.context("Failed to read from backend")?;
                 if n == 0 {
                     anyhow::bail!("Backend closed connection during authentication");
                 }
@@ -83,15 +80,13 @@ impl BackendAuthenticator {
 
                 AuthRequest::CleartextPassword => {
                     let msg = build_password_message(&self.password);
-                    stream.write_all(&msg).await
-                        .context("Failed to send cleartext password")?;
+                    stream.write_all(&msg).await.context("Failed to send cleartext password")?;
                 }
 
                 AuthRequest::Md5 { salt } => {
                     let response = compute_md5_response(&self.password, &self.username, &salt);
                     let msg = build_password_message(&response);
-                    stream.write_all(&msg).await
-                        .context("Failed to send MD5 password")?;
+                    stream.write_all(&msg).await.context("Failed to send MD5 password")?;
                 }
 
                 AuthRequest::Sasl { mechanisms } => {
@@ -105,27 +100,29 @@ impl BackendAuthenticator {
                     let mut client = ScramClient::new(&self.username, &self.password);
                     let client_first = client.client_first();
                     let msg = build_sasl_initial_response("SCRAM-SHA-256", &client_first);
-                    stream.write_all(&msg).await
-                        .context("Failed to send SASL initial response")?;
+                    stream.write_all(&msg).await.context("Failed to send SASL initial response")?;
                     scram_client = Some(client);
                 }
 
                 AuthRequest::SaslContinue { data } => {
-                    let client = scram_client.as_mut()
-                        .ok_or_else(|| anyhow::anyhow!("Received SASLContinue without SASL init"))?;
+                    let client = scram_client.as_mut().ok_or_else(|| {
+                        anyhow::anyhow!("Received SASLContinue without SASL init")
+                    })?;
 
-                    let client_final = client.client_final(&data)
+                    let client_final = client
+                        .client_final(&data)
                         .context("Failed to process SCRAM server-first")?;
                     let msg = build_sasl_response(&client_final);
-                    stream.write_all(&msg).await
-                        .context("Failed to send SASL response")?;
+                    stream.write_all(&msg).await.context("Failed to send SASL response")?;
                 }
 
                 AuthRequest::SaslFinal { data } => {
-                    let client = scram_client.as_ref()
+                    let client = scram_client
+                        .as_ref()
                         .ok_or_else(|| anyhow::anyhow!("Received SASLFinal without SASL init"))?;
 
-                    client.verify_server_final(&data)
+                    client
+                        .verify_server_final(&data)
                         .context("SCRAM server signature verification failed")?;
 
                     debug!("SCRAM-SHA-256 authentication successful");

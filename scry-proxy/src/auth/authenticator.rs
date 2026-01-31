@@ -65,12 +65,13 @@ impl Authenticator {
             self.read_startup(client).await?
         } else {
             // Plain TCP case: startup was buffered during SSL handshake
-            let startup = StartupMessage::parse(startup_data)
-                .context("Failed to parse startup message")?;
+            let startup =
+                StartupMessage::parse(startup_data).context("Failed to parse startup message")?;
             (startup, startup_data.to_vec())
         };
 
-        let username = startup.user()
+        let username = startup
+            .user()
             .ok_or_else(|| anyhow::anyhow!("Startup message missing user parameter"))?
             .to_string();
         let database = startup.database().map(|s| s.to_string());
@@ -130,18 +131,20 @@ impl Authenticator {
     }
 
     /// Read startup message from client
-    async fn read_startup(&self, client: &mut ClientTransport) -> Result<(StartupMessage, Vec<u8>)> {
-        let mut buf = vec![0u8; 8192];
-        let n = client.read(&mut buf).await.context("Failed to read startup message")?;
+    ///
+    /// Uses proper message framing to handle:
+    /// - Large startup messages (>8192 bytes)
+    /// - TCP fragmentation
+    /// - Malformed length fields
+    async fn read_startup(
+        &self,
+        client: &mut ClientTransport,
+    ) -> Result<(StartupMessage, Vec<u8>)> {
+        use crate::protocol::read_startup_message;
 
-        if n < 8 {
-            anyhow::bail!("Startup message too short: {} bytes", n);
-        }
+        let buf = read_startup_message(client).await.context("Failed to read startup message")?;
 
-        buf.truncate(n);
-
-        let startup = StartupMessage::parse(&buf)
-            .context("Failed to parse startup message")?;
+        let startup = StartupMessage::parse(&buf).context("Failed to parse startup message")?;
 
         Ok((startup, buf))
     }
@@ -155,7 +158,9 @@ impl Authenticator {
         database: Option<String>,
         _original_startup: Vec<u8>,
     ) -> Result<AuthHandshakeResult> {
-        let file_auth = self.file_auth.as_ref()
+        let file_auth = self
+            .file_auth
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("MD5 auth enabled but no auth_file configured"))?;
 
         // Check if user exists in auth file
@@ -185,8 +190,9 @@ impl Authenticator {
         debug!(username = %username, "Received password response from client");
 
         // Get stored password from auth file
-        let stored_password = file_auth.get_password(username)
-            .ok_or_else(|| anyhow::anyhow!("Cannot verify MD5 auth without plain password in auth_file"))?;
+        let stored_password = file_auth.get_password(username).ok_or_else(|| {
+            anyhow::anyhow!("Cannot verify MD5 auth without plain password in auth_file")
+        })?;
 
         // Verify MD5 response
         if !verify_md5_response(&client_password, stored_password, username, &salt) {
@@ -215,7 +221,8 @@ impl Authenticator {
         let backend_database = &self.config.backend.database;
 
         // Collect extra parameters from client (excluding user/database)
-        let extra_params: Vec<(&str, &str)> = client_startup.parameters
+        let extra_params: Vec<(&str, &str)> = client_startup
+            .parameters
             .iter()
             .filter(|(k, _)| k.as_str() != "user" && k.as_str() != "database")
             .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -278,11 +285,8 @@ mod tests {
         let auth = Authenticator::new(config, None);
 
         // Create a client startup message
-        let client_startup_bytes = StartupMessage::build(
-            "client_user",
-            "client_db",
-            &[("application_name", "test_app")],
-        );
+        let client_startup_bytes =
+            StartupMessage::build("client_user", "client_db", &[("application_name", "test_app")]);
         let client_startup = StartupMessage::parse(&client_startup_bytes).unwrap();
 
         // Build backend startup

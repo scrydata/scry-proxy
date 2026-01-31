@@ -8,6 +8,7 @@ use scry::proxy::{EventBatcher, ProxyServer};
 use scry::publisher::{DebugLoggerPublisher, EventPublisher};
 use scry::tls::{load_server_tls_config, upgrade_backend_to_tls};
 use std::sync::Arc;
+use std::time::Duration as StdDuration;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -118,6 +119,8 @@ fn create_minimal_config() -> Config {
             pool_queue_depth: 50,
             pool_idle_unpin_secs: 60,
             pool_lifo: true,
+            pool_reset_timeout_ms: 5000,
+            pool_ratio_warning_threshold: 20,
         },
         resilience: ResilienceConfig {
             circuit_breaker: CircuitBreakerConfig {
@@ -419,4 +422,160 @@ async fn test_backend_tls_disable_skips_negotiation() {
     }
 
     backend_task.await.unwrap();
+}
+
+// =============================================================================
+// TLS Connection State Isolation Tests
+// =============================================================================
+
+/// Test that TLS connections are properly reset between clients
+///
+/// This verifies CRIT-2: TLS Connections Skip State Reset is fixed.
+///
+/// Test scenario:
+/// 1. Client A creates a prepared statement
+/// 2. Client A disconnects (connection returns to pool)
+/// 3. Client B connects (gets same pooled connection)
+/// 4. Client B should NOT see Client A's prepared statement
+#[tokio::test]
+#[ignore] // Requires TLS-enabled Postgres backend
+async fn test_tls_connection_state_isolation() {
+    // This test requires:
+    // 1. A TLS-enabled PostgreSQL backend
+    // 2. The proxy configured with server_tls_sslmode = require
+    //
+    // Skip if not configured
+    let scry_tls_url = match std::env::var("SCRY_TLS_TEST_URL") {
+        Ok(url) => url,
+        Err(_) => {
+            eprintln!("Skipping test: SCRY_TLS_TEST_URL not set");
+            eprintln!("Set to a TLS-enabled Scry proxy URL to run this test");
+            return;
+        }
+    };
+
+    if scry_tls_url.is_empty() {
+        eprintln!("Skipping test: SCRY_TLS_TEST_URL is empty");
+        return;
+    }
+
+    // Use native-tls for the test client
+    let connector = native_tls::TlsConnector::builder()
+        .danger_accept_invalid_certs(true) // For self-signed test certs
+        .build()
+        .expect("Failed to create TLS connector");
+    let connector = postgres_native_tls::MakeTlsConnector::new(connector);
+
+    // Client A: Create prepared statement
+    {
+        let (client, connection) = tokio_postgres::connect(&scry_tls_url, connector.clone())
+            .await
+            .expect("Client A failed to connect");
+
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                eprintln!("Client A connection error: {}", e);
+            }
+        });
+
+        // Create a named prepared statement
+        client
+            .execute("PREPARE client_a_stmt AS SELECT 42", &[])
+            .await
+            .expect("Failed to create prepared statement");
+
+        // Verify it exists
+        let result = client
+            .query_one("EXECUTE client_a_stmt", &[])
+            .await
+            .expect("Failed to execute prepared statement");
+        assert_eq!(result.get::<_, i32>(0), 42);
+
+        // Client A disconnects - connection returns to pool
+        drop(client);
+    }
+
+    // Small delay to ensure connection is recycled
+    tokio::time::sleep(StdDuration::from_millis(100)).await;
+
+    // Client B: Should NOT see Client A's prepared statement
+    {
+        let (client, connection) = tokio_postgres::connect(&scry_tls_url, connector)
+            .await
+            .expect("Client B failed to connect");
+
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                eprintln!("Client B connection error: {}", e);
+            }
+        });
+
+        // Try to execute Client A's prepared statement - should fail
+        let result = client.query("EXECUTE client_a_stmt", &[]).await;
+
+        match result {
+            Err(e) => {
+                // Expected: prepared statement doesn't exist
+                let err_msg = e.to_string();
+                assert!(
+                    err_msg.contains("client_a_stmt")
+                        && (err_msg.contains("does not exist") || err_msg.contains("not found")),
+                    "Expected 'prepared statement does not exist', got: {}",
+                    err_msg
+                );
+            }
+            Ok(_) => {
+                panic!(
+                    "CRIT-2 REGRESSION: Client B could execute Client A's prepared statement! \
+                     TLS connection state was NOT reset properly."
+                );
+            }
+        }
+    }
+}
+
+/// Test that TLS connection health checks work
+#[tokio::test]
+#[ignore] // Requires TLS-enabled Postgres backend
+async fn test_tls_connection_health_check() {
+    let scry_tls_url = match std::env::var("SCRY_TLS_TEST_URL") {
+        Ok(url) => url,
+        Err(_) => {
+            eprintln!("Skipping test: SCRY_TLS_TEST_URL not set");
+            return;
+        }
+    };
+
+    if scry_tls_url.is_empty() {
+        eprintln!("Skipping test: SCRY_TLS_TEST_URL is empty");
+        return;
+    }
+
+    let connector = native_tls::TlsConnector::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("Failed to create TLS connector");
+    let connector = postgres_native_tls::MakeTlsConnector::new(connector);
+
+    // Make multiple connections to exercise the pool
+    for i in 0..5 {
+        let (client, connection) = tokio_postgres::connect(&scry_tls_url, connector.clone())
+            .await
+            .unwrap_or_else(|e| panic!("Connection {} failed: {}", i, e));
+
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        // Simple query to verify connection works
+        let result = client
+            .query_one("SELECT 1", &[])
+            .await
+            .unwrap_or_else(|e| panic!("Query {} failed: {}", i, e));
+        assert_eq!(result.get::<_, i32>(0), 1);
+
+        drop(client);
+    }
+
+    // If we get here without errors, health checks are working
 }

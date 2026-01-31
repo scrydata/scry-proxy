@@ -11,6 +11,19 @@ async fn main() -> Result<()> {
     // Initialize tracing/observability with config
     observability::init(&config.observability)?;
 
+    // Validate configuration and log warnings
+    match config.validate() {
+        Ok(warnings) => {
+            for warning in warnings {
+                tracing::warn!("{}", warning);
+            }
+        }
+        Err(e) => {
+            tracing::error!("Configuration validation failed: {}", e);
+            return Err(e);
+        }
+    }
+
     tracing::info!("Starting Scry transparent SQL proxy");
     tracing::info!(
         listen_address = %config.proxy.listen_address,

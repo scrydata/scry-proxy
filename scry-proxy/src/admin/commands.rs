@@ -91,10 +91,7 @@ pub struct AdminConsole {
 impl AdminConsole {
     /// Create a new admin console
     pub fn new(pool_manager: Option<Arc<PoolManager>>, metrics: Arc<ProxyMetrics>) -> Self {
-        Self {
-            pool_manager,
-            metrics,
-        }
+        Self { pool_manager, metrics }
     }
 
     /// Check if an SQL command is an admin command
@@ -110,8 +107,15 @@ impl AdminConsole {
             let keyword = rest.split_whitespace().next().unwrap_or("");
             return matches!(
                 keyword,
-                "POOLS" | "STATS" | "STATS_TOTALS" | "STATS_AVERAGES"
-                | "DATABASES" | "CLIENTS" | "SERVERS" | "VERSION" | "CONFIG"
+                "POOLS"
+                    | "STATS"
+                    | "STATS_TOTALS"
+                    | "STATS_AVERAGES"
+                    | "DATABASES"
+                    | "CLIENTS"
+                    | "SERVERS"
+                    | "VERSION"
+                    | "CONFIG"
             );
         }
 
@@ -197,21 +201,21 @@ impl AdminConsole {
         let total_time_us = (latency.mean_micros * total_queries as f64) as u64;
 
         let rows = vec![vec![
-            "default".to_string(),                    // database
-            total_queries.to_string(),                // total_xact_count
-            total_queries.to_string(),                // total_query_count
-            "0".to_string(),                          // total_received
-            "0".to_string(),                          // total_sent
-            total_time_us.to_string(),                // total_xact_time
-            total_time_us.to_string(),                // total_query_time
-            "0".to_string(),                          // total_wait_time
-            avg_queries_per_sec.to_string(),          // avg_xact_count
-            avg_queries_per_sec.to_string(),          // avg_query_count
-            "0".to_string(),                          // avg_recv
-            "0".to_string(),                          // avg_sent
-            latency.mean_micros.round().to_string(),  // avg_xact_time
-            latency.mean_micros.round().to_string(),  // avg_query_time
-            "0".to_string(),                          // avg_wait_time
+            "default".to_string(),                   // database
+            total_queries.to_string(),               // total_xact_count
+            total_queries.to_string(),               // total_query_count
+            "0".to_string(),                         // total_received
+            "0".to_string(),                         // total_sent
+            total_time_us.to_string(),               // total_xact_time
+            total_time_us.to_string(),               // total_query_time
+            "0".to_string(),                         // total_wait_time
+            avg_queries_per_sec.to_string(),         // avg_xact_count
+            avg_queries_per_sec.to_string(),         // avg_query_count
+            "0".to_string(),                         // avg_recv
+            "0".to_string(),                         // avg_sent
+            latency.mean_micros.round().to_string(), // avg_xact_time
+            latency.mean_micros.round().to_string(), // avg_query_time
+            "0".to_string(),                         // avg_wait_time
         ]];
 
         Ok(AdminResponse::RowSet {
@@ -239,18 +243,18 @@ impl AdminConsole {
     fn show_databases(&self) -> Result<AdminResponse> {
         // For now, just show the default database
         let rows = vec![vec![
-            "default".to_string(),  // name
-            "localhost".to_string(), // host
-            "5432".to_string(),     // port
-            "postgres".to_string(), // database
-            "".to_string(),         // force_user
-            "10".to_string(),       // pool_size
-            "0".to_string(),        // reserve_pool
+            "default".to_string(),     // name
+            "localhost".to_string(),   // host
+            "5432".to_string(),        // port
+            "postgres".to_string(),    // database
+            "".to_string(),            // force_user
+            "10".to_string(),          // pool_size
+            "0".to_string(),           // reserve_pool
             "transaction".to_string(), // pool_mode
-            "0".to_string(),        // max_connections
-            "0".to_string(),        // current_connections
-            "0".to_string(),        // paused
-            "0".to_string(),        // disabled
+            "0".to_string(),           // max_connections
+            "0".to_string(),           // current_connections
+            "0".to_string(),           // paused
+            "0".to_string(),           // disabled
         ]];
 
         Ok(AdminResponse::RowSet {
@@ -342,9 +346,24 @@ impl AdminConsole {
                 "changeable".to_string(),
             ],
             rows: vec![
-                vec!["pool_mode".to_string(), "transaction".to_string(), "transaction".to_string(), "yes".to_string()],
-                vec!["max_client_conn".to_string(), "100".to_string(), "100".to_string(), "yes".to_string()],
-                vec!["default_pool_size".to_string(), "10".to_string(), "10".to_string(), "yes".to_string()],
+                vec![
+                    "pool_mode".to_string(),
+                    "transaction".to_string(),
+                    "transaction".to_string(),
+                    "yes".to_string(),
+                ],
+                vec![
+                    "max_client_conn".to_string(),
+                    "100".to_string(),
+                    "100".to_string(),
+                    "yes".to_string(),
+                ],
+                vec![
+                    "default_pool_size".to_string(),
+                    "10".to_string(),
+                    "10".to_string(),
+                    "yes".to_string(),
+                ],
             ],
         })
     }
