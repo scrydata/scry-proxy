@@ -2,8 +2,8 @@
 #
 # Multi-stage build for the scry-proxy binary
 #
-# Build from parent directory to include scry-protocol:
-#   docker build -t scry-proxy -f scry-proxy/Dockerfile .
+# Build:
+#   docker build -t scry-proxy .
 
 FROM rust:1.85-bookworm AS builder
 
@@ -15,19 +15,14 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Copy scry-protocol first (dependency)
-COPY scry-protocol /scry-protocol
-
 # Copy workspace root files
-COPY scry-proxy/Cargo.toml scry-proxy/Cargo.lock ./
+COPY Cargo.toml Cargo.lock ./
 
 # Copy the scry-proxy crate
-COPY scry-proxy/scry-proxy ./scry-proxy
+COPY scry-proxy ./scry-proxy
 
-# Update the crate's Cargo.toml to use absolute path for scry-protocol
-# The dependency is in scry-proxy/Cargo.toml (the crate, not workspace root)
-RUN sed -i 's|path = "../../scry-protocol"|path = "/scry-protocol"|g' scry-proxy/Cargo.toml && \
-    sed -i 's|members = \["scry-proxy", "benchmarks"\]|members = ["scry-proxy"]|g' Cargo.toml
+# Exclude benchmarks from workspace for Docker build
+RUN sed -i 's|members = \["scry-proxy", "benchmarks"\]|members = ["scry-proxy"]|g' Cargo.toml
 
 # Build release binary
 RUN cargo build --release --package scry

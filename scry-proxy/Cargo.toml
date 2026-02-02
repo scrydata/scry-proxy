@@ -11,8 +11,8 @@ name = "scry"
 path = "src/main.rs"
 
 [dependencies]
-# Protocol dependency (external sibling repository)
-scry-protocol = { path = "../../scry-protocol" }
+# Protocol dependency (published on crates.io)
+scry-protocol = "0.1.0"
 
 # Async runtime
 tokio = { workspace = true }
