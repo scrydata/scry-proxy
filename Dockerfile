@@ -16,7 +16,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # Copy workspace root files
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml ./
 
 # Copy the scry-proxy crate
 COPY scry-proxy ./scry-proxy
