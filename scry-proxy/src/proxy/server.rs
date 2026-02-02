@@ -860,7 +860,7 @@ impl ProxyServer {
                 }
 
                 let remaining = connection_tasks.len();
-                if remaining.is_multiple_of(10) || remaining < 10 {
+                if remaining % 10 == 0 || remaining < 10 {
                     info!(
                         remaining_connections = remaining,
                         elapsed_secs = drain_start.elapsed().as_secs(),
