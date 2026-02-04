@@ -20,6 +20,7 @@
 benchmarks/profiles/*.svg
 benchmarks/profiles/*.data
 benchmarks/profiles/perf.*
+benchmarks/results/
 
 # Environment
 .env

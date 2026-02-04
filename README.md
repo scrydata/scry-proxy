@@ -11,9 +11,9 @@ Scry is a modern alternative to traditional connection poolers like PgBouncer, a
 This repository is organized as a Cargo workspace:
 
 - **`scry-proxy/`** - Main proxy server implementation
-- **`scry-protocol/`** - Standalone event protocol library
+- **`benchmarks/`** - Performance benchmarking suite
 
-The protocol library (`scry-protocol`) is published separately and can be used by analytics services, monitoring dashboards, or any tool that needs to serialize/deserialize Scry query events. It provides types, FlexBuffers serialization, and the canonical FlatBuffers schema.
+The event protocol library ([`scry-protocol`](https://crates.io/crates/scry-protocol)) is published as a standalone crate on crates.io. It can be used independently by analytics services, monitoring dashboards, or any tool that needs to serialize/deserialize Scry query events.
 
 ## Features
 
@@ -181,22 +181,6 @@ Scry is designed for production workloads with strict performance requirements:
 - **Lock-Free**: Circuit breaker and metrics use atomic operations
 - **Async Throughout**: Tokio-based async runtime for maximum concurrency
 - **Best-Effort Publishing**: Events published asynchronously, never block queries
-
-## Current Status
-
-Scry is feature-complete with comprehensive test coverage:
-
-- ✅ Full Postgres wire protocol support (simple and extended)
-- ✅ Production-ready resilience features (circuit breaker, retries, health checks)
-- ✅ Connection pooling with deadpool integration
-- ✅ TLS/SSL support for client and backend connections
-- ✅ Query anonymization with value fingerprinting
-- ✅ HTTP event publisher with FlexBuffers
-- ✅ Prometheus metrics endpoint
-- ✅ 50+ integration tests with real Postgres instances
-- ✅ Graceful shutdown and signal handling
-
-See [CLAUDE.md](CLAUDE.md) for implementation details and architecture decisions.
 
 ## License
 
