@@ -49,8 +49,8 @@ services:
   # Override with: docker compose run -e SCRY_PUBLISHER__ENABLED=true scry
   scry:
     build:
-      context: ../..
-      dockerfile: scry-proxy/Dockerfile
+      context: ..
+      dockerfile: Dockerfile
     depends_on:
       postgres:
         condition: service_healthy
