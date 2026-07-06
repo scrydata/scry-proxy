@@ -118,10 +118,12 @@ Each pillar contributes exit criteria to each gate it appears in. A pillar's gua
 | P3 Reliability | — | Contracts + fault-injection guardrail | Validate under load |
 | P4 Operability | Admin-auth stub, config validation | Functional admin commands, docs/code drift guardrail | — |
 | P5 Performance | Budget gate as non-blocking signal | — | Enforced budget + soak/load |
-| P6 Compatibility | — | `scry-protocol` policy + semver-checks, pgbouncer corpus | Postgres version matrix |
+| P6 Compatibility | **Schema-version field** (envelope only, to carry P1's schema change) | `scry-protocol` policy + semver-checks, pgbouncer corpus | Postgres version matrix |
 | P7 Supply-chain | Clear advisories, digest/action pinning | — | Signing, SBOM, reproducible builds |
 
 **Gate exits:** Phase 1 — no fail-open paths, `cargo audit` clean. Phase 2 — every advertised feature works and is guarded. Phase 3 — measured against the latency budget under load; GA-signable.
+
+**Cross-pillar sequencing — P1 ↔ P6.** P1's Phase-1 anonymization work changes the published event schema (normalized-only `query`, redacted `params`), but the versioning mechanism that makes a schema change safe for consumers lives in P6. The resolution: pull the **minimal `scry-protocol` schema-version field** (P6 §4.1) forward into Phase 1 so P1's schema change ships inside a versioned envelope. The rest of P6's contract work stays in Phase 2. This is the one place the phase ordering requires an explicit early hand-off between pillars; it is reflected in the P6 row above and detailed in P1 §8 / P6 §8.
 
 ---
 
