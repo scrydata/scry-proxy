@@ -457,6 +457,7 @@ mod tests {
                 None, // circuit_breaker
                 None, // retry_config
                 lifo, // lifo
+                5000, // connect_timeout_ms
             )
             .expect("Failed to create pool"),
         )

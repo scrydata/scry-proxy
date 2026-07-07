@@ -191,6 +191,9 @@ impl ProxyServer {
                 "Creating connection pools"
             );
 
+            // Backend connect+TLS timeout, shared by every pool.
+            let connect_timeout_ms = config.backend.connection_timeout_ms;
+
             // Helper to create a pool manager for a database config
             let create_pool_manager =
                 |db_config: &DatabaseConfig,
@@ -220,6 +223,7 @@ impl ProxyServer {
                         circuit_breaker.clone(),
                         retry_config.clone(),
                         perf_config.pool_lifo,
+                        connect_timeout_ms,
                     )
                     .context(format!("Failed to create pool for database '{}'", db_config.name))?;
 

@@ -182,6 +182,12 @@ Retry logic applies to **connection failures only**:
 - Query syntax error
 - Permission denied
 - Circuit breaker open (fail fast)
+- Pool closed or misconfiguration (permanent — fail fast)
+
+Retries wrap **connection acquisition only** — never query execution — so no
+query (idempotent or not) is ever replayed. An explicit classifier decides
+retryability: transient backend/transport failures and acquisition timeouts are
+retried; permanent errors (closed pool, runtime/configuration errors) are not.
 
 ## Feature Integration
 

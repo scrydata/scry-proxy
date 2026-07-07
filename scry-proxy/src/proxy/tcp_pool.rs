@@ -10,9 +10,10 @@ use crate::resilience::{CircuitBreaker, RetryStrategy};
 use crate::tls::{load_server_tls_config, upgrade_backend_to_tls, BackendTransport};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use deadpool::managed::{Manager, Pool, QueueMode, RecycleResult};
+use deadpool::managed::{Manager, Pool, PoolError, QueueMode, RecycleResult, Timeouts};
 use rustls::ClientConfig;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
@@ -57,8 +58,10 @@ impl TcpConnectionPool {
         circuit_breaker: Option<Arc<CircuitBreaker>>,
         retry_config: Option<ConnectionRetryConfig>,
         lifo: bool,
+        connect_timeout_ms: u64,
     ) -> Result<Self> {
         let queue_mode = if lifo { QueueMode::Lifo } else { QueueMode::Fifo };
+        let connect_timeout = Duration::from_millis(connect_timeout_ms);
 
         // Load TLS configuration for backend connections
         let server_tls_config = load_server_tls_config(tls_config)
@@ -83,9 +86,17 @@ impl TcpConnectionPool {
             protocol: Arc::clone(&protocol),
             tls_config: server_tls_config,
             tls_sslmode: tls_config.server_tls_sslmode.clone(),
+            connect_timeout,
         };
 
-        let mut builder = Pool::builder(manager).max_size(max_size).queue_mode(queue_mode);
+        // Bound deadpool's own create/recycle phases as a backstop to the
+        // in-`create` connect timeout (P3 §4.5). `wait` is left to the
+        // pool-manager wait queue, which already applies its own timeout.
+        let timeouts =
+            Timeouts { wait: None, create: Some(connect_timeout), recycle: Some(connect_timeout) };
+
+        let mut builder =
+            Pool::builder(manager).max_size(max_size).queue_mode(queue_mode).timeouts(timeouts);
 
         if let Some(min) = min_idle {
             builder = builder.runtime(deadpool::Runtime::Tokio1);
@@ -146,7 +157,12 @@ impl TcpConnectionPool {
         result
     }
 
-    /// Get connection with retry logic
+    /// Get connection with retry logic.
+    ///
+    /// Only *transient* pool errors (a backend connect/transport failure or an
+    /// acquisition timeout) are retried; *permanent* ones (a closed pool, a
+    /// runtime/config error) fail fast (P3 §4.5, §5.5). Retries wrap connection
+    /// acquisition only — no query bytes are ever replayed.
     async fn get_with_retry(
         &self,
         retry_config: &ConnectionRetryConfig,
@@ -154,13 +170,16 @@ impl TcpConnectionPool {
         let retry_strategy = RetryStrategy::new(retry_config.clone());
 
         retry_strategy
-            .execute(|| async {
-                self.pool
-                    .get()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Failed to get connection: {}", e))
-            })
+            .execute_with_classifier(|| self.pool.get(), Self::pool_error_is_retryable)
             .await
+            .map_err(|e| anyhow::anyhow!("Failed to get connection: {}", e))
+    }
+
+    /// Classify a deadpool error as retryable. Transient backend/transport
+    /// failures and acquisition timeouts are worth retrying; a closed pool or a
+    /// runtime/hook misconfiguration is permanent and must not be retried.
+    fn pool_error_is_retryable(err: &PoolError<anyhow::Error>) -> bool {
+        matches!(err, PoolError::Backend(_) | PoolError::Timeout(_))
     }
 
     /// Get pool status information
@@ -252,6 +271,10 @@ pub struct BackendTransportManager {
     protocol: Arc<dyn Protocol>,
     tls_config: Option<Arc<ClientConfig>>,
     tls_sslmode: TlsSslMode,
+    /// Upper bound on TCP connect + TLS negotiation before the attempt is
+    /// abandoned, so a hung/black-holed backend cannot block a connect
+    /// indefinitely (P3 §4.5).
+    connect_timeout: Duration,
 }
 
 #[async_trait]
@@ -268,24 +291,36 @@ impl Manager for BackendTransportManager {
             "Creating new backend connection"
         );
 
-        // First, establish TCP connection
-        let stream =
-            TcpStream::connect(&self.backend_addr).await.context("Failed to connect to backend")?;
+        // Establish the TCP connection and negotiate TLS under a single deadline
+        // so a hung/black-holed backend cannot block indefinitely (P3 §4.5).
+        let transport = tokio::time::timeout(self.connect_timeout, async {
+            let stream = TcpStream::connect(&self.backend_addr)
+                .await
+                .context("Failed to connect to backend")?;
 
-        // Disable Nagle's algorithm for lower latency
-        stream.set_nodelay(true).context("Failed to set TCP_NODELAY on backend connection")?;
+            // Disable Nagle's algorithm for lower latency
+            stream.set_nodelay(true).context("Failed to set TCP_NODELAY on backend connection")?;
 
-        debug!(backend_addr = %self.backend_addr, "TCP connection established");
+            debug!(backend_addr = %self.backend_addr, "TCP connection established");
 
-        // Then, negotiate SSL if configured
-        let transport = upgrade_backend_to_tls(
-            stream,
-            &self.backend_host,
-            &self.tls_sslmode,
-            self.tls_config.clone(),
-        )
+            // Then, negotiate SSL if configured
+            upgrade_backend_to_tls(
+                stream,
+                &self.backend_host,
+                &self.tls_sslmode,
+                self.tls_config.clone(),
+            )
+            .await
+            .context("Failed to negotiate SSL with backend")
+        })
         .await
-        .context("Failed to negotiate SSL with backend")?;
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Timed out after {:?} connecting to backend {}",
+                self.connect_timeout,
+                self.backend_addr
+            )
+        })??;
 
         if transport.is_encrypted() {
             info!(backend_addr = %self.backend_addr, "Backend connection using TLS");
@@ -413,6 +448,7 @@ mod tests {
             None, // circuit_breaker
             None, // retry_config
             true, // lifo
+            5000, // connect_timeout_ms
         )
         .unwrap();
         let status = pool.status();
@@ -434,12 +470,68 @@ mod tests {
         };
         let tls_config = TlsConfig::default();
 
-        let pool =
-            TcpConnectionPool::new(protocol, config, &tls_config, 10, Some(0), None, None, true)
-                .unwrap();
+        let pool = TcpConnectionPool::new(
+            protocol,
+            config,
+            &tls_config,
+            10,
+            Some(0),
+            None,
+            None,
+            true,
+            5000,
+        )
+        .unwrap();
 
         // Warmup with 0 should return immediately
         let created = pool.warmup(0).await;
         assert_eq!(created, 0);
+    }
+
+    #[test]
+    fn test_pool_error_classification() {
+        // Permanent errors must not be retried; transient ones should.
+        assert!(!TcpConnectionPool::pool_error_is_retryable(&PoolError::Closed));
+        assert!(!TcpConnectionPool::pool_error_is_retryable(&PoolError::NoRuntimeSpecified));
+        assert!(TcpConnectionPool::pool_error_is_retryable(&PoolError::Backend(anyhow::anyhow!(
+            "connection refused"
+        ))));
+        assert!(TcpConnectionPool::pool_error_is_retryable(&PoolError::Timeout(
+            deadpool::managed::TimeoutType::Create
+        )));
+    }
+
+    /// Fault injection: a backend that black-holes the SYN must not hang the
+    /// connect forever — the connect timeout must fire promptly (P3 §4.5).
+    #[tokio::test]
+    async fn test_connect_timeout_fires_on_unreachable_backend() {
+        use std::time::Instant;
+
+        let protocol = Arc::new(PostgresProtocol::new()) as Arc<dyn Protocol>;
+        // TEST-NET-3 (203.0.113.0/24, RFC 5737) — reserved and unroutable, so
+        // the SYN is dropped/rejected rather than answered.
+        let config = ProtocolConfig {
+            host: "203.0.113.1".to_string(),
+            port: 5432,
+            database: Some("test".to_string()),
+            user: Some("postgres".to_string()),
+            password: Some("postgres".to_string()),
+        };
+        let tls_config = TlsConfig::default();
+
+        // 800ms connect budget.
+        let pool =
+            TcpConnectionPool::new(protocol, config, &tls_config, 2, None, None, None, true, 800)
+                .expect("pool");
+
+        let start = Instant::now();
+        let result = pool.get().await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err(), "connect to unreachable backend should fail");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "connect must fail promptly (bounded by the timeout), took {elapsed:?}"
+        );
     }
 }
