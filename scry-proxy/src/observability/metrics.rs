@@ -200,6 +200,7 @@ pub struct QueryMetrics {
     queue_time_histogram: RwLock<Histogram<u64>>,
     pool_acquire_histogram: RwLock<Histogram<u64>>,
     backend_time_histogram: RwLock<Histogram<u64>>,
+    proxy_overhead_histogram: RwLock<Histogram<u64>>,
 
     // Atomic counters
     pub total_queries: AtomicU64,
@@ -222,6 +223,9 @@ impl QueryMetrics {
             backend_time_histogram: RwLock::new(
                 Histogram::<u64>::new_with_bounds(1, 3_600_000_000, 3).unwrap(),
             ),
+            proxy_overhead_histogram: RwLock::new(
+                Histogram::<u64>::new_with_bounds(1, 3_600_000_000, 3).unwrap(),
+            ),
             total_queries: AtomicU64::new(0),
             total_errors: AtomicU64::new(0),
         }
@@ -241,6 +245,24 @@ impl QueryMetrics {
         }
         if let Some(backend_micros) = phases.backend_micros {
             let _ = self.backend_time_histogram.write().record(backend_micros);
+        }
+        // Derived proxy overhead (HDR histograms require a value >= 1).
+        if phases.proxy_overhead_micros > 0 {
+            let _ = self.proxy_overhead_histogram.write().record(phases.proxy_overhead_micros);
+        }
+    }
+
+    /// Proxy-overhead latency percentiles (the proxy's own added latency).
+    pub fn proxy_overhead_percentiles(&self) -> LatencyPercentiles {
+        let hist = self.proxy_overhead_histogram.read();
+        LatencyPercentiles {
+            p50_micros: hist.value_at_quantile(0.50),
+            p90_micros: hist.value_at_quantile(0.90),
+            p95_micros: hist.value_at_quantile(0.95),
+            p99_micros: hist.value_at_quantile(0.99),
+            p999_micros: hist.value_at_quantile(0.999),
+            max_micros: hist.max(),
+            mean_micros: hist.mean(),
         }
     }
 

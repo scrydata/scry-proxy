@@ -770,7 +770,7 @@ impl ConnectionHandler {
                                             metrics.record_hot_data(&fingerprints);
                                         }
                                     }
-                                    metrics.record_query(&QueryTimeline::new(), false);
+                                    metrics.record_query(&QueryTimeline::for_completed(pending.started_at), false);
                                 }
                             }
                             // Check for query completion
@@ -796,7 +796,7 @@ impl ConnectionHandler {
                                             metrics.record_hot_data(&fingerprints);
                                         }
                                     }
-                                    metrics.record_query(&QueryTimeline::new(), true);
+                                    metrics.record_query(&QueryTimeline::for_completed(pending.started_at), true);
                                 }
                             }
 
@@ -1129,7 +1129,10 @@ impl ConnectionHandler {
                                         metrics.record_hot_data(&fingerprints);
                                     }
                                 }
-                                metrics.record_query(&QueryTimeline::new(), false);
+                                metrics.record_query(
+                                    &QueryTimeline::for_completed(pending.started_at),
+                                    false,
+                                );
                             }
                         }
                         // Check if this is a successful query completion
@@ -1160,7 +1163,10 @@ impl ConnectionHandler {
                                         metrics.record_hot_data(&fingerprints);
                                     }
                                 }
-                                metrics.record_query(&QueryTimeline::new(), true);
+                                metrics.record_query(
+                                    &QueryTimeline::for_completed(pending.started_at),
+                                    true,
+                                );
                             }
                         }
 
