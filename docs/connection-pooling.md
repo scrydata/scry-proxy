@@ -630,6 +630,7 @@ This should not happen as Scry automatically runs `DISCARD ALL` on every connect
 
 ## See Also
 
+- [Transparency Contract](transparency-contract.md) - What "clean" state reset must guarantee, and the fail-closed rule for undetectable state
 - [Architecture](architecture.md) - Pool integration in system architecture
 - [Circuit Breaker](circuit-breaker.md) - Circuit breaker integration with pool
 - [Health Checks](health-checks.md) - Active and passive health checking
