@@ -27,6 +27,15 @@ pub enum DetectedCommand {
     Deallocate { name: String },
     /// DEALLOCATE ALL
     DeallocateAll,
+    /// LISTEN channel — registers an async-notification subscription that
+    /// must stay bound to this specific backend connection (P2 §4.3).
+    Listen { channel: String },
+    /// UNLISTEN channel, or UNLISTEN * (`channel: None`)
+    Unlisten { channel: Option<String> },
+    /// NOTIFY channel [, payload] — detected for attribution only; a bare
+    /// NOTIFY does not itself register a subscription, so it never pins (see
+    /// `ConnectionState::apply_query`).
+    Notify { channel: String, payload: Option<String> },
 }
 
 /// Multiplexing-safety classification of a client command (P2 §4.1).
@@ -69,6 +78,18 @@ impl CommandDetector {
     /// known-safe shape. Anything else is `Stateful` (recognized) or `Unknown`
     /// (pin) — the blast radius of a detection gap is a performance cost (an
     /// over-pinned connection), never a correctness bug (leaked session state).
+    ///
+    /// `COPY ... FROM/TO STDIN/STDOUT` deliberately has no dedicated
+    /// `DetectedCommand` variant and therefore always falls through to
+    /// `Unknown` here (see `MUST_PIN_UNKNOWN` in `pooling_safety_test.rs`).
+    /// COPY is passthrough-only by design for 1.0 (P2 §9.4): the proxy never
+    /// models or replays COPY's own sub-protocol (`CopyInResponse`/
+    /// `CopyData`/`CopyDone`/`CopyOutResponse`), it just forwards those bytes
+    /// like any other unrecognized message — fail-closed `Unknown`
+    /// classification simply keeps the connection pinned for the duration of
+    /// the COPY rather than risking a mid-COPY release. See
+    /// `copy_passthrough_byte_identical` in `differential_transparency_test.rs`
+    /// for the byte-for-byte passthrough proof (WP-9 Task 9).
     pub fn classify(sql: &str) -> CommandClass {
         if let Some(cmd) = Self::detect(sql) {
             return CommandClass::Stateful(cmd);
@@ -160,6 +181,21 @@ impl CommandDetector {
         // DEALLOCATE
         if sql_upper.starts_with("DEALLOCATE ") {
             return Self::parse_deallocate(sql_trimmed);
+        }
+
+        // LISTEN channel
+        if sql_upper.starts_with("LISTEN ") {
+            return Self::parse_listen(sql_trimmed);
+        }
+
+        // UNLISTEN channel / UNLISTEN *
+        if sql_upper.starts_with("UNLISTEN ") || sql_upper == "UNLISTEN" {
+            return Self::parse_unlisten(sql_trimmed);
+        }
+
+        // NOTIFY channel [, payload]
+        if sql_upper.starts_with("NOTIFY ") {
+            return Self::parse_notify(sql_trimmed);
         }
 
         // pg_advisory_lock
@@ -285,6 +321,41 @@ impl CommandDetector {
         }
     }
 
+    fn parse_listen(sql: &str) -> Option<DetectedCommand> {
+        // We know sql starts with "LISTEN " (case-insensitive) from detect().
+        let rest = sql.get(7..)?.trim();
+        let channel = rest.split_whitespace().next()?.trim_matches('"').to_string();
+        Some(DetectedCommand::Listen { channel })
+    }
+
+    fn parse_unlisten(sql: &str) -> Option<DetectedCommand> {
+        // We know sql starts with "UNLISTEN" (case-insensitive) from detect().
+        let rest = sql.get(8..).unwrap_or("").trim();
+
+        if rest.is_empty() || rest == "*" {
+            Some(DetectedCommand::Unlisten { channel: None })
+        } else {
+            let channel = rest.split_whitespace().next()?.trim_matches('"').to_string();
+            Some(DetectedCommand::Unlisten { channel: Some(channel) })
+        }
+    }
+
+    fn parse_notify(sql: &str) -> Option<DetectedCommand> {
+        // We know sql starts with "NOTIFY " (case-insensitive) from detect().
+        let rest = sql.get(7..)?.trim();
+
+        let (channel_part, payload) = match rest.find(',') {
+            Some(idx) => {
+                let payload = rest[idx + 1..].trim().trim_matches('\'').to_string();
+                (&rest[..idx], Some(payload))
+            }
+            None => (rest, None),
+        };
+
+        let channel = channel_part.trim().trim_matches('"').to_string();
+        Some(DetectedCommand::Notify { channel, payload })
+    }
+
     fn extract_lock_key(sql: &str) -> Option<i64> {
         // Try to extract numeric key from pg_advisory_lock(12345)
         if let Some(start) = sql.find('(') {
@@ -294,6 +365,32 @@ impl CommandDetector {
             }
         }
         None
+    }
+
+    /// Naively split `sql` into non-empty, trimmed statements on `;` (WP-9 Task
+    /// 9, P2 §4.6).
+    ///
+    /// Deliberately NOT a real SQL parser: it has no idea about string literals,
+    /// dollar-quoting, or comments, so a `;` inside a literal (e.g.
+    /// `SELECT 'a; SET x=1'`) produces a spurious extra fragment (here,
+    /// `"SET x=1'"`). That is safe by construction for every caller of this
+    /// function: `CommandDetector::classify` on a bogus fragment can only ever
+    /// return `Unknown` or, at worst, a `Stateful` match on something that looks
+    /// like a real command — both cases are fail-closed (over-pinning /
+    /// over-attribution), never fail-open. A naive split can never make a real
+    /// trailing state-changing statement (a genuine `SET`/temp-table/etc. after
+    /// a real `;`) disappear from the output, so it can never cause
+    /// under-pinning or a dropped attribution. A query with no interior `;`
+    /// yields exactly one element (the trimmed original), so single-statement
+    /// callers see no behavior change.
+    ///
+    /// Shared by [`ConnectionState::apply_query`](crate::proxy::ConnectionState::apply_query)
+    /// (fail-closed pinning: classify+apply every split part) and the
+    /// connection handler's event attribution (best-effort observability:
+    /// attribute each part to its own `QueryEvent`) so both consumers agree on
+    /// exactly one definition of "a statement" in a multi-statement batch.
+    pub fn split_statements(sql: &str) -> Vec<&str> {
+        sql.split(';').map(str::trim).filter(|s| !s.is_empty()).collect()
     }
 }
 
@@ -431,5 +528,54 @@ mod tests {
     fn test_insert_no_detection() {
         let result = CommandDetector::detect("INSERT INTO users (name) VALUES ('test')");
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_detect_listen() {
+        let result = CommandDetector::detect("LISTEN scry_chan");
+        assert!(matches!(result, Some(DetectedCommand::Listen { channel })
+            if channel == "scry_chan"));
+    }
+
+    #[test]
+    fn test_detect_listen_mixed_case() {
+        let result = CommandDetector::detect("Listen scry_chan");
+        assert!(matches!(result, Some(DetectedCommand::Listen { channel })
+            if channel == "scry_chan"));
+    }
+
+    #[test]
+    fn test_detect_unlisten_channel() {
+        let result = CommandDetector::detect("UNLISTEN scry_chan");
+        assert!(matches!(result, Some(DetectedCommand::Unlisten { channel: Some(channel) })
+            if channel == "scry_chan"));
+    }
+
+    #[test]
+    fn test_detect_unlisten_all() {
+        let result = CommandDetector::detect("UNLISTEN *");
+        assert!(matches!(result, Some(DetectedCommand::Unlisten { channel: None })));
+    }
+
+    #[test]
+    fn test_detect_notify_bare() {
+        let result = CommandDetector::detect("NOTIFY scry_chan");
+        assert!(matches!(result, Some(DetectedCommand::Notify { channel, payload: None })
+            if channel == "scry_chan"));
+    }
+
+    #[test]
+    fn test_detect_notify_with_payload() {
+        let result = CommandDetector::detect("NOTIFY scry_chan, 'payload-42'");
+        assert!(matches!(result, Some(DetectedCommand::Notify { channel, payload: Some(payload) })
+            if channel == "scry_chan" && payload == "payload-42"));
+    }
+
+    #[test]
+    fn test_listen_is_stateful_via_classify() {
+        assert!(matches!(
+            CommandDetector::classify("LISTEN scry_chan"),
+            CommandClass::Stateful(DetectedCommand::Listen { .. })
+        ));
     }
 }

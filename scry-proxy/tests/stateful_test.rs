@@ -1618,7 +1618,122 @@ async fn test_listen_notify_commands() {
     // If we got here, all LISTEN/NOTIFY commands executed successfully through the proxy
 }
 
-// Note: Full LISTEN/NOTIFY notification delivery testing would require more complex
-// async message handling with tokio-postgres. The test above verifies that the proxy
-// correctly forwards LISTEN/NOTIFY protocol messages. Since the proxy uses transparent
-// message forwarding, notifications should be delivered correctly to clients.
+// The test above only proves LISTEN/NOTIFY/UNLISTEN *execute* successfully — it never
+// registers a notification stream, so it can't tell a proxy that silently drops
+// NotificationResponse ('A') frames from one that forwards them correctly. The test
+// below (WP-9 Task 5, P2 §4.3) closes that gap: it drives a real listener Connection
+// and asserts a NOTIFY sent by a separate client is actually delivered, with the right
+// channel and payload.
+
+/// Proves async notification DELIVERY end-to-end through the proxy (the guardrail
+/// `test_listen_notify_commands` above never provided): a listener client issues
+/// `LISTEN scry_chan`, a separate notifier client issues `NOTIFY scry_chan,
+/// 'payload-42'`, and the listener must actually receive the `NotificationResponse`.
+///
+/// `tokio_postgres` delivers async messages (notices, notifications) via the
+/// `Connection`, not the `Client` — the `Client`'s query methods only ever see
+/// query-response messages. The standard idiom for observing them (rather than the
+/// usual "spawn the connection future and ignore it" pattern used for the notifier and
+/// every other test in this file) is to drive `Connection::poll_message` through
+/// `futures::stream::poll_fn` and forward `AsyncMessage::Notification` items
+/// elsewhere (here, an unbounded `mpsc` channel the test awaits on with a timeout).
+/// `futures` is already a normal (non-dev) dependency of `scry-proxy` (see
+/// `scry-proxy/Cargo.toml`), and normal dependencies are available to integration
+/// test binaries, so no new dependency is needed.
+///
+/// Runs with Hybrid pooling enabled (not `Disabled`, as the rest of this file's tests
+/// use) specifically so the LISTEN/NOTIFY path is exercised through a pooled backend
+/// connection, not a 1:1 direct one — proving the proxy's pooling layer doesn't
+/// interfere with delivery. (The separate, pin-specific "was the connection actually
+/// recycled out from under the listener" proof lives in
+/// `differential_transparency_test.rs`'s `assert_listen_survives_hybrid_recycle`,
+/// which uses `pg_listening_channels()` as its observable signal — this test's job is
+/// solely to prove delivery happens at all, something the old test never checked.)
+#[tokio::test]
+async fn test_notification_delivery_through_proxy() {
+    use futures::stream::poll_fn;
+    use futures::StreamExt;
+    use tokio_postgres::AsyncMessage;
+
+    let docker = Cli::default();
+    let postgres_image = RunnableImage::from(Postgres::default()).with_tag("16-alpine");
+    let postgres = docker.run(postgres_image);
+
+    let postgres_port = postgres.get_host_port_ipv4(5432);
+    let postgres_host = "127.0.0.1".to_string();
+
+    sleep(Duration::from_secs(2)).await;
+
+    let mut config = create_test_config(postgres_host, postgres_port);
+    config.performance.connection_pooling = PoolingStrategy::Hybrid;
+    let test_publisher = TestPublisher::new();
+    let publisher = Arc::new(test_publisher.clone());
+
+    let proxy_port =
+        start_test_proxy(config.clone(), publisher).await.expect("Failed to start proxy");
+
+    sleep(Duration::from_millis(100)).await;
+
+    // Listener: drive its Connection manually so async NotificationResponse frames
+    // are captured instead of silently dropped by the default spawn-and-ignore idiom.
+    let (listener_client, mut listener_connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user={} password={} dbname={}",
+            proxy_port, config.backend.user, config.backend.password, config.backend.database
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("Failed to connect listener");
+
+    let (notif_tx, mut notif_rx) = tokio::sync::mpsc::unbounded_channel::<(String, String)>();
+    tokio::spawn(async move {
+        let mut stream = poll_fn(move |cx| listener_connection.poll_message(cx));
+        while let Some(msg) = stream.next().await {
+            match msg {
+                Ok(AsyncMessage::Notification(n)) => {
+                    let _ = notif_tx.send((n.channel().to_string(), n.payload().to_string()));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("Listener connection error: {}", e);
+                    break;
+                }
+            }
+        }
+    });
+
+    // Notifier: a separate client through the same proxy — the standard
+    // spawn-and-ignore idiom is fine here, it never needs to observe async messages.
+    let (notifier_client, notifier_connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user={} password={} dbname={}",
+            proxy_port, config.backend.user, config.backend.password, config.backend.database
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("Failed to connect notifier");
+
+    tokio::spawn(async move {
+        if let Err(e) = notifier_connection.await {
+            eprintln!("Notifier connection error: {}", e);
+        }
+    });
+
+    listener_client.execute("LISTEN scry_chan", &[]).await.expect("LISTEN failed");
+
+    // Give the LISTEN registration a moment to land server-side before NOTIFY fires,
+    // avoiding a race against the backend's subscription bookkeeping.
+    sleep(Duration::from_millis(200)).await;
+
+    notifier_client.execute("NOTIFY scry_chan, 'payload-42'", &[]).await.expect("NOTIFY failed");
+
+    let (channel, payload) = tokio::time::timeout(Duration::from_secs(5), notif_rx.recv())
+        .await
+        .expect("timed out waiting for notification delivery through the proxy")
+        .expect("listener connection closed without ever delivering a notification");
+
+    assert_eq!(channel, "scry_chan", "notification delivered on the wrong channel");
+    assert_eq!(payload, "payload-42", "notification payload did not survive the proxy");
+}

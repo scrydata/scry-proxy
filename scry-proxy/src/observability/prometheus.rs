@@ -211,6 +211,8 @@ fn export_pooling_metrics(output: &mut String, metrics: &ProxyMetrics) {
         pin_counts.advisory_lock
     )
     .unwrap();
+    writeln!(output, "scry_pool_pin_reason_total{{reason=\"listen\"}} {}", pin_counts.listen)
+        .unwrap();
     writeln!(
         output,
         "scry_pool_pin_reason_total{{reason=\"unknown_command\"}} {}",

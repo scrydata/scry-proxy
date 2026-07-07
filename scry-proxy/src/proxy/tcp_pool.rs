@@ -17,10 +17,36 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
+/// A pooled backend connection plus the per-connection state that must survive
+/// recycle so a warm-reused backend can serve a NEW client without re-running
+/// the Postgres startup handshake against it (WP-9 Task 8, P2 §5.3).
+///
+/// A Postgres backend completes its startup/authentication exactly once and then
+/// stays in the query loop for the rest of its life — it cannot be re-initialized
+/// with a second StartupMessage. When a client gracefully disconnects, its
+/// `Terminate` is now intercepted (see `connection.rs`) so the backend survives
+/// and returns to the pool warm. The NEXT client that lands on this same physical
+/// backend must therefore NOT re-handshake the backend; instead the proxy replays
+/// the backend's original client-facing startup response (captured here on first
+/// initialization) to that client. This makes cross-client warm reuse possible
+/// while keeping the client's startup sequence faithful.
+pub struct PooledBackend {
+    /// The live backend transport (TCP or TLS).
+    pub transport: BackendTransport,
+    /// The backend's captured client-facing startup response — everything the
+    /// backend sent after `AuthenticationOk` on its first initialization
+    /// (`ParameterStatus*`, `BackendKeyData`, `ReadyForQuery`). `None` until the
+    /// backend has completed its one-time startup; `Some` for a warm-reusable
+    /// connection. Replayed verbatim to any later client that reuses this same
+    /// physical connection.
+    pub startup_response: Option<Vec<u8>>,
+}
+
 /// Pooled backend connection wrapper
 ///
-/// This type wraps a pooled backend connection (TCP or TLS).
-/// When dropped, the connection is automatically returned to the pool.
+/// This type wraps a pooled backend connection (TCP or TLS) plus its captured
+/// startup response. When dropped, the connection is automatically returned to
+/// the pool (with any captured startup response preserved for warm reuse).
 pub(crate) type PooledConnection = deadpool::managed::Object<BackendTransportManager>;
 
 /// TCP connection pool for database backends
@@ -279,11 +305,11 @@ pub struct BackendTransportManager {
 
 #[async_trait]
 impl Manager for BackendTransportManager {
-    type Type = BackendTransport;
+    type Type = PooledBackend;
     type Error = anyhow::Error;
 
     /// Create a new backend connection, optionally upgrading to TLS
-    async fn create(&self) -> Result<BackendTransport, Self::Error> {
+    async fn create(&self) -> Result<PooledBackend, Self::Error> {
         debug!(
             backend_addr = %self.backend_addr,
             protocol = self.protocol.name(),
@@ -328,7 +354,11 @@ impl Manager for BackendTransportManager {
             debug!(backend_addr = %self.backend_addr, "Backend connection using plain TCP");
         }
 
-        Ok(transport)
+        // A freshly created backend has only completed TCP/TLS — it has NOT yet
+        // performed the Postgres startup handshake. That is done once, by the
+        // first client's connection handler, which then records the backend's
+        // startup response here so subsequent clients can warm-reuse it.
+        Ok(PooledBackend { transport, startup_response: None })
     }
 
     /// Recycle a connection before returning it to the pool
@@ -338,7 +368,7 @@ impl Manager for BackendTransportManager {
     /// reset_connection method to clear any session state.
     async fn recycle(
         &self,
-        conn: &mut BackendTransport,
+        conn: &mut PooledBackend,
         _metrics: &deadpool::managed::Metrics,
     ) -> RecycleResult<Self::Error> {
         debug!(protocol = self.protocol.name(), "Recycling backend connection");
@@ -346,7 +376,11 @@ impl Manager for BackendTransportManager {
         // Health check and reset work differently for plain vs TLS connections
         // For plain TCP, we can use the protocol methods directly
         // For TLS, we have limited health check capability without protocol changes
-        match conn {
+        // The captured startup response (conn.startup_response) is intentionally
+        // preserved across recycle — DISCARD ALL resets session STATE but the
+        // backend's identity/startup parameters are unchanged, so the previously
+        // captured startup response remains valid for the next warm-reuse client.
+        match &mut conn.transport {
             BackendTransport::Plain(stream) => {
                 // First, check if connection is still healthy
                 match self.protocol.health_check(stream).await {

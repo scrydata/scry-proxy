@@ -37,6 +37,16 @@ pub enum AcquireError {
     WaitTimeout,
 }
 
+/// Returned by [`ManagedConnection::stream`]/[`ManagedConnection::stream_mut`]
+/// when the underlying connection has already been taken (e.g. handed off to
+/// `release()`/`pin()`) out from under a stale `ManagedConnection`. This
+/// should never happen on the normal per-query hot path; it exists so a bug
+/// elsewhere surfaces as a typed, propagatable error instead of a panic that
+/// would tear down the whole connection task.
+#[derive(Debug, Error)]
+#[error("connection already taken from this ManagedConnection")]
+pub struct ConnectionTaken;
+
 /// Configuration for the pool manager
 #[derive(Debug, Clone)]
 pub struct PoolManagerConfig {
@@ -100,13 +110,32 @@ pub struct ManagedConnection {
 
 impl ManagedConnection {
     /// Get a reference to the underlying backend transport (TCP or TLS)
-    pub fn stream(&self) -> &BackendTransport {
-        self.connection.as_ref().expect("connection taken")
+    pub fn stream(&self) -> Result<&BackendTransport, ConnectionTaken> {
+        self.connection.as_deref().map(|p| &p.transport).ok_or(ConnectionTaken)
     }
 
     /// Get a mutable reference to the underlying backend transport (TCP or TLS)
-    pub fn stream_mut(&mut self) -> &mut BackendTransport {
-        self.connection.as_mut().expect("connection taken")
+    pub fn stream_mut(&mut self) -> Result<&mut BackendTransport, ConnectionTaken> {
+        self.connection.as_deref_mut().map(|p| &mut p.transport).ok_or(ConnectionTaken)
+    }
+
+    /// The captured client-facing startup response for this physical backend, if
+    /// it has already completed its one-time Postgres startup handshake (WP-9
+    /// Task 8, P2 §5.3). `Some` means this connection is being warm-reused and
+    /// the caller must replay these bytes to the client instead of re-running the
+    /// backend startup handshake; `None` means this is a fresh backend that still
+    /// needs to be initialized.
+    pub fn startup_response(&self) -> Option<&[u8]> {
+        self.connection.as_deref().and_then(|p| p.startup_response.as_deref())
+    }
+
+    /// Record the backend's client-facing startup response after a fresh backend
+    /// has been initialized, so a later client that warm-reuses this same
+    /// physical connection can be served without re-handshaking the backend.
+    pub fn set_startup_response(&mut self, bytes: Vec<u8>) {
+        if let Some(p) = self.connection.as_deref_mut() {
+            p.startup_response = Some(bytes);
+        }
     }
 
     /// Check if this connection is pinned
@@ -540,6 +569,24 @@ mod tests {
 
         assert!(!conn.is_pinned());
         assert_eq!(conn.client_id(), 99);
+    }
+
+    #[test]
+    fn test_stream_after_take_returns_error_not_panic() {
+        // A ManagedConnection with `connection: None` models the state right
+        // after `take_connection()` has removed the underlying PooledConnection
+        // (e.g. between release()/pin() taking it and the caller still holding
+        // a stale ManagedConnection). stream()/stream_mut() must return a typed
+        // error instead of panicking via `.expect("connection taken")`.
+        let mut conn = ManagedConnection {
+            connection: None,
+            client_id: 7,
+            is_pinned: false,
+            binding_id: None,
+        };
+
+        assert!(conn.stream().is_err());
+        assert!(conn.stream_mut().is_err());
     }
 
     #[test]

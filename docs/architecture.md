@@ -39,7 +39,9 @@ Scry sits between your application and database, transparently intercepting and 
 ```
 
 **Key Design Principles**:
-- **Transparency**: Drop-in replacement for direct database connection
+- **Transparency**: Drop-in replacement for direct database connection — see the
+  [Transparency Contract](transparency-contract.md) for the normative, testable definition of
+  this guarantee
 - **Low Overhead**: <1ms target latency addition through async operations and lock-free data structures
 - **Best-Effort Observability**: Events published asynchronously, never block queries
 - **Resilience**: Circuit breaker, retries, and health checks protect your database
@@ -453,6 +455,7 @@ Deadpool is the standard connection pooling library for Rust async:
 
 ## See Also
 
+- [Transparency Contract](transparency-contract.md) - Normative definition of the transparency guarantee
 - [Configuration](configuration.md) - Configure all components
 - [Observability](observability.md) - Event publishing and batching
 - [Circuit Breaker](circuit-breaker.md) - Circuit breaker details

@@ -1,12 +1,13 @@
 use super::{
     AcquireError, ConnectionState, EventBatcher, ModeEnforcer, PendingExecution, PoolManager,
-    PoolingMode, PreparedStatement, PreparedStatementCache, StateReplayer, TransactionTracker,
+    PoolingMode, PreparedStatement, PreparedStatementCache, TransactionTracker,
 };
 use crate::auth::{Authenticator, FileAuthenticator};
 use crate::config::{BackpressureMode, Config, ParseFailureMode, PoolingStrategy};
 use crate::observability::{ProxyMetrics, QueryTimeline};
 use crate::protocol::{
-    build_error_response, decode_params, Message, MessageExtractor, QueryAnonymizer,
+    build_error_response, decode_params, CommandDetector, Message, MessageExtractor,
+    QueryAnonymizer,
 };
 use crate::publisher::{QueryEvent, QueryEventBuilder};
 use crate::tls::ClientTransport;
@@ -235,17 +236,96 @@ impl ConnectionHandler {
     ///
     /// Returns true if the connection should be released back to the pool,
     /// allowing other clients to use it. The decision depends on:
-    /// - Pooling strategy (transaction mode always releases, session mode never does)
-    /// - Connection state (pinned connections with unsafe state are not released)
+    /// - Pooling strategy (session mode never releases)
+    /// - Connection state (pinned connections are not released)
+    ///
+    /// # Restrict-by-pinning (WP-9 Task 6, P2 §4.5)
+    ///
+    /// Transaction mode releases only *positively-clean* (unpinned) connections;
+    /// a connection carrying replay-fragile session state is PINNED (kept) rather
+    /// than released. `ModeEnforcer` already rejects `SET` / temp tables /
+    /// cursors / advisory locks in Transaction mode (SQLSTATE `0A000`), so the
+    /// only things that can pin a Transaction connection are **prepared
+    /// statements** and **`LISTEN`**. Pinning them is correct-by-construction:
+    /// it makes the old fragile SQL-`PREPARE` state-replay path unreachable (a
+    /// connection that reaches the release block is never pinned, so there is
+    /// nothing to replay), eliminating the silent state destruction that path
+    /// could cause.
+    ///
+    /// ## Pooling-cost tradeoff (accepted)
+    ///
+    /// A driver that keeps named prepared statements cached on the connection
+    /// (or holds a `LISTEN`) will see **reduced pooling in Transaction mode** —
+    /// such connections stay pinned to their client instead of being returned to
+    /// the pool. This is the spec's accepted cost ("costs some pooling for
+    /// prepared-heavy workloads"); a protocol-level replay is a possible
+    /// post-GA revisit (P2 §9.1). Stateless clients are unaffected: a clean
+    /// Transaction connection is still released and pooled as before.
     fn should_release_connection(strategy: &PoolingStrategy, conn_state: &ConnectionState) -> bool {
         match strategy {
             // Disabled or Session mode: never release until client disconnects
             PoolingStrategy::Disabled | PoolingStrategy::Session => false,
-            // Transaction mode: always release after transaction (strict mode)
-            PoolingStrategy::Transaction => true,
-            // Hybrid mode: release only if connection is not pinned
-            PoolingStrategy::Hybrid => !conn_state.is_pinned(),
+            // Transaction and Hybrid modes: release only positively-clean
+            // (unpinned) connections. Prepared statements / LISTEN pin the
+            // connection so their state is never silently dropped.
+            PoolingStrategy::Transaction | PoolingStrategy::Hybrid => !conn_state.is_pinned(),
         }
+    }
+
+    /// WP-9 Task 8 review fix (Fix 1) — decide whether a `Terminate` found at
+    /// `message_index` within THIS read buffer's parsed message list
+    /// (`extractor.extract_messages(data)`, zero-based) is safe to intercept
+    /// (kept off the wire so the backend survives for warm reuse), or must
+    /// instead be forwarded to the backend like any other message.
+    ///
+    /// # The sole-leading-Terminate predicate
+    ///
+    /// Only `message_index == 0` — i.e. Terminate is the FIRST parsed message
+    /// for this buffer, so no other message from the same client `read()`
+    /// precedes it — is intercepted. If a client pipelines another message
+    /// (e.g. `Sync`, `Query`) immediately before `Terminate` in one read, the
+    /// prior whole-buffer `should_forward = false` unconditionally dropped
+    /// that preceding message before it ever reached the backend — a
+    /// transparency violation strictly worse than losing the reuse
+    /// optimization. Returning `false` here forwards the entire buffer
+    /// (including the trailing Terminate bytes) verbatim instead, exactly
+    /// matching pre-Task-8 behavior for this rare pipelined case: the backend
+    /// receives the Terminate at the end of the stream and closes, so this
+    /// one connection simply isn't warm-reused. Correctness over the
+    /// optimization, always.
+    fn should_intercept_terminate(message_index: usize) -> bool {
+        message_index == 0
+    }
+
+    /// Classifies the SQL carried by a `Parse` message and applies the
+    /// resulting session-state pin to `conn_state`, then records the
+    /// prepared statement for the pin tracker (WP-9 Task 4, P2 §4.2).
+    ///
+    /// This is the exact sequence the `Message::Parse` arm performs so that
+    /// a stateful statement (`SET` / temp table / cursor / advisory lock /
+    /// `DISCARD` / `DEALLOCATE`) issued via the EXTENDED protocol
+    /// (Parse/Bind/Execute — what every modern driver, including
+    /// `tokio_postgres`'s own `.query()`/`.execute()`, actually uses) pins
+    /// the connection exactly as it would via the simple `Query` protocol.
+    /// Classification reuses [`ConnectionState::apply_query`] — the *same*
+    /// call the simple-`Query` arm makes — so there is a single classifier
+    /// call site shared by both protocols; nothing here duplicates
+    /// `CommandDetector`'s match.
+    ///
+    /// Called once per `Parse` (statement definition), not per `Bind`/
+    /// `Execute` — `Bind`/`Execute` carry no SQL text, only a statement/
+    /// portal name, so classification must happen here. Re-`Parse`ing the
+    /// same statement name is idempotent: `apply_query` and
+    /// `add_prepared_statement` both route through sets/maps keyed by name/
+    /// value that already dedupe.
+    fn apply_parse_state(
+        conn_state: &mut ConnectionState,
+        name: &str,
+        query: &str,
+        param_oids: &[u32],
+    ) {
+        conn_state.apply_query(query);
+        conn_state.add_prepared_statement(name.to_string(), query.to_string(), param_oids.to_vec());
     }
 
     // Query-event construction now lives on `AnonymizationSettings`
@@ -578,6 +658,192 @@ impl ConnectionHandler {
         Ok(())
     }
 
+    /// Backend-only Postgres startup + capture — the single routine that turns a
+    /// freshly-created, never-handshaked backend into a usable one (WP-9 Task 8,
+    /// P2 §5.3; whole-branch review fix).
+    ///
+    /// Sends the StartupMessage to the backend, completes backend authentication,
+    /// and records every byte the backend sends after `AuthenticationOk` (its
+    /// `ParameterStatus` messages, `BackendKeyData`, and terminating
+    /// `ReadyForQuery`), returning them for warm-reuse replay.
+    ///
+    /// This routine is deliberately **backend-only**: it never reads from nor
+    /// writes to the client stream. It is shared by two callers:
+    /// - the session-start capture path
+    ///   ([`Self::perform_startup_handshake_capturing`]), which afterwards forwards
+    ///   the captured response to the client to complete the client's startup, and
+    /// - the mid-session reacquire path, where the client is already authenticated
+    ///   and past its own startup, so ONLY the backend needs initializing.
+    async fn initialize_backend_startup(
+        connection_id: u64,
+        backend_user: String,
+        backend_password: String,
+        backend_startup_bytes: &[u8],
+        backend_stream: &mut (impl AsyncWriteExt + AsyncReadExt + Unpin),
+    ) -> Result<Vec<u8>> {
+        debug!(connection_id, "Initializing backend startup (backend-only, capturing for warm reuse)");
+
+        // Send the StartupMessage to the freshly-created backend.
+        backend_stream
+            .write_all(backend_startup_bytes)
+            .await
+            .context("Failed to forward startup to backend")?;
+
+        // Handle backend authentication.
+        let backend_auth =
+            crate::auth::BackendAuthenticator::new(backend_user, backend_password);
+        let remaining_data = backend_auth
+            .authenticate(backend_stream, &[])
+            .await
+            .context("Backend authentication failed")?;
+
+        // Capture the backend's client-facing startup response verbatim, up to and
+        // including ReadyForQuery. Nothing is forwarded to the client here.
+        let mut captured: Vec<u8> = Vec::new();
+        let mut pending = remaining_data;
+        let mut backend_buffer = vec![0u8; 8192];
+        let extractor = MessageExtractor::new();
+
+        loop {
+            if !pending.is_empty() {
+                captured.extend_from_slice(&pending);
+                if extractor.contains_ready_for_query(&pending) {
+                    debug!(connection_id, "Backend startup complete (ReadyForQuery received)");
+                    break;
+                }
+                pending.clear();
+            }
+
+            let n = backend_stream
+                .read(&mut backend_buffer)
+                .await
+                .context("Failed to read backend startup data")?;
+            if n == 0 {
+                anyhow::bail!("Backend closed connection during startup");
+            }
+            captured.extend_from_slice(&backend_buffer[..n]);
+            if extractor.contains_ready_for_query(&backend_buffer[..n]) {
+                debug!(connection_id, "Backend startup complete (ReadyForQuery received)");
+                break;
+            }
+        }
+
+        debug!(
+            connection_id,
+            captured_bytes = captured.len(),
+            "Backend startup complete; captured backend startup response for warm reuse"
+        );
+        Ok(captured)
+    }
+
+    /// Fresh-backend startup handshake for the session-start pooled path that ALSO
+    /// captures the backend's client-facing startup response for warm reuse (WP-9
+    /// Task 8, P2 §5.3).
+    ///
+    /// Authenticates the CLIENT, then delegates the backend side to
+    /// [`Self::initialize_backend_startup`] (the single backend-startup routine),
+    /// and finally forwards the captured backend startup response to the client to
+    /// complete its startup sequence. Returns `(captured_startup_response,
+    /// backend_startup_bytes)`: the caller stores the capture on the pooled
+    /// connection for warm reuse, and retains the backend-directed
+    /// `StartupMessage` bytes so a later mid-session reacquire of a fresh backend
+    /// can initialize it identically.
+    async fn perform_startup_handshake_capturing(
+        &mut self,
+        backend_stream: &mut (impl AsyncWriteExt + AsyncReadExt + Unpin),
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        let connection_id = self.connection_id;
+        debug!(connection_id, "Starting handshake (capturing for warm reuse)");
+
+        let authenticator =
+            Authenticator::new(Arc::clone(&self.config), self.authenticator.clone());
+
+        let auth_result = authenticator
+            .authenticate(&mut self.client_stream, &self.startup_data)
+            .await
+            .context("Client authentication failed")?;
+        debug!(connection_id, username = %auth_result.username, "Client authenticated");
+
+        // Forward AuthenticationOk to client.
+        let auth_ok = crate::protocol::build_auth_ok();
+        self.client_stream
+            .write_all(&auth_ok)
+            .await
+            .context("Failed to send AuthenticationOk to client")?;
+
+        // Initialize the backend side (StartupMessage + backend auth) and capture
+        // its client-facing startup response for warm reuse.
+        let captured = Self::initialize_backend_startup(
+            connection_id,
+            self.config.backend.user.clone(),
+            self.config.backend.password.clone(),
+            &auth_result.startup_bytes,
+            backend_stream,
+        )
+        .await?;
+
+        // Forward the captured backend startup response to the client, completing
+        // the client's startup. Transparent: identical bytes, delivered together
+        // (the same shape as the warm-reuse replay in `replay_startup_to_client`).
+        self.client_stream
+            .write_all(&captured)
+            .await
+            .context("Failed to forward startup data to client")?;
+        self.client_stream
+            .flush()
+            .await
+            .context("Failed to flush startup response to client")?;
+
+        debug!(
+            connection_id,
+            captured_bytes = captured.len(),
+            "Handshake complete; captured backend startup response for warm reuse"
+        );
+        Ok((captured, auth_result.startup_bytes))
+    }
+
+    /// Warm-reuse startup: serve a NEW client on a backend that has already
+    /// completed its one-time Postgres startup (WP-9 Task 8, P2 §5.3).
+    ///
+    /// The backend is already authenticated and (via recycle's `DISCARD ALL`)
+    /// reset clean, so it MUST NOT be re-initialized. We authenticate only the
+    /// client, send it `AuthenticationOk`, and replay the backend's original
+    /// captured startup response (`ParameterStatus*` + `BackendKeyData` +
+    /// `ReadyForQuery`). No bytes are sent to the backend, so its clean idle
+    /// state is preserved for the client's first real query.
+    ///
+    /// Returns the backend-directed `StartupMessage` bytes derived from this
+    /// client's startup. Although the warm-reused backend needs no
+    /// re-initialization, the handler retains these bytes so that a later
+    /// mid-session reacquire which lands on a fresh, never-handshaked backend can
+    /// initialize it via [`Self::initialize_backend_startup`].
+    async fn replay_startup_to_client(&mut self, captured: &[u8]) -> Result<Vec<u8>> {
+        let connection_id = self.connection_id;
+        debug!(connection_id, "Warm-reuse handshake: authenticating client, replaying startup");
+
+        let authenticator =
+            Authenticator::new(Arc::clone(&self.config), self.authenticator.clone());
+        let auth_result = authenticator
+            .authenticate(&mut self.client_stream, &self.startup_data)
+            .await
+            .context("Client authentication failed")?;
+        debug!(connection_id, username = %auth_result.username, "Client authenticated (warm reuse)");
+
+        let auth_ok = crate::protocol::build_auth_ok();
+        self.client_stream
+            .write_all(&auth_ok)
+            .await
+            .context("Failed to send AuthenticationOk to client")?;
+        self.client_stream
+            .write_all(captured)
+            .await
+            .context("Failed to replay captured startup response to client")?;
+        self.client_stream.flush().await.context("Failed to flush replayed startup response")?;
+
+        debug!(connection_id, "Warm-reuse handshake complete");
+        Ok(auth_result.startup_bytes)
+    }
+
     /// Handle connection with a managed connection from PoolManager
     ///
     /// This method integrates with the PoolManager for proper connection lifecycle:
@@ -621,10 +887,42 @@ impl ConnectionHandler {
         let query_timeout_dur = Duration::from_secs(query_timeout_secs);
         let mut query_deadline: Option<tokio::time::Instant> = None;
 
-        // Perform authentication and startup handshake
-        self.perform_startup_handshake(managed_conn.stream_mut())
-            .await
-            .context("Startup handshake failed")?;
+        // Reuse-aware startup handshake (WP-9 Task 8, P2 §5.3).
+        //
+        // A Postgres backend performs its startup+authentication exactly once and
+        // then stays in the query loop for life; it cannot be re-initialized with
+        // a second StartupMessage. Because a client's graceful `Terminate` is now
+        // intercepted (below) so the backend survives for warm reuse, the backend
+        // we just acquired from the pool may ALREADY be initialized (a previous
+        // client did its startup handshake and recycle DISCARD-ALL-reset it clean).
+        //
+        // - Fresh backend (no captured startup response): run the full handshake
+        //   AND capture the backend's client-facing startup response, storing it
+        //   on the pooled connection for the next reuser.
+        // - Warm-reused backend (captured startup response present): authenticate
+        //   only the CLIENT and replay the captured startup response to it —
+        //   NEVER re-send a StartupMessage to the already-initialized backend
+        //   (doing so corrupts its protocol stream and closes the session).
+        // The backend-directed `StartupMessage` bytes for this client, retained so
+        // a mid-session reacquire that lands on a fresh, never-handshaked backend
+        // (pool grew during this session) can initialize it identically instead of
+        // forwarding the client's next query to an un-initialized backend.
+        let backend_startup_bytes: Vec<u8> = match managed_conn.startup_response() {
+            Some(captured) => {
+                let captured = captured.to_vec();
+                self.replay_startup_to_client(&captured)
+                    .await
+                    .context("Client handshake on warm-reused backend failed")?
+            }
+            None => {
+                let (captured, backend_startup_bytes) = self
+                    .perform_startup_handshake_capturing(managed_conn.stream_mut()?)
+                    .await
+                    .context("Startup handshake failed")?;
+                managed_conn.set_startup_response(captured);
+                backend_startup_bytes
+            }
+        };
 
         loop {
             // Copy the deadline for this iteration so the timeout branch owns it
@@ -641,9 +939,13 @@ impl ConnectionHandler {
                         Ok(n) => {
                             let data = &client_buffer[..n];
                             let mut should_forward = true;
+                            // WP-9 Task 8 (P2 §5.3): set when the client sends a graceful
+                            // Terminate ('X'). We intercept it (do NOT forward) so the backend
+                            // session survives and can be warm-reused by the pool.
+                            let mut client_terminated = false;
 
                             // Process ALL protocol messages in buffer
-                            for msg in extractor.extract_messages(data) {
+                            for (msg_index, msg) in extractor.extract_messages(data).into_iter().enumerate() {
                                 match msg {
                                     Message::Parse { ref name, ref query, ref param_oids } => {
                                         // Validate command against pooling mode
@@ -670,11 +972,7 @@ impl ConnectionHandler {
                                             started_at: Instant::now(),
                                         });
 
-                                        conn_state.add_prepared_statement(
-                                            name.clone(),
-                                            query.clone(),
-                                            param_oids.clone(),
-                                        );
+                                        Self::apply_parse_state(&mut conn_state, name, query, param_oids);
                                     }
                                     Message::Bind { portal, statement, format_codes, params_raw } => {
                                         let (query, params, incomplete) = match stmt_cache.get_statement(&statement) {
@@ -733,13 +1031,71 @@ impl ConnectionHandler {
                                             _ => {}
                                         }
                                     }
+                                    // WP-9 Task 8 (P2 §5.3): the client is gracefully
+                                    // disconnecting. Forwarding its Terminate to the backend
+                                    // would kill the physical Postgres session, so the pool
+                                    // could never warm-reuse the backend across clients (every
+                                    // new client would pay full connect+auth — defeating the
+                                    // pool's documented purpose). Intercept it instead: stop
+                                    // forwarding this buffer, end this client's session, and let
+                                    // the final `pool_manager.release(managed_conn)` return the
+                                    // still-alive backend to deadpool. Its recycle hook then
+                                    // health-checks + `DISCARD ALL`-resets the backend before the
+                                    // next client, so reuse is both warm AND clean. This is the
+                                    // ONLY message we deliberately do not forward — a
+                                    // connection-lifecycle signal the pool owns, not a data-stream
+                                    // rewrite. (The owned/non-pooled path still forwards it 1:1.)
+                                    //
+                                    // WP-9 Task 8 review fix (Fix 1): a whole-buffer
+                                    // `should_forward = false` is only safe when Terminate is
+                                    // the SOLE / leading message this read produced
+                                    // (`should_intercept_terminate`, i.e. no preceding message
+                                    // in the same buffer). If the client pipelined another
+                                    // message (e.g. `Sync`, `Query`) immediately before
+                                    // Terminate in one `read()`, intercepting here would
+                                    // silently drop that preceding message before it ever
+                                    // reached the backend — a transparency violation strictly
+                                    // worse than losing the reuse optimization. In that case we
+                                    // fall through and forward the whole buffer verbatim
+                                    // (matching pre-Task-8 behavior): the backend receives the
+                                    // Terminate at the end and closes, so only THIS connection
+                                    // loses the warm-reuse optimization — correctness is never
+                                    // sacrificed.
+                                    Message::Terminate => {
+                                        if ConnectionHandler::should_intercept_terminate(msg_index) {
+                                            debug!(
+                                                connection_id = connection_id,
+                                                "Client sent Terminate; intercepting (not forwarding) so backend returns to pool for warm reuse"
+                                            );
+                                            should_forward = false;
+                                            client_terminated = true;
+                                            break;
+                                        }
+                                        debug!(
+                                            connection_id = connection_id,
+                                            msg_index = msg_index,
+                                            "Client Terminate preceded by other message(s) in the same read buffer; forwarding buffer verbatim (no warm reuse for this connection)"
+                                        );
+                                    }
                                     _ => {}
                                 }
                             }
 
                             // Forward to backend if not rejected
                             if should_forward {
-                                managed_conn.stream_mut().write_all(data).await.context("Failed to write to backend")?;
+                                managed_conn.stream_mut()?.write_all(data).await.context("Failed to write to backend")?;
+                            }
+
+                            // Client gracefully terminated: end the session now. The backend
+                            // never received the Terminate, so it stays alive and is released
+                            // (exactly once) by the handler-exit `release(managed_conn)` below —
+                            // no double-release (we break the outer loop here, so a following
+                            // client EOF is never read), no half-read backend (a graceful client
+                            // is idle at ReadyForQuery, so nothing is in flight; if something
+                            // rare were, recycle's health_check would catch the desync and
+                            // discard the connection — i.e. worst case is today's behavior).
+                            if client_terminated {
+                                break;
                             }
 
                             // Arm the query deadline once a query is in flight.
@@ -755,7 +1111,7 @@ impl ConnectionHandler {
                 }
 
                 // Backend -> Client
-                result = managed_conn.stream_mut().read(&mut backend_buffer) => {
+                result = managed_conn.stream_mut()?.read(&mut backend_buffer) => {
                     match result {
                         Ok(0) => {
                             debug!("Backend closed connection");
@@ -797,22 +1153,52 @@ impl ConnectionHandler {
                                     let duration = pending.started_at.elapsed();
                                     debug!(query = %crate::observability::loggable(&pending.query), duration_ms = duration.as_millis(), "Query completed successfully");
 
-                                    if let Some((event, fingerprints)) = anon_settings.build_event(
-                                        &pending.query,
-                                        pending.params,
-                                        pending.params_incomplete,
-                                        duration,
-                                        true,
-                                        None,
-                                        &connection_id_str,
-                                        &database,
-                                    ) {
-                                        if let Err(e) = batcher.send_event(event) {
-                                            warn!(error = %e, "Failed to send event to batcher");
+                                    // WP-9 Task 9 (P2 §4.6): a simple-Query
+                                    // `pending.query` may itself be a
+                                    // `;`-separated multi-statement batch (one
+                                    // Query message, N CommandCompletes on the
+                                    // wire). Before this, the whole batch was
+                                    // attributed to a SINGLE event under the
+                                    // first CommandComplete found — observable
+                                    // accuracy only, never a forwarded-bytes
+                                    // change. Re-using the exact same
+                                    // fail-closed split
+                                    // `ConnectionState::apply_query` uses for
+                                    // pinning attributes each statement to its
+                                    // own event instead. A single-statement
+                                    // query (by far the common case) yields
+                                    // exactly one part, so exactly one event —
+                                    // no change there. This is pure CPU-bound
+                                    // event construction over an already-taken
+                                    // `pending`; it runs before the bytes below
+                                    // are forwarded to the client but does no
+                                    // I/O and no awaiting, so it adds no
+                                    // material latency and can't fail the
+                                    // query itself (a publish failure is
+                                    // already best-effort/logged, same as
+                                    // before).
+                                    let mut fingerprints_all = Vec::new();
+                                    for stmt_text in CommandDetector::split_statements(&pending.query) {
+                                        if let Some((event, fingerprints)) = anon_settings.build_event(
+                                            stmt_text,
+                                            pending.params.clone(),
+                                            pending.params_incomplete,
+                                            duration,
+                                            true,
+                                            None,
+                                            &connection_id_str,
+                                            &database,
+                                        ) {
+                                            if let Err(e) = batcher.send_event(event) {
+                                                warn!(error = %e, "Failed to send event to batcher");
+                                            }
+                                            if !fingerprints.is_empty() {
+                                                fingerprints_all.extend(fingerprints);
+                                            }
                                         }
-                                        if !fingerprints.is_empty() {
-                                            metrics.record_hot_data(&fingerprints);
-                                        }
+                                    }
+                                    if !fingerprints_all.is_empty() {
+                                        metrics.record_hot_data(&fingerprints_all);
                                     }
                                     metrics.record_query(&QueryTimeline::for_completed(pending.started_at), true);
                                 }
@@ -871,48 +1257,49 @@ impl ConnectionHandler {
                                         "Re-acquired connection from pool"
                                     );
 
-                                    // State replay: if client has state but got a fresh connection,
-                                    // replay the state to the new connection
-                                    if conn_state.is_pinned() && !managed_conn.is_pinned() && !conn_state.has_unsafe_state() {
-                                        let replay_state = conn_state.get_replayable_state();
-                                        if !replay_state.prepared_statements.is_empty() || !replay_state.session_variables.is_empty() {
-                                            debug!(
-                                                connection_id = connection_id,
-                                                prepared_statements = replay_state.prepared_statements.len(),
-                                                session_variables = replay_state.session_variables.len(),
-                                                "Replaying state to new connection"
-                                            );
-
-                                            let replayer = StateReplayer::new();
-                                            match replayer.replay(&replay_state, managed_conn.stream_mut()).await {
-                                                Ok(result) => {
-                                                    if result.is_success() {
-                                                        debug!(
-                                                            connection_id = connection_id,
-                                                            prepared_statements_replayed = result.prepared_statements_replayed,
-                                                            session_variables_replayed = result.session_variables_replayed,
-                                                            "State replay completed successfully"
-                                                        );
-                                                    } else {
-                                                        warn!(
-                                                            connection_id = connection_id,
-                                                            errors = ?result.errors,
-                                                            "State replay had errors"
-                                                        );
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    warn!(
-                                                        connection_id = connection_id,
-                                                        error = %e,
-                                                        "State replay failed"
-                                                    );
-                                                    // Clear client state since replay failed
-                                                    conn_state.clear_all();
-                                                }
-                                            }
-                                        }
+                                    // WP-9 whole-branch review fix: Task 8 made a
+                                    // physical backend perform its Postgres startup
+                                    // exactly once, lazily, only on the
+                                    // session-start path. If the pool GREW during
+                                    // this active session (all existing backends
+                                    // busy), deadpool may hand us a brand-new
+                                    // backend that has never received a
+                                    // StartupMessage and is not authenticated.
+                                    // Forwarding the client's next query to it would
+                                    // desync the session. Initialize its BACKEND
+                                    // side here (the client is already authenticated
+                                    // and past its own startup, so we touch ONLY the
+                                    // backend, never the client stream) and capture
+                                    // its startup response for future warm reuse. A
+                                    // warm/reused backend already has a captured
+                                    // startup response and is skipped.
+                                    if managed_conn.startup_response().is_none() {
+                                        let captured = Self::initialize_backend_startup(
+                                            connection_id,
+                                            self.config.backend.user.clone(),
+                                            self.config.backend.password.clone(),
+                                            &backend_startup_bytes,
+                                            managed_conn.stream_mut()?,
+                                        )
+                                        .await
+                                        .context(
+                                            "Backend startup on mid-session reacquired connection failed",
+                                        )?;
+                                        managed_conn.set_startup_response(captured);
                                     }
+
+                                    // No state replay: under restrict-by-pinning
+                                    // (WP-9 Task 6, P2 §4.5) this block is reached
+                                    // only for positively-clean, UNPINNED
+                                    // connections — `should_release_connection`
+                                    // keeps any connection carrying prepared
+                                    // statements or a LISTEN pinned to its client,
+                                    // so `conn_state` has no replayable state here.
+                                    // The old fragile SQL-`PREPARE` replay (which
+                                    // could silently `clear_all()` the proxy's
+                                    // state view on I/O failure, dangling the
+                                    // client's cached statement names) is therefore
+                                    // gone by construction.
 
                                     // Continue to next iteration (data already sent to client)
                                     continue;
@@ -1565,9 +1952,11 @@ mod tests {
     }
 
     #[test]
-    fn test_should_release_connection_transaction_mode() {
+    fn test_should_release_connection_transaction_mode_clean_still_pools() {
         let conn_state = ConnectionState::new(100);
-        // Transaction mode should always release
+        // A positively-clean (unpinned) Transaction connection MUST still be
+        // released so stateless clients keep the benefit of transaction pooling
+        // (restrict-by-pinning does not disable Transaction pooling wholesale).
         assert!(ConnectionHandler::should_release_connection(
             &PoolingStrategy::Transaction,
             &conn_state
@@ -1575,11 +1964,28 @@ mod tests {
     }
 
     #[test]
-    fn test_should_release_connection_transaction_mode_with_pinned_state() {
+    fn test_should_release_connection_transaction_mode_with_prepared_statement_pins() {
         let mut conn_state = ConnectionState::new(100);
         conn_state.add_prepared_statement("stmt1".to_string(), "SELECT 1".to_string(), vec![]);
-        // Transaction mode should still release even with pinned state (strict mode)
-        assert!(ConnectionHandler::should_release_connection(
+        // Restrict-by-pinning (WP-9 Task 6, P2 §4.5): a Transaction connection
+        // carrying a client-cached prepared statement must NOT be released — it
+        // is pinned to the client. This is what makes the fragile SQL-PREPARE
+        // replay path unreachable and eliminates the silent state destruction.
+        assert!(!ConnectionHandler::should_release_connection(
+            &PoolingStrategy::Transaction,
+            &conn_state
+        ));
+    }
+
+    #[test]
+    fn test_should_release_connection_transaction_mode_with_listen_pins() {
+        let mut conn_state = ConnectionState::new(100);
+        conn_state.add_listen_channel("events".to_string());
+        // A LISTEN registration also pins the connection in Transaction mode.
+        // Before restrict-by-pinning this connection was released and its
+        // registration silently lost (LISTEN has unsafe state, so it was never
+        // even replayed); pinning fixes that latent bug.
+        assert!(!ConnectionHandler::should_release_connection(
             &PoolingStrategy::Transaction,
             &conn_state
         ));
@@ -1626,6 +2032,141 @@ mod tests {
             &PoolingStrategy::Hybrid,
             &conn_state
         ));
+    }
+
+    // Tests for should_intercept_terminate() — WP-9 Task 8 review Fix 1.
+    // These exercise the exact predicate used by the `Message::Terminate` arm
+    // in `handle_with_managed_connection`, fed with message indices produced
+    // by the SAME `MessageExtractor::extract_messages` the production
+    // forwarding loop uses — no re-invented framing.
+
+    #[test]
+    fn test_should_intercept_terminate_when_sole_message_in_buffer() {
+        use crate::protocol::MSG_TERMINATE;
+
+        let extractor = MessageExtractor::new();
+        // A read buffer containing ONLY a Terminate message.
+        let data = [MSG_TERMINATE, 0, 0, 0, 4];
+        let messages = extractor.extract_messages(&data);
+
+        let terminate_index = messages
+            .iter()
+            .position(|m| matches!(m, Message::Terminate))
+            .expect("Terminate must be parsed from the buffer");
+        assert_eq!(terminate_index, 0);
+        assert!(
+            ConnectionHandler::should_intercept_terminate(terminate_index),
+            "a sole Terminate must still be intercepted so the backend is warm-released"
+        );
+    }
+
+    #[test]
+    fn test_should_not_intercept_terminate_preceded_by_other_message() {
+        use crate::protocol::{MSG_SYNC, MSG_TERMINATE};
+
+        let extractor = MessageExtractor::new();
+        // A single client read() that pipelines Sync immediately followed by
+        // Terminate — the exact scenario the pre-fix code silently dropped
+        // (whole-buffer should_forward = false discarded the Sync).
+        let mut data = vec![MSG_SYNC, 0, 0, 0, 4];
+        data.extend_from_slice(&[MSG_TERMINATE, 0, 0, 0, 4]);
+        let messages = extractor.extract_messages(&data);
+
+        assert_eq!(messages.len(), 2, "both pipelined messages must be parsed");
+        assert!(matches!(messages[0], Message::Sync));
+        assert!(matches!(messages[1], Message::Terminate));
+
+        let terminate_index = messages
+            .iter()
+            .position(|m| matches!(m, Message::Terminate))
+            .expect("Terminate must be parsed from the buffer");
+        assert_eq!(terminate_index, 1);
+        assert!(
+            !ConnectionHandler::should_intercept_terminate(terminate_index),
+            "Terminate preceded by another message in the same buffer must NOT be \
+             intercepted — the whole buffer (including the preceding Sync) must be \
+             forwarded verbatim so the Sync is never silently dropped"
+        );
+    }
+
+    // Tests for apply_parse_state() — extended-protocol (Parse-arm) session
+    // state classification (WP-9 Task 4, P2 §4.2). `apply_parse_state` is the
+    // exact call the `Message::Parse` arm makes, so a stateful statement
+    // carried by Parse must pin the connection exactly as it would via the
+    // simple-`Query` arm's `ConnectionState::apply_query` — the same
+    // classifier, reused rather than duplicated.
+
+    #[test]
+    fn test_apply_parse_state_clean_select_only_pins_prepared_statement() {
+        let mut conn_state = ConnectionState::new(100);
+        ConnectionHandler::apply_parse_state(&mut conn_state, "s1", "SELECT 1", &[]);
+
+        assert!(conn_state.is_pinned());
+        assert!(!conn_state.has_unsafe_state());
+        assert_eq!(
+            conn_state.pin_reasons(),
+            std::iter::once(crate::proxy::PinReason::PreparedStatement).collect()
+        );
+    }
+
+    #[test]
+    fn test_apply_parse_state_set_adds_session_variable_pin_on_top_of_prepared_statement() {
+        let mut conn_state = ConnectionState::new(100);
+        ConnectionHandler::apply_parse_state(&mut conn_state, "s1", "SET search_path = foo", &[]);
+
+        assert!(conn_state.pin_reasons().contains(&crate::proxy::PinReason::PreparedStatement));
+        assert!(conn_state.pin_reasons().contains(&crate::proxy::PinReason::SessionVariable));
+        assert!(!conn_state.has_unsafe_state(), "SET is a safe/replayable pin, not unsafe state");
+    }
+
+    #[test]
+    fn test_apply_parse_state_temp_table_pins_unsafe_state() {
+        let mut conn_state = ConnectionState::new(100);
+        ConnectionHandler::apply_parse_state(
+            &mut conn_state,
+            "s1",
+            "CREATE TEMP TABLE tmp_ext (id int)",
+            &[],
+        );
+
+        assert!(conn_state.pin_reasons().contains(&crate::proxy::PinReason::TempTable));
+        assert!(conn_state.has_unsafe_state());
+    }
+
+    #[test]
+    fn test_apply_parse_state_advisory_lock_pins_unsafe_state() {
+        let mut conn_state = ConnectionState::new(100);
+        ConnectionHandler::apply_parse_state(
+            &mut conn_state,
+            "s1",
+            "SELECT pg_advisory_lock(42)",
+            &[],
+        );
+
+        assert!(conn_state.pin_reasons().contains(&crate::proxy::PinReason::AdvisoryLock));
+        assert!(conn_state.has_unsafe_state());
+    }
+
+    #[test]
+    fn test_apply_parse_state_unknown_command_fails_closed() {
+        let mut conn_state = ConnectionState::new(100);
+        ConnectionHandler::apply_parse_state(&mut conn_state, "s1", "VACUUM FULL", &[]);
+
+        assert!(conn_state.pin_reasons().contains(&crate::proxy::PinReason::UnknownCommand));
+        assert!(
+            conn_state.has_unsafe_state(),
+            "fail-closed: an unclassifiable Parse statement must pin as unsafe"
+        );
+    }
+
+    #[test]
+    fn test_apply_parse_state_reparse_of_same_name_is_idempotent() {
+        let mut conn_state = ConnectionState::new(100);
+        ConnectionHandler::apply_parse_state(&mut conn_state, "s1", "SET a = 'b'", &[]);
+        ConnectionHandler::apply_parse_state(&mut conn_state, "s1", "SET a = 'b'", &[]);
+
+        assert!(conn_state.pin_reasons().contains(&crate::proxy::PinReason::SessionVariable));
+        assert!(conn_state.pin_reasons().contains(&crate::proxy::PinReason::PreparedStatement));
     }
 
     #[test]
@@ -1820,6 +2361,72 @@ mod tests {
         assert!(
             error_str.contains("timeout waiting for connection"),
             "Should contain timeout message"
+        );
+    }
+
+    /// WP-9 whole-branch review fix: the backend-only startup routine used by the
+    /// mid-session reacquire path must turn a freshly-created, never-handshaked
+    /// backend into a usable, Postgres-initialized backend — sending the
+    /// StartupMessage, completing backend auth, and capturing the backend's
+    /// client-facing startup response for warm reuse — WITHOUT touching the
+    /// client stream.
+    #[tokio::test]
+    async fn test_initialize_backend_startup_handshakes_fresh_backend_and_captures_response() {
+        use tokio::io::duplex;
+
+        // The proxy->backend StartupMessage bytes (length 8, protocol 3.0). Our
+        // fake backend does not parse these; it only asserts they arrive.
+        let backend_startup_bytes: Vec<u8> = vec![0, 0, 0, 8, 0, 3, 0, 0];
+
+        let (mut proxy_side, mut backend_side) = duplex(8192);
+
+        // Fake un-handshaked backend: expects the StartupMessage, then replies
+        // with AuthenticationOk + ParameterStatus + BackendKeyData + ReadyForQuery.
+        let backend_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            let n = backend_side.read(&mut buf).await.unwrap();
+            // The backend must have received the StartupMessage before any query.
+            assert_eq!(&buf[..n], &[0u8, 0, 0, 8, 0, 3, 0, 0]);
+
+            let mut resp: Vec<u8> = Vec::new();
+            // AuthenticationOk
+            resp.extend_from_slice(&[b'R', 0, 0, 0, 8, 0, 0, 0, 0]);
+            // ParameterStatus server_version=16.0
+            resp.push(b'S');
+            let payload = b"server_version\016.0\0";
+            resp.extend_from_slice(&((4 + payload.len()) as i32).to_be_bytes());
+            resp.extend_from_slice(payload);
+            // BackendKeyData (pid=1, secret=2)
+            resp.extend_from_slice(&[b'K', 0, 0, 0, 12, 0, 0, 0, 1, 0, 0, 0, 2]);
+            // ReadyForQuery (Idle)
+            resp.extend_from_slice(&[b'Z', 0, 0, 0, 5, b'I']);
+            backend_side.write_all(&resp).await.unwrap();
+
+            // Keep the backend half open so the duplex isn't torn down early.
+            let _ = backend_side.read(&mut buf).await;
+        });
+
+        let captured = ConnectionHandler::initialize_backend_startup(
+            42,
+            "postgres".to_string(),
+            String::new(),
+            &backend_startup_bytes,
+            &mut proxy_side,
+        )
+        .await
+        .expect("backend startup on a fresh backend should succeed");
+
+        drop(proxy_side);
+        let _ = backend_task.await;
+
+        // The captured startup response is the backend's client-facing sequence
+        // AFTER AuthenticationOk (which backend auth consumes): it starts with the
+        // first ParameterStatus 'S' and contains a terminating ReadyForQuery.
+        assert_eq!(captured[0], b'S', "capture must begin at ParameterStatus, not AuthenticationOk");
+        let extractor = MessageExtractor::new();
+        assert!(
+            extractor.contains_ready_for_query(&captured),
+            "captured startup response must include ReadyForQuery (backend is ready for a query)"
         );
     }
 }
