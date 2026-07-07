@@ -10,12 +10,22 @@ pub enum PinReason {
     TempTable,
     Cursor,
     AdvisoryLock,
+    /// A command that could not be positively classified as safe to multiplex
+    /// was observed (P2 §4.1). Fail closed: pin, because we cannot prove the
+    /// connection is clean.
+    UnknownCommand,
 }
 
 impl PinReason {
     /// Check if this pin reason represents unsafe state that cannot be replayed
     pub fn is_unsafe(&self) -> bool {
-        matches!(self, PinReason::TempTable | PinReason::Cursor | PinReason::AdvisoryLock)
+        matches!(
+            self,
+            PinReason::TempTable
+                | PinReason::Cursor
+                | PinReason::AdvisoryLock
+                | PinReason::UnknownCommand
+        )
     }
 }
 
@@ -47,6 +57,9 @@ pub struct ConnectionState {
     cursors: HashSet<String>,
     /// Advisory locks held
     advisory_locks: HashSet<i64>,
+    /// A command that could not be positively classified as clean was seen, so
+    /// the connection must stay pinned (fail closed, P2 §4.1).
+    unknown_command: bool,
     /// Maximum prepared statements (LRU eviction)
     #[allow(dead_code)]
     max_prepared_statements: usize,
@@ -60,13 +73,15 @@ impl ConnectionState {
             temp_tables: HashSet::new(),
             cursors: HashSet::new(),
             advisory_locks: HashSet::new(),
+            unknown_command: false,
             max_prepared_statements,
         }
     }
 
     /// Check if connection is pinned (has any state)
     pub fn is_pinned(&self) -> bool {
-        !self.prepared_statements.is_empty()
+        self.unknown_command
+            || !self.prepared_statements.is_empty()
             || !self.session_variables.is_empty()
             || !self.temp_tables.is_empty()
             || !self.cursors.is_empty()
@@ -75,7 +90,50 @@ impl ConnectionState {
 
     /// Check if connection has unsafe state that cannot be replayed
     pub fn has_unsafe_state(&self) -> bool {
-        !self.temp_tables.is_empty() || !self.cursors.is_empty() || !self.advisory_locks.is_empty()
+        self.unknown_command
+            || !self.temp_tables.is_empty()
+            || !self.cursors.is_empty()
+            || !self.advisory_locks.is_empty()
+    }
+
+    /// Record that a command which could not be positively classified as clean
+    /// was observed. The connection will stay pinned until state is cleared.
+    pub fn mark_unknown_command(&mut self) {
+        self.unknown_command = true;
+    }
+
+    /// Apply a client query to the tracked state, fail-closed (P2 §4.1): a
+    /// recognized state-changing command updates the corresponding state; a
+    /// command that cannot be positively classified as clean pins the
+    /// connection via [`mark_unknown_command`].
+    pub fn apply_query(&mut self, query: &str) {
+        use crate::protocol::{CommandClass, CommandDetector, DetectedCommand};
+        match CommandDetector::classify(query) {
+            CommandClass::Clean => {}
+            CommandClass::Unknown => self.mark_unknown_command(),
+            CommandClass::Stateful(cmd) => match cmd {
+                DetectedCommand::Set { name, value } => self.add_session_variable(name, value),
+                DetectedCommand::Reset { name } => self.remove_session_variable(&name),
+                DetectedCommand::ResetAll => self.clear_session_variables(),
+                DetectedCommand::CreateTempTable { name } => self.add_temp_table(name),
+                DetectedCommand::DropTable { name } => self.remove_temp_table(&name),
+                DetectedCommand::DeclareCursor { name, .. } => self.add_cursor(name),
+                DetectedCommand::CloseCursor { name } => self.remove_cursor(&name),
+                DetectedCommand::AdvisoryLock { key } => {
+                    if let Some(k) = key {
+                        self.add_advisory_lock(k);
+                    }
+                }
+                DetectedCommand::AdvisoryUnlock { key } => {
+                    if let Some(k) = key {
+                        self.remove_advisory_lock(k);
+                    }
+                }
+                DetectedCommand::DiscardAll => self.clear_all(),
+                DetectedCommand::Deallocate { name } => self.remove_prepared_statement(&name),
+                DetectedCommand::DeallocateAll => self.clear_prepared_statements(),
+            },
+        }
     }
 
     /// Get all current pin reasons
@@ -95,6 +153,9 @@ impl ConnectionState {
         }
         if !self.advisory_locks.is_empty() {
             reasons.insert(PinReason::AdvisoryLock);
+        }
+        if self.unknown_command {
+            reasons.insert(PinReason::UnknownCommand);
         }
         reasons
     }
@@ -176,6 +237,9 @@ impl ConnectionState {
         self.temp_tables.clear();
         self.cursors.clear();
         self.advisory_locks.clear();
+        // DISCARD ALL resets the session, so a prior unknown command no longer
+        // keeps the connection pinned.
+        self.unknown_command = false;
     }
 }
 

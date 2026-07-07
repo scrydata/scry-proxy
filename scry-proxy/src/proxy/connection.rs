@@ -5,9 +5,7 @@ use super::{
 use crate::auth::{Authenticator, FileAuthenticator};
 use crate::config::{BackpressureMode, Config, ParseFailureMode, PoolingStrategy};
 use crate::observability::{ProxyMetrics, QueryTimeline};
-use crate::protocol::{
-    decode_params, CommandDetector, DetectedCommand, Message, MessageExtractor, QueryAnonymizer,
-};
+use crate::protocol::{decode_params, Message, MessageExtractor, QueryAnonymizer};
 use crate::publisher::{QueryEvent, QueryEventBuilder};
 use crate::tls::ClientTransport;
 use anyhow::{Context, Result};
@@ -710,7 +708,7 @@ impl ConnectionHandler {
                                             started_at: Instant::now(),
                                         });
 
-                                        Self::update_connection_state(&mut conn_state, query);
+                                        conn_state.apply_query(query);
                                     }
                                     Message::Close { kind, ref name } => {
                                         match kind {
@@ -941,54 +939,6 @@ impl ConnectionHandler {
     }
 
     /// Update connection state based on detected SQL command
-    fn update_connection_state(conn_state: &mut ConnectionState, query: &str) {
-        if let Some(cmd) = CommandDetector::detect(query) {
-            match cmd {
-                DetectedCommand::Set { name, value } => {
-                    conn_state.add_session_variable(name, value);
-                }
-                DetectedCommand::Reset { name } => {
-                    conn_state.remove_session_variable(&name);
-                }
-                DetectedCommand::ResetAll => {
-                    conn_state.clear_session_variables();
-                }
-                DetectedCommand::CreateTempTable { name } => {
-                    conn_state.add_temp_table(name);
-                }
-                DetectedCommand::DropTable { name } => {
-                    // Only remove if it's a known temp table
-                    conn_state.remove_temp_table(&name);
-                }
-                DetectedCommand::DeclareCursor { name, .. } => {
-                    conn_state.add_cursor(name);
-                }
-                DetectedCommand::CloseCursor { name } => {
-                    conn_state.remove_cursor(&name);
-                }
-                DetectedCommand::AdvisoryLock { key } => {
-                    if let Some(k) = key {
-                        conn_state.add_advisory_lock(k);
-                    }
-                }
-                DetectedCommand::AdvisoryUnlock { key } => {
-                    if let Some(k) = key {
-                        conn_state.remove_advisory_lock(k);
-                    }
-                }
-                DetectedCommand::DiscardAll => {
-                    conn_state.clear_all();
-                }
-                DetectedCommand::Deallocate { name } => {
-                    conn_state.remove_prepared_statement(&name);
-                }
-                DetectedCommand::DeallocateAll => {
-                    conn_state.clear_prepared_statements();
-                }
-            }
-        }
-    }
-
     /// Handle connection with an owned backend TCP stream
     async fn handle_with_owned_backend(mut self, mut backend_stream: TcpStream) -> Result<()> {
         // Perform authentication and startup handshake
@@ -1639,7 +1589,7 @@ mod tests {
     #[test]
     fn test_update_connection_state_set() {
         let mut conn_state = ConnectionState::new(100);
-        ConnectionHandler::update_connection_state(&mut conn_state, "SET timezone = 'UTC'");
+        conn_state.apply_query("SET timezone = 'UTC'");
         assert!(conn_state.is_pinned());
     }
 
@@ -1649,7 +1599,7 @@ mod tests {
         conn_state.add_session_variable("timezone".to_string(), "UTC".to_string());
         assert!(conn_state.is_pinned());
 
-        ConnectionHandler::update_connection_state(&mut conn_state, "RESET timezone");
+        conn_state.apply_query("RESET timezone");
         assert!(!conn_state.is_pinned());
     }
 
@@ -1660,17 +1610,14 @@ mod tests {
         conn_state.add_session_variable("search_path".to_string(), "public".to_string());
         assert!(conn_state.is_pinned());
 
-        ConnectionHandler::update_connection_state(&mut conn_state, "RESET ALL");
+        conn_state.apply_query("RESET ALL");
         assert!(!conn_state.is_pinned());
     }
 
     #[test]
     fn test_update_connection_state_create_temp_table() {
         let mut conn_state = ConnectionState::new(100);
-        ConnectionHandler::update_connection_state(
-            &mut conn_state,
-            "CREATE TEMP TABLE tmp_users (id int)",
-        );
+        conn_state.apply_query("CREATE TEMP TABLE tmp_users (id int)");
         assert!(conn_state.is_pinned());
         assert!(conn_state.has_unsafe_state());
     }
@@ -1678,10 +1625,7 @@ mod tests {
     #[test]
     fn test_update_connection_state_declare_cursor() {
         let mut conn_state = ConnectionState::new(100);
-        ConnectionHandler::update_connection_state(
-            &mut conn_state,
-            "DECLARE my_cursor CURSOR FOR SELECT 1",
-        );
+        conn_state.apply_query("DECLARE my_cursor CURSOR FOR SELECT 1");
         assert!(conn_state.is_pinned());
         assert!(conn_state.has_unsafe_state());
     }
@@ -1692,17 +1636,14 @@ mod tests {
         conn_state.add_cursor("my_cursor".to_string());
         assert!(conn_state.has_unsafe_state());
 
-        ConnectionHandler::update_connection_state(&mut conn_state, "CLOSE my_cursor");
+        conn_state.apply_query("CLOSE my_cursor");
         assert!(!conn_state.has_unsafe_state());
     }
 
     #[test]
     fn test_update_connection_state_advisory_lock() {
         let mut conn_state = ConnectionState::new(100);
-        ConnectionHandler::update_connection_state(
-            &mut conn_state,
-            "SELECT pg_advisory_lock(12345)",
-        );
+        conn_state.apply_query("SELECT pg_advisory_lock(12345)");
         assert!(conn_state.is_pinned());
         assert!(conn_state.has_unsafe_state());
     }
@@ -1713,10 +1654,7 @@ mod tests {
         conn_state.add_advisory_lock(12345);
         assert!(conn_state.has_unsafe_state());
 
-        ConnectionHandler::update_connection_state(
-            &mut conn_state,
-            "SELECT pg_advisory_unlock(12345)",
-        );
+        conn_state.apply_query("SELECT pg_advisory_unlock(12345)");
         assert!(!conn_state.has_unsafe_state());
     }
 
@@ -1729,7 +1667,7 @@ mod tests {
         assert!(conn_state.is_pinned());
         assert!(conn_state.has_unsafe_state());
 
-        ConnectionHandler::update_connection_state(&mut conn_state, "DISCARD ALL");
+        conn_state.apply_query("DISCARD ALL");
         assert!(!conn_state.is_pinned());
         assert!(!conn_state.has_unsafe_state());
     }
@@ -1740,7 +1678,7 @@ mod tests {
         conn_state.add_prepared_statement("stmt1".to_string(), "SELECT 1".to_string(), vec![]);
         assert!(conn_state.is_pinned());
 
-        ConnectionHandler::update_connection_state(&mut conn_state, "DEALLOCATE stmt1");
+        conn_state.apply_query("DEALLOCATE stmt1");
         assert!(!conn_state.is_pinned());
     }
 
@@ -1751,14 +1689,14 @@ mod tests {
         conn_state.add_prepared_statement("stmt2".to_string(), "SELECT 2".to_string(), vec![]);
         assert!(conn_state.is_pinned());
 
-        ConnectionHandler::update_connection_state(&mut conn_state, "DEALLOCATE ALL");
+        conn_state.apply_query("DEALLOCATE ALL");
         assert!(!conn_state.is_pinned());
     }
 
     #[test]
     fn test_update_connection_state_regular_query_no_effect() {
         let mut conn_state = ConnectionState::new(100);
-        ConnectionHandler::update_connection_state(&mut conn_state, "SELECT * FROM users");
+        conn_state.apply_query("SELECT * FROM users");
         assert!(!conn_state.is_pinned());
     }
 
@@ -1768,7 +1706,7 @@ mod tests {
         conn_state.add_temp_table("tmp_users".to_string());
         assert!(conn_state.has_unsafe_state());
 
-        ConnectionHandler::update_connection_state(&mut conn_state, "DROP TABLE tmp_users");
+        conn_state.apply_query("DROP TABLE tmp_users");
         assert!(!conn_state.has_unsafe_state());
     }
 

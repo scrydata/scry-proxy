@@ -14,7 +14,7 @@ pub use auth_messages::{
     parse_password_message, verify_md5_response, AuthRequest, StartupMessage,
 };
 pub use bind::decode_params;
-pub use command_detector::{CommandDetector, DetectedCommand};
+pub use command_detector::{CommandClass, CommandDetector, DetectedCommand};
 pub use extractor::MessageExtractor;
 pub use startup::{
     is_ssl_request as is_ssl_request_msg, read_startup_message, MAX_STARTUP_MESSAGE_SIZE,

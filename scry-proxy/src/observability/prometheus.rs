@@ -211,6 +211,12 @@ fn export_pooling_metrics(output: &mut String, metrics: &ProxyMetrics) {
         pin_counts.advisory_lock
     )
     .unwrap();
+    writeln!(
+        output,
+        "scry_pool_pin_reason_total{{reason=\"unknown_command\"}} {}",
+        pin_counts.unknown_command
+    )
+    .unwrap();
 
     // Queue depth gauge
     writeln!(output, "# HELP scry_pool_queue_depth Current wait queue depth").unwrap();
