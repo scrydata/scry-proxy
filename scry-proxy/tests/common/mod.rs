@@ -1,0 +1,469 @@
+//! Shared differential-transparency test harness (WP-9, P2 §5.1).
+//!
+//! This module is included via `mod common;` from individual `tests/*.rs` binaries
+//! (Rust convention: a file at `tests/common/mod.rs`, rather than `tests/common.rs`,
+//! is not itself compiled as a standalone test binary). It factors the config/
+//! publisher/proxy-bringup boilerplate that the 5 pre-existing container suites
+//! each copy-pasted, and adds the direct-vs-proxy comparison primitives that none
+//! of them had: `paired_clients`, `all_modes`, and the result comparator.
+//!
+//! Not every test binary uses every item here, so allow dead_code at the module
+//! level rather than sprinkling `#[allow(dead_code)]` per item.
+#![allow(dead_code)]
+
+use scry::{config::*, observability::*, proxy::*, publisher::*};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::time::sleep;
+use tokio_postgres::{Client, SimpleQueryMessage};
+
+// ---------------------------------------------------------------------------
+// Publisher
+// ---------------------------------------------------------------------------
+
+/// Test publisher that captures events for verification (copied verbatim from
+/// the pattern in `integration_test.rs` / `transaction_pooling_test.rs`).
+#[derive(Debug, Clone)]
+pub struct TestPublisher {
+    events: Arc<Mutex<Vec<QueryEvent>>>,
+}
+
+impl Default for TestPublisher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TestPublisher {
+    pub fn new() -> Self {
+        Self { events: Arc::new(Mutex::new(Vec::new())) }
+    }
+
+    pub fn events(&self) -> Vec<QueryEvent> {
+        self.events.lock().unwrap().clone()
+    }
+
+    pub fn event_count(&self) -> usize {
+        self.events.lock().unwrap().len()
+    }
+
+    pub fn clear(&self) {
+        self.events.lock().unwrap().clear();
+    }
+
+    pub fn find_query(&self, pattern: &str) -> Option<QueryEvent> {
+        self.events.lock().unwrap().iter().find(|e| e.query.contains(pattern)).cloned()
+    }
+}
+
+#[async_trait::async_trait]
+impl EventPublisher for TestPublisher {
+    async fn publish_batch(&self, events: Vec<QueryEvent>) -> anyhow::Result<()> {
+        let mut captured = self.events.lock().unwrap();
+        captured.extend(events);
+        Ok(())
+    }
+
+    async fn shutdown(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Config + proxy bring-up
+// ---------------------------------------------------------------------------
+
+/// Shared config builder, parametrized by backend address and pooling mode
+/// (mirrors `transaction_pooling_test.rs:52`).
+pub fn create_test_config(host: String, port: u16, pooling: PoolingStrategy) -> Config {
+    Config {
+        proxy: ProxyConfig {
+            listen_address: "127.0.0.1:0".to_string(), // Let OS assign port
+            max_connections: 100,
+            shutdown_timeout_secs: 5,
+            unix_socket: None,
+        },
+        databases: Vec::new(),
+        backend: BackendConfig {
+            protocol: DatabaseProtocol::Postgres,
+            host,
+            port,
+            database: "postgres".to_string(),
+            user: "postgres".to_string(),
+            password: "postgres".to_string(),
+            pool_size: 5,
+            connection_timeout_ms: 5000,
+        },
+        observability: ObservabilityConfig {
+            enable_tracing: false,
+            otlp_endpoint: None,
+            service_name: "scry-differential-test".to_string(),
+            enable_metrics_server: false,
+            metrics_server_address: "127.0.0.1:0".to_string(),
+            unsafe_debug_logging: false,
+        },
+        protocol: ProtocolConfig { max_prepared_statements: 100 },
+        publisher: PublisherConfig {
+            enabled: true,
+            batch_size: 10,
+            flush_interval_ms: 100,
+            anonymize: false,
+            publisher_type: "debug".to_string(),
+            max_queue_size: 1000,
+            http_endpoint: None,
+            http_timeout_ms: 500,
+            http_max_retries: 2,
+            http_api_key: None,
+            http_compression: false,
+            shadow_id: None,
+            allow_insecure: false,
+            anonymize_salt: None,
+            parse_failure_mode: ParseFailureMode::Redact,
+        },
+        performance: PerformanceConfig {
+            latency_budget: scry::config::LatencyBudget::default(),
+            query_timeout_secs: 0,
+            connection_pooling: pooling,
+            pool_size: 5,
+            pool_min_idle: 1,
+            pool_timeout_secs: 30,
+            pool_recycle_secs: 3600,
+            pool_aggressive_unpinning: false,
+            buffer_size: 8192,
+            pool_queue_depth: 50,
+            pool_idle_unpin_secs: 60,
+            pool_lifo: true,
+            pool_reset_timeout_ms: 5000,
+            pool_ratio_warning_threshold: 20,
+            pool_backpressure_mode: scry::config::BackpressureMode::RejectImmediate,
+            pool_retry_hint_ms: 200,
+            pool_queue_saturation_warn_threshold: 0.8,
+        },
+        resilience: ResilienceConfig {
+            circuit_breaker: CircuitBreakerConfig {
+                enabled: false,
+                failure_threshold: 5,
+                success_threshold: 2,
+                window_secs: 30,
+                open_timeout_secs: 60,
+                use_health_monitor: false,
+            },
+            connection_retry: ConnectionRetryConfig {
+                enabled: false,
+                max_attempts: 3,
+                initial_backoff_ms: 50,
+                max_backoff_ms: 5000,
+                backoff_multiplier: 2.0,
+                jitter_factor: 0.1,
+            },
+            healthcheck: HealthcheckConfig {
+                active_enabled: false,
+                interval_secs: 30,
+                timeout_ms: 1000,
+                failure_threshold: 3,
+            },
+        },
+        tls: TlsConfig::default(),
+        auth: AuthConfig::default(),
+        admin: AdminConfig::default(),
+    }
+}
+
+/// Start the proxy server and return its listen port (mirrors
+/// `integration_test.rs:151`).
+pub async fn start_test_proxy(
+    config: Config,
+    publisher: Arc<dyn EventPublisher>,
+) -> anyhow::Result<u16> {
+    let batcher = EventBatcher::new(
+        publisher,
+        config.publisher.batch_size,
+        config.publisher.flush_interval_ms,
+        config.publisher.max_queue_size,
+    );
+
+    let metrics = Arc::new(ProxyMetrics::new(100, HealthConfig::default()));
+    let server = ProxyServer::new(config.clone(), batcher, metrics).await?;
+    let port = server.local_addr()?.port();
+
+    tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    Ok(port)
+}
+
+/// Variant that also returns the metrics handle (mirrors
+/// `integration_test.rs:872`), for tasks that need to inspect histograms.
+pub async fn start_test_proxy_with_metrics(
+    config: Config,
+    publisher: Arc<dyn EventPublisher>,
+) -> anyhow::Result<(u16, Arc<ProxyMetrics>)> {
+    let batcher = EventBatcher::new(
+        publisher,
+        config.publisher.batch_size,
+        config.publisher.flush_interval_ms,
+        config.publisher.max_queue_size,
+    );
+
+    let metrics = Arc::new(ProxyMetrics::new(100, HealthConfig::default()));
+    let server = ProxyServer::new(config.clone(), batcher, Arc::clone(&metrics)).await?;
+    let port = server.local_addr()?.port();
+
+    tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    Ok((port, metrics))
+}
+
+/// All four pooling modes, for matrix loops.
+pub fn all_modes() -> [PoolingStrategy; 4] {
+    [
+        PoolingStrategy::Disabled,
+        PoolingStrategy::Session,
+        PoolingStrategy::Transaction,
+        PoolingStrategy::Hybrid,
+    ]
+}
+
+// ---------------------------------------------------------------------------
+// Client connection helpers
+// ---------------------------------------------------------------------------
+
+/// Connects a `tokio_postgres` client to `host:port` and spawns its connection
+/// driver in the background, returning the ready-to-use client.
+pub async fn connect_client(
+    host: &str,
+    port: u16,
+    user: &str,
+    password: &str,
+    dbname: &str,
+) -> anyhow::Result<Client> {
+    let (client, connection) = tokio_postgres::connect(
+        &format!("host={host} port={port} user={user} password={password} dbname={dbname}"),
+        tokio_postgres::NoTls,
+    )
+    .await?;
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("connection error: {e}");
+        }
+    });
+
+    Ok(client)
+}
+
+/// A proxy-connected client paired with a client connected directly to the
+/// same backend container, for the same pooling mode. This is the core
+/// primitive of the differential suite: run the same operation on both and
+/// compare via [`assert_outcomes_equivalent`].
+pub struct PairedClients {
+    pub proxy_port: u16,
+    pub proxy: Client,
+    pub direct: Client,
+}
+
+/// Starts a proxy in front of `backend_host:backend_port` with the given
+/// pooling mode, and returns both a client connected through the proxy and a
+/// client connected directly to the backend container.
+///
+/// The direct client is the "ground truth": a real client talking to
+/// unmodified Postgres. The proxy client is what we're validating. If the
+/// proxy is truly transparent, every observable outcome should match.
+pub async fn paired_clients(
+    backend_host: &str,
+    backend_port: u16,
+    pooling: PoolingStrategy,
+) -> anyhow::Result<PairedClients> {
+    let config = create_test_config(backend_host.to_string(), backend_port, pooling);
+    let publisher: Arc<dyn EventPublisher> = Arc::new(TestPublisher::new());
+    let proxy_port = start_test_proxy(config.clone(), publisher).await?;
+
+    // Give the proxy listener a moment to come up before connecting.
+    sleep(Duration::from_millis(300)).await;
+
+    let proxy = connect_client(
+        "127.0.0.1",
+        proxy_port,
+        &config.backend.user,
+        &config.backend.password,
+        &config.backend.database,
+    )
+    .await?;
+    let direct = connect_client(
+        backend_host,
+        backend_port,
+        &config.backend.user,
+        &config.backend.password,
+        &config.backend.database,
+    )
+    .await?;
+
+    Ok(PairedClients { proxy_port, proxy, direct })
+}
+
+// ---------------------------------------------------------------------------
+// Result comparator
+// ---------------------------------------------------------------------------
+
+/// A single statement's outcome from the simple query protocol: the row data
+/// (as text — simple protocol never returns binary), and the rows-affected /
+/// command-complete count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatementResult {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<Option<String>>>,
+    pub rows_affected: u64,
+}
+
+/// The full outcome of a (possibly multi-statement) simple-query call: one
+/// [`StatementResult`] per statement, in order.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct QuerySnapshot {
+    pub statements: Vec<StatementResult>,
+}
+
+/// Normalizes the raw `SimpleQueryMessage` stream into a [`QuerySnapshot`].
+/// Rows accumulate into the statement they belong to; a `CommandComplete`
+/// closes out the current statement.
+fn snapshot_from_messages(msgs: Vec<SimpleQueryMessage>) -> QuerySnapshot {
+    let mut statements = Vec::new();
+    let mut columns: Vec<String> = Vec::new();
+    let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+
+    for msg in msgs {
+        match msg {
+            SimpleQueryMessage::RowDescription(cols) => {
+                columns = cols.iter().map(|c| c.name().to_string()).collect();
+            }
+            SimpleQueryMessage::Row(row) => {
+                let mut values = Vec::with_capacity(row.len());
+                for i in 0..row.len() {
+                    values.push(row.get(i).map(|s| s.to_string()));
+                }
+                rows.push(values);
+            }
+            SimpleQueryMessage::CommandComplete(rows_affected) => {
+                statements.push(StatementResult {
+                    columns: std::mem::take(&mut columns),
+                    rows: std::mem::take(&mut rows),
+                    rows_affected,
+                });
+            }
+            // SimpleQueryMessage is #[non_exhaustive] upstream in newer versions;
+            // treat anything else as a no-op rather than fail to compile.
+            #[allow(unreachable_patterns)]
+            _ => {}
+        }
+    }
+
+    QuerySnapshot { statements }
+}
+
+/// The outcome of running one operation against one client: either a
+/// normalized result snapshot, or an error identified by its SQLSTATE code
+/// (never by message text, which can differ between direct and proxied
+/// connections even when the underlying error is identical).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunOutcome {
+    Ok(QuerySnapshot),
+    Err { sqlstate: Option<String> },
+}
+
+/// Runs `sql` via the simple query protocol and captures the outcome.
+///
+/// Uses `simple_query` (not `.query()`/`.execute()`, which always use the
+/// extended protocol in `tokio_postgres` even with zero parameters) so the
+/// baseline matrix genuinely exercises the simple-protocol path end to end,
+/// including multi-statement batches like `BEGIN; ...; COMMIT;`.
+pub async fn run_simple(client: &Client, sql: &str) -> RunOutcome {
+    match client.simple_query(sql).await {
+        Ok(msgs) => RunOutcome::Ok(snapshot_from_messages(msgs)),
+        Err(e) => RunOutcome::Err { sqlstate: e.code().map(|c| c.code().to_string()) },
+    }
+}
+
+/// The comparator: asserts that the direct and proxied outcomes of the same
+/// operation are equivalent — same rows (values + column names/count), same
+/// command tag / rows-affected, and (for errors) the same SQLSTATE code.
+/// `context` is prefixed to failure messages to identify which case failed.
+///
+/// This is the load-bearing assertion for the whole differential suite: if
+/// it ever degenerated to always passing, every test built on it would be
+/// worthless. See the self-proof test in
+/// `differential_transparency_test.rs` for the check that it actually
+/// discriminates.
+pub fn assert_outcomes_equivalent(direct: &RunOutcome, proxy: &RunOutcome, context: &str) {
+    match (direct, proxy) {
+        (RunOutcome::Ok(d), RunOutcome::Ok(p)) => {
+            assert_eq!(
+                d, p,
+                "{context}: direct and proxied results diverged (rows/columns/command-tag)"
+            );
+        }
+        (RunOutcome::Err { sqlstate: d }, RunOutcome::Err { sqlstate: p }) => {
+            assert_eq!(d, p, "{context}: direct and proxied SQLSTATE diverged");
+        }
+        (direct, proxy) => {
+            panic!(
+                "{context}: one side errored and the other did not — direct={direct:?} proxy={proxy:?}"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pool-cleanliness probe
+// ---------------------------------------------------------------------------
+
+/// Extracts the first column of the first row from a simple-query message
+/// stream, if any (used by [`assert_session_state_clean`]).
+fn simple_first_value(msgs: &[SimpleQueryMessage]) -> Option<String> {
+    msgs.iter().find_map(|m| match m {
+        SimpleQueryMessage::Row(row) if row.len() > 0 => row.get(0).map(|s| s.to_string()),
+        _ => None,
+    })
+}
+
+/// Opens a fresh connection to `host:port` and asserts no session-local state
+/// leaked from a previous client sharing this proxy's pool: `guc_name` must
+/// still report `expected_guc_value` (its default, if the caller never sets
+/// it), and `temp_table_name` (a previously-created temp table, schema-
+/// qualified e.g. `"pg_temp.leak_probe"`) must not be visible via
+/// `to_regclass`.
+///
+/// This is the proof that pooling doesn't leak state: Postgres temp tables
+/// and session GUCs live on the *backend* connection, not the logical client
+/// session, so if the proxy hands the same backend connection to a new
+/// client without resetting it, this probe catches it.
+pub async fn assert_session_state_clean(
+    host: &str,
+    port: u16,
+    user: &str,
+    password: &str,
+    dbname: &str,
+    guc_name: &str,
+    expected_guc_value: &str,
+    temp_table_name: &str,
+) -> anyhow::Result<()> {
+    let client = connect_client(host, port, user, password, dbname).await?;
+
+    let msgs = client.simple_query(&format!("SHOW {guc_name}")).await?;
+    let actual_guc = simple_first_value(&msgs).unwrap_or_default();
+    anyhow::ensure!(
+        actual_guc.eq_ignore_ascii_case(expected_guc_value),
+        "GUC {guc_name} leaked across pooled sessions: expected '{expected_guc_value}', got '{actual_guc}'"
+    );
+
+    let msgs =
+        client.simple_query(&format!("SELECT to_regclass('{temp_table_name}')::text")).await?;
+    let visible = simple_first_value(&msgs);
+    anyhow::ensure!(
+        visible.is_none(),
+        "temp table {temp_table_name} leaked across pooled sessions (to_regclass returned {visible:?})"
+    );
+
+    Ok(())
+}
