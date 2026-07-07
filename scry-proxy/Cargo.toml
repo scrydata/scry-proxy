@@ -102,3 +102,10 @@ postgres-native-tls = "0.5"
 [[bench]]
 name = "proxy_throughput"
 harness = false
+
+# Non-blocking perf signal: measures the proxy's added latency (direct-vs-proxy
+# delta) against the configured budget and prints a report. Exits 0 regardless
+# so CI can run it as an informational signal (flips to blocking in WP-13).
+[[bench]]
+name = "overhead_delta"
+harness = false
