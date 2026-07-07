@@ -1,0 +1,65 @@
+# cargo-deny policy for scry-proxy (P7 §4.2).
+#
+# Run locally with: cargo deny check
+# CI gate: .github/workflows/ci.yml `deny` job.
+
+[graph]
+targets = []
+all-features = false
+no-default-features = false
+
+[advisories]
+version = 2
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+ignore = [
+    # rand 0.8.5 / 0.9.2: "Rand is unsound with a custom logger using
+    # `rand::rng()`". Our only uses of `rand` are `thread_rng()` +
+    # `Rng::fill` for SCRAM salt generation (auth/scram.rs,
+    # auth/authenticator.rs) and retry-jitter (resilience/retry.rs) — none
+    # of these install a custom logger that calls `rand::rng()`, so the
+    # unsoundness described in the advisory cannot be triggered by this
+    # codebase. There is no fixed 0.8.x release; upgrading to the 0.9/1.0
+    # API is a breaking change tracked separately and not worth forcing
+    # here purely for an inapplicable advisory.
+    # Expires 2026-10-31 — re-evaluate (a fixed 0.8.x release may exist by
+    # then, or the rand upgrade may have landed via other work).
+    # NOTE: this cargo-deny release's advisories.ignore schema only supports
+    # {id, reason} — no machine-checked `expires` field. The expiry above is
+    # tracked by convention (grep this file / re-run `cargo audit` on that
+    # date) until cargo-deny adds native expiry support.
+    { id = "RUSTSEC-2026-0097", reason = "unsound only when a custom logger calls rand::rng(); this codebase does not do that. No 0.8.x fix exists. Re-review by 2026-10-31 (expiry tracked by convention; see comment above)." },
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    # Mozilla's CA root bundle data shipped by `webpki-roots`.
+    "CDLA-Permissive-2.0",
+    # Public-domain-equivalent; used standalone by `tiny-keccak` (via
+    # const-random -> ordered-multimap -> rust-ini -> config).
+    "CC0-1.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "warn"
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
