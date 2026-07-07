@@ -11,9 +11,11 @@ name = "scry"
 path = "src/main.rs"
 
 [dependencies]
-# Protocol dependency (path dep for coordinated schema work; see WP-15 for
-# switching back to a published crates.io version)
-scry-protocol = { path = "../../scry-protocol" }
+# Event protocol crate, from crates.io. The proxy does not currently consume any
+# unreleased schema changes, so it depends on the published version (reproducible
+# in CI). When a coordinated schema change is needed, bump to a newly-released
+# version (a path dep can be reintroduced locally for that development, per WP-11/WP-15).
+scry-protocol = "0.1"
 
 # Async runtime
 tokio = { workspace = true }

@@ -1392,7 +1392,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.2",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -2707,6 +2707,8 @@ dependencies = [
 [[package]]
 name = "scry-protocol"
 version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d2d6a195ccc92d17db822cd5d1bc8ca49208c944319390d62a736d49091f1030"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
