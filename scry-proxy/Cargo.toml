@@ -11,8 +11,9 @@ name = "scry"
 path = "src/main.rs"
 
 [dependencies]
-# Protocol dependency (published on crates.io)
-scry-protocol = "0.1.0"
+# Protocol dependency (path dep for coordinated schema work; see WP-15 for
+# switching back to a published crates.io version)
+scry-protocol = { path = "../../scry-protocol" }
 
 # Async runtime
 tokio = { workspace = true }

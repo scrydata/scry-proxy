@@ -2706,9 +2706,7 @@ dependencies = [
 
 [[package]]
 name = "scry-protocol"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20a470405b67539b3d939abafbedb4f21af559c392abd4467cb24659f546a4c7"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
