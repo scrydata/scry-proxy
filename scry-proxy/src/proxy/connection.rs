@@ -676,7 +676,7 @@ impl ConnectionHandler {
         let mut query_deadline: Option<tokio::time::Instant> = None;
 
         // Perform authentication and startup handshake
-        self.perform_startup_handshake(managed_conn.stream_mut())
+        self.perform_startup_handshake(managed_conn.stream_mut()?)
             .await
             .context("Startup handshake failed")?;
 
@@ -789,7 +789,7 @@ impl ConnectionHandler {
 
                             // Forward to backend if not rejected
                             if should_forward {
-                                managed_conn.stream_mut().write_all(data).await.context("Failed to write to backend")?;
+                                managed_conn.stream_mut()?.write_all(data).await.context("Failed to write to backend")?;
                             }
 
                             // Arm the query deadline once a query is in flight.
@@ -805,7 +805,7 @@ impl ConnectionHandler {
                 }
 
                 // Backend -> Client
-                result = managed_conn.stream_mut().read(&mut backend_buffer) => {
+                result = managed_conn.stream_mut()?.read(&mut backend_buffer) => {
                     match result {
                         Ok(0) => {
                             debug!("Backend closed connection");

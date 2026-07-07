@@ -1,6 +1,6 @@
 // scry-proxy/src/proxy/connection_state.rs
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Reasons why a connection is pinned to a client
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -73,9 +73,15 @@ pub struct ConnectionState {
     /// A command that could not be positively classified as clean was seen, so
     /// the connection must stay pinned (fail closed, P2 §4.1).
     unknown_command: bool,
-    /// Maximum prepared statements (LRU eviction)
-    #[allow(dead_code)]
+    /// Maximum prepared statements (LRU eviction). Clamped to at least 1 (see
+    /// [`ConnectionState::new`]) so a misconfigured/unset `0` can never mean
+    /// "evict everything" — that would let a prepared statement exist on the
+    /// backend while the map (and therefore `is_pinned()`) reports clean.
     max_prepared_statements: usize,
+    /// Insertion/use order for `prepared_statements`, oldest at the front.
+    /// A plain `HashMap` has no order, so this tracks LRU order alongside it;
+    /// kept in sync on every insert/remove/clear.
+    prepared_statements_lru: VecDeque<String>,
 }
 
 impl ConnectionState {
@@ -88,7 +94,12 @@ impl ConnectionState {
             advisory_locks: HashSet::new(),
             listen_channels: HashSet::new(),
             unknown_command: false,
-            max_prepared_statements,
+            // Fail-closed: a bound of 0 must not silently evict every
+            // statement immediately after insertion (which would leave the
+            // map empty and `is_pinned()` reporting clean despite a live
+            // prepared statement on the backend). Clamp to a minimum of 1.
+            max_prepared_statements: max_prepared_statements.max(1),
+            prepared_statements_lru: VecDeque::new(),
         }
     }
 
@@ -192,17 +203,44 @@ impl ConnectionState {
     }
 
     // Prepared statements
+    ///
+    /// Enforces `max_prepared_statements` with LRU eviction (closes
+    /// `TODO(tracked): WP-9 Task 7`): if the name is already tracked, its LRU
+    /// position is refreshed; otherwise, once the map is at the bound, the
+    /// least-recently-used statement is evicted (from both the map and the
+    /// order tracker) before the new one is inserted. Because eviction only
+    /// ever runs immediately before an insert, the map never goes empty as a
+    /// side effect of eviction — it stays at the bound (>= 1, see `new`),
+    /// non-empty, so `is_pinned()` correctly remains `true`.
     pub fn add_prepared_statement(&mut self, name: String, query: String, param_oids: Vec<u32>) {
-        // TODO: LRU eviction if over max
-        self.prepared_statements.insert(name, (query, param_oids));
+        if self.prepared_statements.contains_key(&name) {
+            // Re-inserting an existing name: refresh its LRU position rather
+            // than double-counting it in the order tracker.
+            self.prepared_statements_lru.retain(|n| n != &name);
+        } else {
+            while self.prepared_statements.len() >= self.max_prepared_statements {
+                if let Some(oldest) = self.prepared_statements_lru.pop_front() {
+                    self.prepared_statements.remove(&oldest);
+                } else {
+                    // Order tracker empty but map at/over bound would mean
+                    // they've desynced; break defensively rather than loop.
+                    break;
+                }
+            }
+        }
+
+        self.prepared_statements.insert(name.clone(), (query, param_oids));
+        self.prepared_statements_lru.push_back(name);
     }
 
     pub fn remove_prepared_statement(&mut self, name: &str) {
         self.prepared_statements.remove(name);
+        self.prepared_statements_lru.retain(|n| n != name);
     }
 
     pub fn clear_prepared_statements(&mut self) {
         self.prepared_statements.clear();
+        self.prepared_statements_lru.clear();
     }
 
     // Session variables
@@ -277,6 +315,7 @@ impl ConnectionState {
     /// Clear all state (for DISCARD ALL or connection reset)
     pub fn clear_all(&mut self) {
         self.prepared_statements.clear();
+        self.prepared_statements_lru.clear();
         self.session_variables.clear();
         self.temp_tables.clear();
         self.cursors.clear();
@@ -573,5 +612,107 @@ mod tests {
     #[test]
     fn test_pin_reason_listen_is_unsafe() {
         assert!(PinReason::Listen.is_unsafe());
+    }
+
+    // -- LRU bound on prepared statements (WP-9 Task 7, P2 §4.7) -------------
+
+    #[test]
+    fn test_add_prepared_statement_beyond_bound_evicts_oldest() {
+        let mut state = ConnectionState::new(2);
+        state.add_prepared_statement("stmt1".to_string(), "SELECT 1".to_string(), vec![]);
+        state.add_prepared_statement("stmt2".to_string(), "SELECT 2".to_string(), vec![]);
+        // Over the bound of 2: stmt1 (oldest) must be evicted.
+        state.add_prepared_statement("stmt3".to_string(), "SELECT 3".to_string(), vec![]);
+
+        let replay = state.get_replayable_state();
+        assert_eq!(replay.prepared_statements.len(), 2);
+        let names: Vec<&str> = replay.prepared_statements.iter().map(|s| s.name.as_str()).collect();
+        assert!(!names.contains(&"stmt1"), "oldest statement should have been evicted");
+        assert!(names.contains(&"stmt2"));
+        assert!(names.contains(&"stmt3"));
+    }
+
+    #[test]
+    fn test_lru_eviction_keeps_connection_pinned() {
+        let mut state = ConnectionState::new(1);
+        state.add_prepared_statement("stmt1".to_string(), "SELECT 1".to_string(), vec![]);
+        state.add_prepared_statement("stmt2".to_string(), "SELECT 2".to_string(), vec![]);
+
+        // Map stays at the bound (non-empty), so pinning must never lapse due
+        // to eviction alone.
+        assert!(state.is_pinned());
+        assert!(state.pin_reasons().contains(&PinReason::PreparedStatement));
+    }
+
+    #[test]
+    fn test_lru_order_tracker_has_no_stale_entries_after_removal() {
+        let mut state = ConnectionState::new(3);
+        state.add_prepared_statement("stmt1".to_string(), "SELECT 1".to_string(), vec![]);
+        state.add_prepared_statement("stmt2".to_string(), "SELECT 2".to_string(), vec![]);
+        state.remove_prepared_statement("stmt1");
+
+        // Fill back up to the bound; if the removed "stmt1" were still lurking
+        // in the order tracker, it could be evicted a second time (harmless)
+        // but must never resurface in the replayable state or be double-counted.
+        state.add_prepared_statement("stmt3".to_string(), "SELECT 3".to_string(), vec![]);
+        state.add_prepared_statement("stmt4".to_string(), "SELECT 4".to_string(), vec![]);
+
+        let replay = state.get_replayable_state();
+        assert_eq!(replay.prepared_statements.len(), 3);
+        let names: Vec<&str> = replay.prepared_statements.iter().map(|s| s.name.as_str()).collect();
+        assert!(!names.contains(&"stmt1"));
+    }
+
+    #[test]
+    fn test_lru_order_tracker_synced_after_clear_prepared_statements() {
+        let mut state = ConnectionState::new(2);
+        state.add_prepared_statement("stmt1".to_string(), "SELECT 1".to_string(), vec![]);
+        state.clear_prepared_statements();
+
+        // After clearing, filling back up to the bound should evict purely on
+        // FIFO order among the new entries, with no stale "stmt1" tracked.
+        state.add_prepared_statement("stmt2".to_string(), "SELECT 2".to_string(), vec![]);
+        state.add_prepared_statement("stmt3".to_string(), "SELECT 3".to_string(), vec![]);
+        state.add_prepared_statement("stmt4".to_string(), "SELECT 4".to_string(), vec![]);
+
+        let replay = state.get_replayable_state();
+        assert_eq!(replay.prepared_statements.len(), 2);
+        let names: Vec<&str> = replay.prepared_statements.iter().map(|s| s.name.as_str()).collect();
+        assert!(!names.contains(&"stmt1"));
+        assert!(!names.contains(&"stmt2"), "stmt2 should be the oldest of the new batch, evicted");
+        assert!(names.contains(&"stmt3"));
+        assert!(names.contains(&"stmt4"));
+    }
+
+    #[test]
+    fn test_lru_order_tracker_synced_after_clear_all() {
+        let mut state = ConnectionState::new(2);
+        state.add_prepared_statement("stmt1".to_string(), "SELECT 1".to_string(), vec![]);
+        state.clear_all();
+
+        state.add_prepared_statement("stmt2".to_string(), "SELECT 2".to_string(), vec![]);
+        state.add_prepared_statement("stmt3".to_string(), "SELECT 3".to_string(), vec![]);
+        state.add_prepared_statement("stmt4".to_string(), "SELECT 4".to_string(), vec![]);
+
+        let replay = state.get_replayable_state();
+        assert_eq!(replay.prepared_statements.len(), 2);
+        let names: Vec<&str> = replay.prepared_statements.iter().map(|s| s.name.as_str()).collect();
+        assert!(!names.contains(&"stmt1"));
+        assert!(!names.contains(&"stmt2"));
+        assert!(names.contains(&"stmt3"));
+        assert!(names.contains(&"stmt4"));
+    }
+
+    #[test]
+    fn test_zero_max_prepared_statements_does_not_break_pinning() {
+        // A misconfigured/unset bound of 0 must not mean "evict everything":
+        // that would let a prepared statement exist on the backend while the
+        // proxy believes the connection is clean (unsafe multiplexing). Guard
+        // by clamping the effective bound to at least 1.
+        let mut state = ConnectionState::new(0);
+        state.add_prepared_statement("stmt1".to_string(), "SELECT 1".to_string(), vec![]);
+
+        assert!(state.is_pinned());
+        assert_eq!(state.get_replayable_state().prepared_statements.len(), 1);
     }
 }

@@ -15,7 +15,8 @@ pub use connection_state::{ConnectionState, PinReason, PreparedStatementInfo, Re
 pub use event_batcher::EventBatcher;
 pub use mode_enforcer::{ModeEnforcer, PoolingMode};
 pub use pool_manager::{
-    AcquireError, ManagedConnection, PoolManager, PoolManagerConfig, StickyConnectionInfo,
+    AcquireError, ConnectionTaken, ManagedConnection, PoolManager, PoolManagerConfig,
+    StickyConnectionInfo,
 };
 pub use server::ProxyServer;
 pub use tcp_pool::{PoolStatus, TcpConnectionPool};

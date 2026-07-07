@@ -407,7 +407,27 @@ impl ProxyServer {
 
     /// Get the authenticator, if authentication is enabled
     pub fn authenticator(&self) -> Option<Arc<FileAuthenticator>> {
-        self.authenticator.read().unwrap().clone()
+        self.authenticator_read().clone()
+    }
+
+    /// Read-lock the authenticator, recovering from a poisoned lock.
+    ///
+    /// `std::sync::RwLock` poisons if a thread panics while holding a guard.
+    /// The guarded value (`Option<Arc<FileAuthenticator>>`) is plain data with
+    /// no invariant that a panic mid-write could leave inconsistent from a
+    /// reader's perspective — either the old Arc or the new one is present —
+    /// so it is always valid to recover and read it. A single poisoned lock
+    /// must not cascade into every new connection's spawn path panicking.
+    fn authenticator_read(&self) -> std::sync::RwLockReadGuard<'_, Option<Arc<FileAuthenticator>>> {
+        self.authenticator.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Write-lock the authenticator, recovering from a poisoned lock (see
+    /// [`Self::authenticator_read`]).
+    fn authenticator_write(
+        &self,
+    ) -> std::sync::RwLockWriteGuard<'_, Option<Arc<FileAuthenticator>>> {
+        self.authenticator.write().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Get the reload sender for use by signal handlers
@@ -477,7 +497,7 @@ impl ProxyServer {
         if let Some(auth_file) = auth_file {
             match FileAuthenticator::from_file(auth_file) {
                 Ok(new_auth) => {
-                    let mut auth_guard = self.authenticator.write().unwrap();
+                    let mut auth_guard = self.authenticator_write();
                     let user_count = new_auth.len();
                     *auth_guard = Some(Arc::new(new_auth));
                     info!(
@@ -956,7 +976,7 @@ impl ProxyServer {
         let metrics = Arc::clone(&self.metrics);
         let tls_config = self.tls_config.clone();
         // Read current authenticator from RwLock (allows hot-reload via SIGHUP)
-        let authenticator = self.authenticator.read().unwrap().clone();
+        let authenticator = self.authenticator_read().clone();
         let active_connections = Arc::clone(&self.active_connections);
 
         // Increment connection counter BEFORE spawning
@@ -1032,7 +1052,7 @@ impl ProxyServer {
         let pool_managers = self.pool_managers.clone();
         let metrics = Arc::clone(&self.metrics);
         // Read current authenticator from RwLock (allows hot-reload via SIGHUP)
-        let authenticator = self.authenticator.read().unwrap().clone();
+        let authenticator = self.authenticator_read().clone();
         let active_connections = Arc::clone(&self.active_connections);
 
         // Increment connection counter BEFORE spawning
@@ -1452,6 +1472,42 @@ mod tests {
             .unwrap();
 
         // Should have authenticator with the test user
+        let auth = server.authenticator().unwrap();
+        assert!(auth.has_user("testuser"));
+        assert!(auth.check_password("testuser", "testpass"));
+    }
+
+    #[tokio::test]
+    async fn test_authenticator_read_survives_poisoned_lock() {
+        // Create a temp auth file so the server has a real authenticator to read.
+        let mut auth_file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(auth_file, "\"testuser\" \"testpass\"").unwrap();
+        auth_file.flush().unwrap();
+
+        let mut config = create_test_config();
+        config.auth.auth_type = AuthType::Md5;
+        config.auth.auth_file = Some(auth_file.path().to_string_lossy().to_string());
+
+        let publisher = Arc::new(DebugLoggerPublisher::new());
+        let metrics = Arc::new(ProxyMetrics::new(100, HealthConfig::default()));
+
+        let server = Arc::new(
+            ProxyServer::new(config, EventBatcher::new(publisher, 10, 100, 1000), metrics)
+                .await
+                .unwrap(),
+        );
+
+        // Poison the std::sync::RwLock by panicking while holding the write guard.
+        let server_for_thread = Arc::clone(&server);
+        let poisoner = std::thread::spawn(move || {
+            let _guard = server_for_thread.authenticator.write().unwrap();
+            panic!("intentionally poisoning the authenticator lock");
+        });
+        // The thread panicking is expected; joining just waits for it to finish.
+        assert!(poisoner.join().is_err());
+
+        // A subsequent read must recover the poisoned guard rather than panic,
+        // and must still return the valid authenticator data.
         let auth = server.authenticator().unwrap();
         assert!(auth.has_user("testuser"));
         assert!(auth.check_password("testuser", "testpass"));
