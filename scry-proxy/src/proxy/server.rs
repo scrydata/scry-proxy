@@ -744,6 +744,11 @@ impl ProxyServer {
         // Graceful shutdown: wait for active connections to drain
         self.drain_connections(connection_tasks).await;
 
+        // Announce drain completion so a blocking admin `SHUTDOWN WAIT`
+        // (WP-10 Task 5) can return once the proxy has actually drained,
+        // rather than reporting a premature success.
+        self.admin_handles.signal_drain_complete();
+
         // EventBatcher will be dropped here, which closes the channel
         // and triggers flush of remaining events + publisher shutdown
         info!("Proxy server shutdown complete");
@@ -1058,13 +1063,16 @@ impl ProxyServer {
         let authenticator = self.authenticator_read().clone();
         let active_connections = Arc::clone(&self.active_connections);
         let admin_handles = Arc::clone(&self.admin_handles);
+        // Clone the registry handle out so we can store this task's abort handle
+        // AFTER spawning (the `Arc` inside `admin_handles` is moved into the task).
+        let client_registry = Arc::clone(&admin_handles.client_registry);
 
         // Increment connection counter BEFORE spawning
         active_connections.fetch_add(1, Ordering::Relaxed);
         // Also update ProxyMetrics for observability
         metrics.increment_active_connections();
 
-        connection_tasks.spawn(async move {
+        let abort_handle = connection_tasks.spawn(async move {
             // Ensure counter is decremented AND the registry entry (if any) is
             // removed on every exit path (drop guard pattern).
             let _guard = ConnectionCountGuard {
@@ -1143,6 +1151,9 @@ impl ProxyServer {
             )
             .await;
         });
+
+        // Record this task's abort handle so `KILL [db]` can cancel it (Task 5).
+        client_registry.register_abort_handle(conn_id, abort_handle);
     }
 
     /// Spawn a handler for a UNIX socket connection (Unix platforms only)
@@ -1161,13 +1172,16 @@ impl ProxyServer {
         let authenticator = self.authenticator_read().clone();
         let active_connections = Arc::clone(&self.active_connections);
         let admin_handles = Arc::clone(&self.admin_handles);
+        // Clone the registry handle out so we can store this task's abort handle
+        // AFTER spawning (the `Arc` inside `admin_handles` is moved into the task).
+        let client_registry = Arc::clone(&admin_handles.client_registry);
 
         // Increment connection counter BEFORE spawning
         active_connections.fetch_add(1, Ordering::Relaxed);
         // Also update ProxyMetrics for observability
         metrics.increment_active_connections();
 
-        connection_tasks.spawn(async move {
+        let abort_handle = connection_tasks.spawn(async move {
             // Ensure counter is decremented AND the registry entry (if any) is
             // removed on every exit path (drop guard pattern).
             let _guard = ConnectionCountGuard {
@@ -1196,6 +1210,9 @@ impl ProxyServer {
             )
             .await;
         });
+
+        // Record this task's abort handle so `KILL [db]` can cancel it (Task 5).
+        client_registry.register_abort_handle(conn_id, abort_handle);
     }
 
     /// Common connection handling logic for both TCP and UNIX sockets

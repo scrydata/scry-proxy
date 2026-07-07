@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::watch;
+use tokio::task::AbortHandle;
 
 /// Coarse lifecycle state of a client connection.
 ///
@@ -67,6 +68,13 @@ pub struct ClientEntry {
 #[derive(Debug, Default)]
 pub struct ClientRegistry {
     inner: RwLock<HashMap<u64, ClientEntry>>,
+    /// Per-connection task cancellation handles, keyed by `conn_id` (WP-10 Task
+    /// 5 KILL). Populated at connection spawn (before identity is known, so it
+    /// is a *separate* map from `inner`, whose entry is only inserted once the
+    /// startup message is parsed). Removed on the same drop path as `inner`, so
+    /// it can never outlive its task. `KILL [db]` reads `inner` to find which
+    /// connections match a database, then aborts their handles from here.
+    abort_handles: RwLock<HashMap<u64, AbortHandle>>,
 }
 
 impl ClientRegistry {
@@ -80,10 +88,62 @@ impl ClientRegistry {
         self.inner.write().insert(entry.conn_id, entry);
     }
 
+    /// Store the task [`AbortHandle`] for a connection so `KILL` can cancel it
+    /// (WP-10 Task 5). Called at spawn time, before the connection's identity
+    /// (and thus its [`ClientEntry`]) is known. O(1), off the hot path.
+    pub fn register_abort_handle(&self, conn_id: u64, handle: AbortHandle) {
+        self.abort_handles.write().insert(conn_id, handle);
+    }
+
     /// Remove a connection. No-op if it was never registered, so it is always
-    /// safe to call from a drop guard regardless of how far startup got.
+    /// safe to call from a drop guard regardless of how far startup got. Also
+    /// drops the connection's abort handle (Task 5), keeping the two maps in
+    /// lockstep on every exit path (clean close, error, terminate, KILL abort).
     pub fn deregister(&self, conn_id: u64) {
         self.inner.write().remove(&conn_id);
+        self.abort_handles.write().remove(&conn_id);
+    }
+
+    /// `KILL [db]`: forcibly disconnect every live client whose startup
+    /// `database` matches `db` (case-insensitive). Aborts each matching
+    /// connection's task (closing its client socket) AND removes its registry
+    /// entry + abort handle synchronously, so the registry never lists a
+    /// killed connection even for the brief window before the aborted task's
+    /// drop guard runs. Returns the `conn_id`s that were killed.
+    ///
+    /// The two maps are locked sequentially (never nested) here and everywhere
+    /// else, so this can't deadlock against a concurrent `deregister`.
+    pub fn kill_by_database(&self, db: &str) -> Vec<u64> {
+        // 1. Find matching connections (read lock on entries only).
+        let matched: Vec<u64> = {
+            let entries = self.inner.read();
+            entries
+                .values()
+                .filter(|e| e.database.eq_ignore_ascii_case(db))
+                .map(|e| e.conn_id)
+                .collect()
+        };
+        if matched.is_empty() {
+            return matched;
+        }
+        // 2. Abort each task and drop its handle (write lock on handles only).
+        {
+            let mut handles = self.abort_handles.write();
+            for id in &matched {
+                if let Some(handle) = handles.remove(id) {
+                    handle.abort();
+                }
+            }
+        }
+        // 3. Remove the entries (write lock on inner only), so a follow-up
+        //    SHOW CLIENTS / snapshot can't still see them.
+        {
+            let mut entries = self.inner.write();
+            for id in &matched {
+                entries.remove(id);
+            }
+        }
+        matched
     }
 
     /// Best-effort update of a live entry's coarse state and `last_request_time`.
@@ -207,6 +267,13 @@ pub struct AdminHandles {
     pub client_registry: Arc<ClientRegistry>,
     /// Backend/pool registry (Task 2 SHOW SERVERS).
     pub server_registry: Arc<ServerRegistry>,
+    /// Drain-completion signal (Task 5 `SHUTDOWN WAIT`). `run()` sets this to
+    /// `true` via [`Self::signal_drain_complete`] once `drain_connections`
+    /// returns (all connections drained or force-aborted). `SHUTDOWN WAIT`
+    /// subscribes via [`Self::subscribe_drain_complete`] and blocks until it
+    /// flips, so the admin command can report completion rather than a false
+    /// immediate success. Created internally (never wired from an OS signal).
+    drain_complete: watch::Sender<bool>,
 }
 
 impl AdminHandles {
@@ -221,6 +288,8 @@ impl AdminHandles {
     ) -> Arc<Self> {
         let client_registry = Arc::new(ClientRegistry::new());
         let server_registry = Arc::new(ServerRegistry::new(pool_managers.clone()));
+        // Seeded `false`; `run()` flips it to `true` when the drain finishes.
+        let (drain_complete, _drain_rx) = watch::channel(false);
         Arc::new(Self {
             pool_managers,
             reload_sender,
@@ -229,6 +298,7 @@ impl AdminHandles {
             config,
             client_registry,
             server_registry,
+            drain_complete,
         })
     }
 
@@ -245,6 +315,22 @@ impl AdminHandles {
     /// down / receiver dropped).
     pub fn trigger_shutdown(&self) -> bool {
         self.shutdown_trigger.send(true).is_ok()
+    }
+
+    /// Announce that the graceful drain has finished (Task 5 `SHUTDOWN WAIT`).
+    /// Called by `run()` immediately after `drain_connections` returns. Idempotent
+    /// and infallible: the sender lives for the whole process, so there is always
+    /// at least itself keeping the channel open.
+    pub fn signal_drain_complete(&self) {
+        let _ = self.drain_complete.send(true);
+    }
+
+    /// Subscribe to the drain-completion signal (Task 5 `SHUTDOWN WAIT`). The
+    /// returned receiver observes `true` once (and stays `true`) after the drain
+    /// completes. Subscribe BEFORE calling [`Self::trigger_shutdown`] so the
+    /// completion transition can never be missed.
+    pub fn subscribe_drain_complete(&self) -> watch::Receiver<bool> {
+        self.drain_complete.subscribe()
     }
 
     /// Minimal handles for unit/integration tests: default config, no pools,

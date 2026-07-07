@@ -9,6 +9,7 @@ use crate::proxy::{AdminHandles, ClientState, PoolManager};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// A single logical database as seen from config (the default `"*"` backend
 /// plus every entry in `config.databases`), joined with the key used to look
@@ -994,13 +995,89 @@ impl AdminConsole {
         }
     }
 
-    async fn shutdown(&self, _wait: bool) -> Result<AdminResponse> {
-        // TODO: Implement shutdown signal
+    /// SHUTDOWN [WAIT] — initiate the REAL graceful drain (WP-10 Task 5, P4
+    /// §4.2/§5.4), the same drain `run()` performs on SIGINT/SIGTERM.
+    ///
+    /// Fires `AdminHandles::shutdown_trigger`, which `run()`'s `tokio::select!`
+    /// observes exactly like an OS signal: it stops accepting new connections
+    /// and drains the active ones (bounded by `shutdown_timeout_secs`, then
+    /// force-abort). Returns an honest `ErrorResponse` if the trigger can no
+    /// longer initiate a drain (shutdown already in progress / `run()` no longer
+    /// listening) — never a false `CommandComplete`.
+    ///
+    /// WAIT semantics: plain `SHUTDOWN` returns `CommandComplete` immediately
+    /// (the drain proceeds; this admin connection is itself torn down as part of
+    /// the drain — PgBouncer-like). `SHUTDOWN WAIT` blocks on the
+    /// drain-completion signal (set by `run()` when `drain_connections`
+    /// returns), bounded by `shutdown_timeout_secs` + slack so it can never hang
+    /// past the drain's own bound.
+    ///
+    /// Deadlock note: when WAIT is issued over a connection that is itself part
+    /// of the drained set (the normal case), that connection is force-aborted at
+    /// `shutdown_timeout_secs`, so WAIT behaves like plain SHUTDOWN there — its
+    /// distinct value is for out-of-band callers holding these handles directly.
+    async fn shutdown(&self, wait: bool) -> Result<AdminResponse> {
+        // Subscribe to the completion signal BEFORE triggering, so a fast drain
+        // can't flip-and-be-missed between trigger and await.
+        let mut drain_rx = self.handles.subscribe_drain_complete();
+
+        if !self.handles.trigger_shutdown() {
+            return Ok(AdminResponse::Error {
+                message: "shutdown already in progress (or the server is no longer accepting the \
+                          shutdown signal)"
+                    .to_string(),
+            });
+        }
+
+        if !wait {
+            return Ok(AdminResponse::CommandComplete { tag: "SHUTDOWN".to_string() });
+        }
+
+        // WAIT: block until the drain completes, bounded so we never hang past
+        // the drain's own timeout (+ slack for the force-abort/flush tail).
+        // Both outcomes (Ok = drain completed / sender dropped as the process
+        // tore down; Err = outer bound elapsed while the time-bounded drain is
+        // still proceeding) resolve to the same honest completion — the `let`
+        // binding drops the borrow of `drain_rx` before the function returns.
+        let bound = Duration::from_secs(self.handles.config.proxy.shutdown_timeout_secs + 2);
+        let _drained = tokio::time::timeout(bound, drain_rx.wait_for(|done| *done)).await;
         Ok(AdminResponse::CommandComplete { tag: "SHUTDOWN".to_string() })
     }
 
-    async fn kill(&self, _database: Option<String>) -> Result<AdminResponse> {
-        // TODO: Implement kill functionality
-        Ok(AdminResponse::CommandComplete { tag: "KILL".to_string() })
+    /// KILL [db] — forcibly disconnect all live client connections for a
+    /// database (WP-10 Task 5, P4 §4.2/§5.4).
+    ///
+    /// Requires a database argument (bare `KILL` is an error). Validates `db`
+    /// against the configured databases and returns an honest `ErrorResponse`
+    /// for an unknown one — never a false `CommandComplete`. For a known db it
+    /// aborts every matching client's task (closing its client socket) and
+    /// removes its registry entry, returning the count killed in the tag.
+    ///
+    /// The backend connections those clients held return to the pool and are
+    /// recycled by the existing pool hygiene on next checkout. The admin
+    /// (`pgbouncer`) console is never a configured database, so `KILL` can never
+    /// target the admin connection issuing it.
+    async fn kill(&self, database: Option<String>) -> Result<AdminResponse> {
+        let db = match database {
+            Some(db) => db,
+            None => {
+                return Ok(AdminResponse::Error {
+                    message: "KILL requires a database name (usage: KILL <db>)".to_string(),
+                });
+            }
+        };
+
+        // Honest error for an unknown database (checked against config, so it
+        // works regardless of whether pooling is enabled).
+        let known = self
+            .database_entries()
+            .iter()
+            .any(|e| e.name.eq_ignore_ascii_case(&db) || e.pool_key.eq_ignore_ascii_case(&db));
+        if !known {
+            return Ok(AdminResponse::Error { message: format!("no such database: {db}") });
+        }
+
+        let killed = self.handles.client_registry.kill_by_database(&db);
+        Ok(AdminResponse::CommandComplete { tag: format!("KILL {}", killed.len()) })
     }
 }
