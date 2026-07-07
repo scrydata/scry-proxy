@@ -3,7 +3,7 @@
 //! Implements PgBouncer-compatible admin commands.
 
 use super::response::AdminResponse;
-use crate::config::PoolingStrategy;
+use crate::config::{redacted_opt, AuthType, Config, PoolingStrategy, RedactedSecret, TlsSslMode};
 use crate::observability::ProxyMetrics;
 use crate::proxy::{AdminHandles, ClientState};
 use anyhow::Result;
@@ -47,6 +47,45 @@ fn pool_mode_str(strategy: &PoolingStrategy) -> &'static str {
         PoolingStrategy::Transaction => "transaction",
         PoolingStrategy::Hybrid => "hybrid",
     }
+}
+
+/// Render a [`TlsSslMode`] the way it's configured/serialized (lowercase,
+/// hyphenated), for `SHOW CONFIG` display.
+fn tls_mode_str(mode: &TlsSslMode) -> &'static str {
+    match mode {
+        TlsSslMode::Disable => "disable",
+        TlsSslMode::Allow => "allow",
+        TlsSslMode::Require => "require",
+        TlsSslMode::VerifyCa => "verify-ca",
+        TlsSslMode::VerifyFull => "verify-full",
+    }
+}
+
+/// Render an [`AuthType`] the way it's configured/serialized, for `SHOW
+/// CONFIG` display.
+fn auth_type_str(auth_type: &AuthType) -> &'static str {
+    match auth_type {
+        AuthType::Trust => "trust",
+        AuthType::Md5 => "md5",
+        AuthType::ScramSha256 => "scram-sha-256",
+        AuthType::Cert => "cert",
+    }
+}
+
+/// Render a `bool` config value the PgBouncer-ish way `SHOW CONFIG` uses.
+fn bool_str(value: bool) -> &'static str {
+    if value {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
+/// Render a non-secret `Option<String>` config value: the real value if set,
+/// or an honest `<unset>` marker (never a bare empty string, which would be
+/// indistinguishable from an intentionally-empty configured value).
+fn opt_str(value: &Option<String>) -> String {
+    value.clone().unwrap_or_else(|| "<unset>".to_string())
 }
 
 /// Split an `"host:port"` (or bracketed IPv6 `"[::1]:port"`) string into its
@@ -614,8 +653,259 @@ impl AdminConsole {
         })
     }
 
+    /// `SHOW CONFIG` — the REAL running configuration (WP-10, P4 §4.3), not
+    /// the 3 hardcoded rows this used to return.
+    ///
+    /// Security-sensitive (P4 §5.5): `backend.password`, `admin.admin_password`,
+    /// `publisher.http_api_key`, and `publisher.anonymize_salt` must NEVER
+    /// appear in the `value` column. Redaction is by construction rather than
+    /// hand-formatted-and-hoped-remembered: every secret's display string is
+    /// produced by routing it through `redacted_opt`/`RedactedSecret` —
+    /// `config/mod.rs`'s own redacting `Debug` machinery (already covered by
+    /// its own leak-regression test at `config/mod.rs:1161-1186`) — so this
+    /// can't silently drift from that redaction. The closures below only ever
+    /// inspect a secret's `Option`/emptiness; the plaintext value itself is
+    /// never read or formatted.
+    ///
+    /// `config.databases` (per-database backend overrides, each with their
+    /// own `password`) is deliberately NOT dumped here: today those don't have
+    /// a redacting `Debug` of their own (a separate, narrower pre-existing gap
+    /// — see report), so the safest thing this handler can do is not touch
+    /// them at all, exactly like `SHOW DATABASES` already doesn't emit
+    /// per-database passwords.
     fn show_config(&self) -> Result<AdminResponse> {
-        // Return basic config info
+        let cfg = &self.handles.config;
+        let default_cfg = Config::default();
+
+        // The one and only place the redaction placeholder text is produced —
+        // reusing `RedactedSecret`'s Debug impl instead of a second
+        // hand-typed `"<redacted>"` literal.
+        let redacted = format!("{:?}", RedactedSecret);
+        // Presence-only: `redacted_opt` turns `Some(secret)` into
+        // `Some(RedactedSecret)` and `None` stays `None` — the secret's value
+        // is never bound to a variable here.
+        let opt_secret_str = |value: &Option<String>| match redacted_opt(value) {
+            Some(_) => redacted.clone(),
+            None => "<unset>".to_string(),
+        };
+        // `backend.password` is a required `String`, not `Option<String>`;
+        // only its emptiness is inspected, never its contents.
+        let required_secret_str = |value: &str| {
+            if value.is_empty() {
+                "<unset>".to_string()
+            } else {
+                redacted.clone()
+            }
+        };
+
+        let mut rows: Vec<Vec<String>> = Vec::new();
+        let mut push = |key: &str, value: String, default: String, changeable: bool| {
+            rows.push(vec![key.to_string(), value, default, bool_str(changeable).to_string()]);
+        };
+
+        // Nothing is actually live-reloadable yet (RELOAD is still a stub —
+        // WP-10 Task 4), so `changeable` is honestly `no` across the board
+        // rather than a fabricated `yes` copied from the old canned rows.
+        const CHANGEABLE: bool = false;
+
+        // -- pooling / connection limits (PgBouncer-compatible key names) --
+        push(
+            "pool_mode",
+            pool_mode_str(&cfg.performance.connection_pooling).to_string(),
+            pool_mode_str(&default_cfg.performance.connection_pooling).to_string(),
+            CHANGEABLE,
+        );
+        push(
+            "max_client_conn",
+            cfg.proxy.max_connections.to_string(),
+            default_cfg.proxy.max_connections.to_string(),
+            CHANGEABLE,
+        );
+        push(
+            "default_pool_size",
+            cfg.performance.pool_size.to_string(),
+            default_cfg.performance.pool_size.to_string(),
+            CHANGEABLE,
+        );
+
+        // -- proxy --
+        push(
+            "proxy.listen_address",
+            cfg.proxy.listen_address.clone(),
+            default_cfg.proxy.listen_address.clone(),
+            CHANGEABLE,
+        );
+        push(
+            "proxy.shutdown_timeout_secs",
+            cfg.proxy.shutdown_timeout_secs.to_string(),
+            default_cfg.proxy.shutdown_timeout_secs.to_string(),
+            CHANGEABLE,
+        );
+
+        // -- backend (default database) --
+        push(
+            "backend.host",
+            cfg.backend.host.clone(),
+            default_cfg.backend.host.clone(),
+            CHANGEABLE,
+        );
+        push(
+            "backend.port",
+            cfg.backend.port.to_string(),
+            default_cfg.backend.port.to_string(),
+            CHANGEABLE,
+        );
+        push(
+            "backend.database",
+            cfg.backend.database.clone(),
+            default_cfg.backend.database.clone(),
+            CHANGEABLE,
+        );
+        push(
+            "backend.user",
+            cfg.backend.user.clone(),
+            default_cfg.backend.user.clone(),
+            CHANGEABLE,
+        );
+        // SECRET.
+        push(
+            "backend.password",
+            required_secret_str(&cfg.backend.password),
+            required_secret_str(&default_cfg.backend.password),
+            CHANGEABLE,
+        );
+
+        // -- performance / pool timeouts --
+        push(
+            "performance.pool_min_idle",
+            cfg.performance.pool_min_idle.to_string(),
+            default_cfg.performance.pool_min_idle.to_string(),
+            CHANGEABLE,
+        );
+        push(
+            "performance.pool_timeout_secs",
+            cfg.performance.pool_timeout_secs.to_string(),
+            default_cfg.performance.pool_timeout_secs.to_string(),
+            CHANGEABLE,
+        );
+        push(
+            "performance.query_timeout_secs",
+            cfg.performance.query_timeout_secs.to_string(),
+            default_cfg.performance.query_timeout_secs.to_string(),
+            CHANGEABLE,
+        );
+
+        // -- TLS --
+        push(
+            "tls.client_tls_sslmode",
+            tls_mode_str(&cfg.tls.client_tls_sslmode).to_string(),
+            tls_mode_str(&default_cfg.tls.client_tls_sslmode).to_string(),
+            CHANGEABLE,
+        );
+        push(
+            "tls.server_tls_sslmode",
+            tls_mode_str(&cfg.tls.server_tls_sslmode).to_string(),
+            tls_mode_str(&default_cfg.tls.server_tls_sslmode).to_string(),
+            CHANGEABLE,
+        );
+
+        // -- auth --
+        push(
+            "auth.auth_type",
+            auth_type_str(&cfg.auth.auth_type).to_string(),
+            auth_type_str(&default_cfg.auth.auth_type).to_string(),
+            CHANGEABLE,
+        );
+        push(
+            "auth.allow_trust",
+            bool_str(cfg.auth.allow_trust).to_string(),
+            bool_str(default_cfg.auth.allow_trust).to_string(),
+            CHANGEABLE,
+        );
+
+        // -- admin console --
+        push(
+            "admin.enabled",
+            bool_str(cfg.admin.enabled).to_string(),
+            bool_str(default_cfg.admin.enabled).to_string(),
+            CHANGEABLE,
+        );
+        // SECRET.
+        push(
+            "admin.admin_password",
+            opt_secret_str(&cfg.admin.admin_password),
+            opt_secret_str(&default_cfg.admin.admin_password),
+            CHANGEABLE,
+        );
+
+        // -- observability / metrics --
+        push(
+            "observability.enable_metrics_server",
+            bool_str(cfg.observability.enable_metrics_server).to_string(),
+            bool_str(default_cfg.observability.enable_metrics_server).to_string(),
+            CHANGEABLE,
+        );
+        push(
+            "observability.metrics_server_address",
+            cfg.observability.metrics_server_address.clone(),
+            default_cfg.observability.metrics_server_address.clone(),
+            CHANGEABLE,
+        );
+
+        // -- publisher --
+        push(
+            "publisher.enabled",
+            bool_str(cfg.publisher.enabled).to_string(),
+            bool_str(default_cfg.publisher.enabled).to_string(),
+            CHANGEABLE,
+        );
+        push(
+            "publisher.publisher_type",
+            cfg.publisher.publisher_type.clone(),
+            default_cfg.publisher.publisher_type.clone(),
+            CHANGEABLE,
+        );
+        push(
+            "publisher.http_endpoint",
+            opt_str(&cfg.publisher.http_endpoint),
+            opt_str(&default_cfg.publisher.http_endpoint),
+            CHANGEABLE,
+        );
+        // SECRET.
+        push(
+            "publisher.http_api_key",
+            opt_secret_str(&cfg.publisher.http_api_key),
+            opt_secret_str(&default_cfg.publisher.http_api_key),
+            CHANGEABLE,
+        );
+        push(
+            "publisher.anonymize",
+            bool_str(cfg.publisher.anonymize).to_string(),
+            bool_str(default_cfg.publisher.anonymize).to_string(),
+            CHANGEABLE,
+        );
+        // SECRET.
+        push(
+            "publisher.anonymize_salt",
+            opt_secret_str(&cfg.publisher.anonymize_salt),
+            opt_secret_str(&default_cfg.publisher.anonymize_salt),
+            CHANGEABLE,
+        );
+
+        // -- resilience --
+        push(
+            "resilience.circuit_breaker.enabled",
+            bool_str(cfg.resilience.circuit_breaker.enabled).to_string(),
+            bool_str(default_cfg.resilience.circuit_breaker.enabled).to_string(),
+            CHANGEABLE,
+        );
+        push(
+            "resilience.healthcheck.active_enabled",
+            bool_str(cfg.resilience.healthcheck.active_enabled).to_string(),
+            bool_str(default_cfg.resilience.healthcheck.active_enabled).to_string(),
+            CHANGEABLE,
+        );
+
         Ok(AdminResponse::RowSet {
             columns: vec![
                 "key".to_string(),
@@ -623,26 +913,7 @@ impl AdminConsole {
                 "default".to_string(),
                 "changeable".to_string(),
             ],
-            rows: vec![
-                vec![
-                    "pool_mode".to_string(),
-                    "transaction".to_string(),
-                    "transaction".to_string(),
-                    "yes".to_string(),
-                ],
-                vec![
-                    "max_client_conn".to_string(),
-                    "100".to_string(),
-                    "100".to_string(),
-                    "yes".to_string(),
-                ],
-                vec![
-                    "default_pool_size".to_string(),
-                    "10".to_string(),
-                    "10".to_string(),
-                    "yes".to_string(),
-                ],
-            ],
+            rows,
         })
     }
 

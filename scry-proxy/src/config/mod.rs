@@ -68,7 +68,12 @@ pub struct ProxyConfig {
 
 /// Debug placeholder for a present secret value. Renders as `<redacted>` with no
 /// surrounding quotes, so secrets never leak through `{:?}` (P1 §4.7).
-struct RedactedSecret;
+///
+/// `pub(crate)` so other in-crate consumers that need to report secret
+/// *presence* without ever touching the plaintext (e.g. `SHOW CONFIG`,
+/// WP-10 P4 §4.3/§5.5) can reuse this exact redaction instead of hand-rolling
+/// a second one that could drift from this Debug impl.
+pub(crate) struct RedactedSecret;
 
 impl std::fmt::Debug for RedactedSecret {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -77,7 +82,7 @@ impl std::fmt::Debug for RedactedSecret {
 }
 
 /// Render an optional secret's *presence* for Debug output, never its value.
-fn redacted_opt(value: &Option<String>) -> Option<RedactedSecret> {
+pub(crate) fn redacted_opt(value: &Option<String>) -> Option<RedactedSecret> {
     value.as_ref().map(|_| RedactedSecret)
 }
 
