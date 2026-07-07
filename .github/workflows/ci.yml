@@ -103,10 +103,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Install Rust toolchain (1.85, pinned to match Dockerfile builder)
+      # This job only runs security tooling against Cargo.lock; it does not build
+      # the project, so it uses a recent stable toolchain (not the 1.85 builder
+      # pin) to install current cargo-audit, which parses the latest advisory-db.
+      - name: Install Rust toolchain (stable, for tooling only)
         uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master @ 2026-06-30
         with:
-          toolchain: "1.85"
+          toolchain: "stable"
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
@@ -124,16 +127,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Install Rust toolchain (1.85, pinned to match Dockerfile builder)
+      # Tooling-only job (see audit): stable toolchain so the latest cargo-deny
+      # installs and can parse the current advisory database.
+      - name: Install Rust toolchain (stable, for tooling only)
         uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master @ 2026-06-30
         with:
-          toolchain: "1.85"
+          toolchain: "stable"
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       - name: Install cargo-deny
-        run: cargo install cargo-deny --version "^0.16" --locked
+        run: cargo install cargo-deny --locked
 
       - name: Run cargo deny check
         run: cargo deny check
