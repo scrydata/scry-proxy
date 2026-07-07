@@ -504,6 +504,38 @@ SCRY_BACKEND__HOST: postgres-replica.prod.internal
 
 **Note**: Scry fills the same role as traditional connection poolers (like PgBouncer), but provides significant observability advantages including per-query metrics, anomaly detection, and query anonymization. You should connect Scry directly to your database rather than introducing another pooling layer.
 
+## Graceful Shutdown
+
+Scry drains connections gracefully on **both `SIGINT` (Ctrl+C) and `SIGTERM`** —
+the signal container orchestrators (Kubernetes, Docker, systemd) send to stop a
+process. This makes rolling deploys safe: in-flight queries are allowed to
+finish rather than being cut off.
+
+**The drain contract:**
+
+1. On receiving `SIGINT` or `SIGTERM`, Scry **stops accepting new connections**.
+2. It waits for existing in-flight queries/connections to complete, up to
+   `proxy.shutdown_timeout_secs` (env `SCRY_PROXY__SHUTDOWN_TIMEOUT_SECS`,
+   default 30s).
+3. Any connections still active when the timeout expires are terminated so the
+   process can exit.
+4. Buffered observability events are flushed to the publisher before exit.
+
+Set the drain timeout to comfortably exceed your longest expected query, and
+make it shorter than your orchestrator's kill grace period so Scry drains on its
+own terms. For Kubernetes, set `terminationGracePeriodSeconds` a few seconds
+higher than `SCRY_PROXY__SHUTDOWN_TIMEOUT_SECS`:
+
+```yaml
+spec:
+  terminationGracePeriodSeconds: 35   # > shutdown_timeout_secs (30s)
+  containers:
+    - name: scry-proxy
+      env:
+        - name: SCRY_PROXY__SHUTDOWN_TIMEOUT_SECS
+          value: "30"
+```
+
 ## Monitoring Setup
 
 ### Prometheus Configuration

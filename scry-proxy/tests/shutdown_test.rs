@@ -283,3 +283,105 @@ async fn test_shutdown_timeout() {
     drop(clients);
     drop(proxy_handle);
 }
+
+/// Real SIGTERM graceful-drain test (WP-7 Task 7.1, P3 §4.4/§5.2).
+///
+/// Spawns the actual `scry` binary, starts a long-running query through it,
+/// sends SIGTERM, and asserts the in-flight query completes (the proxy drained
+/// rather than cutting it off) and the process exits cleanly within the
+/// configured shutdown timeout. Unix-only: SIGTERM is a Unix signal.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_sigterm_drains_in_flight_query() {
+    use std::process::Command;
+    use tokio::net::TcpStream;
+
+    let docker = Cli::default();
+    let postgres = docker.run(RunnableImage::from(Postgres::default()).with_tag("16-alpine"));
+    let pg_port = postgres.get_host_port_ipv4(5432);
+    sleep(Duration::from_secs(2)).await;
+
+    // Pick a free port for the proxy to listen on.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy_port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    // Launch the real binary, configured entirely via env, with a generous
+    // drain timeout so the in-flight query has time to finish.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_scry"))
+        .env("SCRY_PROXY__LISTEN_ADDRESS", format!("127.0.0.1:{proxy_port}"))
+        .env("SCRY_PROXY__SHUTDOWN_TIMEOUT_SECS", "15")
+        .env("SCRY_BACKEND__HOST", "127.0.0.1")
+        .env("SCRY_BACKEND__PORT", pg_port.to_string())
+        .env("SCRY_BACKEND__USER", "postgres")
+        .env("SCRY_BACKEND__PASSWORD", "postgres")
+        .env("SCRY_BACKEND__DATABASE", "postgres")
+        .env("SCRY_AUTH__ALLOW_TRUST", "true")
+        .env("SCRY_PUBLISHER__ENABLED", "false")
+        .env("SCRY_PUBLISHER__ANONYMIZE", "false")
+        .env("SCRY_PERFORMANCE__CONNECTION_POOLING", "disabled")
+        .env("SCRY_RESILIENCE__HEALTHCHECK__ACTIVE_ENABLED", "false")
+        .env("SCRY_OBSERVABILITY__ENABLE_TRACING", "false")
+        .env("SCRY_OBSERVABILITY__ENABLE_METRICS_SERVER", "false")
+        .spawn()
+        .expect("failed to spawn scry binary");
+    let pid = child.id();
+
+    // Wait for the proxy to accept connections.
+    let mut ready = false;
+    for _ in 0..100 {
+        if TcpStream::connect(("127.0.0.1", proxy_port)).await.is_ok() {
+            ready = true;
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    assert!(ready, "proxy did not become ready");
+
+    // Connect a client and start a slow query in the background.
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={proxy_port} user=postgres password=postgres dbname=postgres"
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("connect to proxy");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let query = tokio::spawn(async move {
+        // ~3s in-flight query; must survive the SIGTERM drain.
+        client.query_one("SELECT pg_sleep(3), 42::int AS answer", &[]).await
+    });
+
+    // Let the query get in flight, then send SIGTERM.
+    sleep(Duration::from_millis(800)).await;
+    let status = Command::new("kill").arg("-TERM").arg(pid.to_string()).status().unwrap();
+    assert!(status.success(), "kill -TERM failed");
+
+    // The in-flight query must complete successfully (proxy drained it).
+    let row = query
+        .await
+        .expect("query task panicked")
+        .expect("in-flight query should complete during graceful drain");
+    assert_eq!(row.get::<_, i32>("answer"), 42);
+
+    // The process must exit cleanly within the drain window.
+    let mut exited = false;
+    for _ in 0..150 {
+        match child.try_wait().expect("try_wait") {
+            Some(status) => {
+                assert!(status.success(), "proxy exited non-zero: {status:?}");
+                exited = true;
+                break;
+            }
+            None => sleep(Duration::from_millis(100)).await,
+        }
+    }
+    if !exited {
+        let _ = child.kill();
+        panic!("proxy did not exit within the shutdown window after SIGTERM");
+    }
+}

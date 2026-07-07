@@ -576,14 +576,37 @@ impl ProxyServer {
         let mut connection_count = 0u64;
         let mut connection_tasks = JoinSet::new();
 
-        // Setup shutdown signal handling
+        // Setup shutdown signal handling. Both SIGINT (Ctrl+C) and SIGTERM
+        // (the signal orchestrators like Kubernetes/Docker send to stop a
+        // container) trigger the same graceful drain path (P3 §4.4).
         let shutdown = async {
-            match tokio::signal::ctrl_c().await {
-                Ok(()) => {
-                    info!("Received Ctrl+C signal");
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{signal, SignalKind};
+                let mut sigterm = match signal(SignalKind::terminate()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!(error = %e, "Failed to install SIGTERM handler");
+                        // Fall back to SIGINT-only so we still shut down cleanly.
+                        let _ = tokio::signal::ctrl_c().await;
+                        return;
+                    }
+                };
+                tokio::select! {
+                    r = tokio::signal::ctrl_c() => match r {
+                        Ok(()) => info!("Received SIGINT (Ctrl+C); starting graceful shutdown"),
+                        Err(e) => error!(error = %e, "Failed to listen for SIGINT"),
+                    },
+                    _ = sigterm.recv() => {
+                        info!("Received SIGTERM; starting graceful shutdown");
+                    }
                 }
-                Err(e) => {
-                    error!(error = %e, "Failed to listen for Ctrl+C signal");
+            }
+            #[cfg(not(unix))]
+            {
+                match tokio::signal::ctrl_c().await {
+                    Ok(()) => info!("Received Ctrl+C signal; starting graceful shutdown"),
+                    Err(e) => error!(error = %e, "Failed to listen for Ctrl+C signal"),
                 }
             }
         };
