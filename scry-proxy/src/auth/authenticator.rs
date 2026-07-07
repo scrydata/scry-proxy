@@ -105,14 +105,14 @@ impl Authenticator {
             }
 
             AuthType::ScramSha256 => {
-                // SCRAM-SHA-256 is not implemented. `Config::validate()` rejects
-                // this auth_type at startup (P1 §4.1), so reaching this arm means
-                // validation was bypassed. Fail closed rather than the previous
-                // silent trust fallback — never authenticate a client we cannot
-                // actually verify.
-                warn!("SCRAM-SHA-256 authentication is not implemented; refusing connection");
+                // SCRAM-SHA-256 client auth is intentionally unsupported.
+                // `Config::validate()` rejects this auth_type at startup (P1 §4.1),
+                // so reaching this arm means validation was bypassed. Fail closed
+                // rather than the previous silent trust fallback — never
+                // authenticate a client we cannot actually verify.
+                warn!("SCRAM-SHA-256 client authentication is unsupported; refusing connection");
                 Err(anyhow::anyhow!(
-                    "SCRAM-SHA-256 authentication is not implemented; refusing to \
+                    "SCRAM-SHA-256 client authentication is unsupported; refusing to \
                      authenticate client rather than falling back to trust"
                 ))
             }

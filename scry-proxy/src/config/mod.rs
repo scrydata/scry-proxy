@@ -679,11 +679,11 @@ impl Config {
 
         // --- Fail-closed security checks (P1 §4.1, §5.1) ---
 
-        // 1. SCRAM-SHA-256 client auth is not implemented. Refuse rather than
-        // silently downgrading to trust.
+        // 1. SCRAM-SHA-256 client auth is intentionally unsupported. Refuse
+        // rather than silently downgrading to trust.
         if self.auth.auth_type == AuthType::ScramSha256 {
             anyhow::bail!(
-                "auth.auth_type = scram-sha-256 is not implemented; refusing to start \
+                "auth.auth_type = scram-sha-256 is unsupported; refusing to start \
                  rather than falling back to trust. Use auth.auth_type = md5 (with \
                  auth.auth_file set) or auth.auth_type = cert instead."
             );
@@ -1032,7 +1032,7 @@ mod fail_closed_tests {
         assert!(result.is_ok(), "Expected Ok, got: {:?}", result.err());
     }
 
-    // Case 1: ScramSha256 is not implemented; must be refused, not silently
+    // Case 1: ScramSha256 is unsupported; must be refused, not silently
     // downgraded to trust.
     #[test]
     fn test_validate_rejects_scram_sha256_auth() {
@@ -1040,7 +1040,7 @@ mod fail_closed_tests {
         config.auth.auth_type = AuthType::ScramSha256;
         assert!(
             config.validate().is_err(),
-            "SCRAM-SHA-256 auth must be rejected (not implemented)"
+            "SCRAM-SHA-256 auth must be rejected (unsupported)"
         );
     }
 

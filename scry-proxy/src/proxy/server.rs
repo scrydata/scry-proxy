@@ -3,9 +3,12 @@ use super::{
 };
 use crate::admin::{AdminConsole, AdminResponse, ADMIN_DATABASE};
 use crate::auth::FileAuthenticator;
-use crate::config::{AuthType, Config, DatabaseConfig, PoolingStrategy, TlsSslMode};
+use crate::config::{AdminConfig, AuthType, Config, DatabaseConfig, PoolingStrategy, TlsSslMode};
 use crate::observability::ProxyMetrics;
-use crate::protocol::{Protocol, ProtocolConfig, ProtocolRegistry, StartupMessage};
+use crate::protocol::{
+    build_auth_cleartext_password, build_auth_ok, build_error_response, parse_password_message,
+    Protocol, ProtocolConfig, ProtocolRegistry, StartupMessage,
+};
 use crate::resilience::{ActiveHealthcheck, CircuitBreaker};
 use crate::routing::DatabaseRouter;
 use crate::tls::{handle_ssl_startup, load_client_tls_config, ClientTransport, SslStartupResult};
@@ -1067,7 +1070,9 @@ impl ProxyServer {
                 "Routing to admin console"
             );
 
-            if let Err(e) = handle_admin_connection(transport, pool_manager, metrics).await {
+            if let Err(e) =
+                handle_admin_connection(transport, pool_manager, metrics, &config.admin).await
+            {
                 error!(
                     connection_id = conn_id,
                     client_addr = %addr_str,
@@ -1110,6 +1115,20 @@ impl ProxyServer {
     }
 }
 
+/// Constant-time byte-slice equality, to avoid leaking the admin password
+/// through comparison timing. WP-12 centralizes constant-time comparisons via
+/// `subtle`; this is the local, dependency-free version for the admin gate.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// Handle an admin console connection
 ///
 /// This handles connections to the virtual "pgbouncer" database,
@@ -1118,10 +1137,48 @@ async fn handle_admin_connection(
     mut client: ClientTransport,
     pool_manager: Option<Arc<PoolManager>>,
     metrics: Arc<ProxyMetrics>,
+    admin: &AdminConfig,
 ) -> Result<()> {
-    // Send AuthenticationOk
+    // Fail closed (P1 §4.6): the admin console is refused unless it has been
+    // explicitly enabled AND an admin password is configured. Without this the
+    // virtual `pgbouncer` database was an unauthenticated control channel.
+    let expected_password = match (admin.enabled, admin.admin_password.as_deref()) {
+        (true, Some(pw)) if !pw.is_empty() => pw,
+        _ => {
+            warn!("Admin console connection refused: console disabled or no credential configured");
+            let err = build_error_response(
+                "FATAL",
+                "28000",
+                "administrative console is disabled on this server",
+            );
+            let _ = client.write_all(&err).await;
+            return Ok(());
+        }
+    };
+
+    // Request a cleartext password (intended for use over TLS / loopback) and
+    // verify it before granting any admin access.
+    client
+        .write_all(&build_auth_cleartext_password())
+        .await
+        .context("Failed to send AuthenticationCleartextPassword")?;
+
+    let mut auth_buf = vec![0u8; 4096];
+    let auth_n = client.read(&mut auth_buf).await.context("Failed to read admin password")?;
+    let provided = parse_password_message(&auth_buf[..auth_n]);
+    let authenticated =
+        provided.as_deref().is_some_and(|p| constant_time_eq(p.as_bytes(), expected_password.as_bytes()));
+
+    if !authenticated {
+        warn!("Admin console authentication failed");
+        let err = build_error_response("FATAL", "28P01", "admin authentication failed");
+        let _ = client.write_all(&err).await;
+        return Ok(());
+    }
+
+    // Authenticated: send AuthenticationOk
     // Format: 'R' + length(8) + auth_type(0)
-    let auth_ok = [b'R', 0, 0, 0, 8, 0, 0, 0, 0];
+    let auth_ok = build_auth_ok();
     client.write_all(&auth_ok).await.context("Failed to send AuthenticationOk")?;
 
     // Send ReadyForQuery (idle state)
@@ -1192,6 +1249,98 @@ mod tests {
         // Disable active healthchecks for tests
         config.resilience.healthcheck.active_enabled = false;
         config
+    }
+
+    #[test]
+    fn test_constant_time_eq() {
+        assert!(constant_time_eq(b"secret", b"secret"));
+        assert!(!constant_time_eq(b"secret", b"secreT"));
+        assert!(!constant_time_eq(b"secret", b"secret-longer"));
+        assert!(!constant_time_eq(b"", b"x"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    /// Drive `handle_admin_connection` with a raw TCP client and return the
+    /// first server response frame (its message-type byte + body).
+    async fn admin_handshake(admin: AdminConfig, password_to_send: Option<&str>) -> Vec<u8> {
+        use crate::protocol::build_password_message;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let metrics = Arc::new(ProxyMetrics::new(100, HealthConfig::default()));
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let transport = ClientTransport::Plain(stream);
+            let _ = handle_admin_connection(transport, None, metrics, &admin).await;
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let mut first = vec![0u8; 1024];
+        let n = client.read(&mut first).await.unwrap();
+        let first = first[..n].to_vec();
+
+        // If the server asked for a password ('R' auth request) and we have one
+        // to send, send it and read the follow-up frame instead.
+        let response = if !first.is_empty() && first[0] == b'R' && password_to_send.is_some() {
+            client.write_all(&build_password_message(password_to_send.unwrap())).await.unwrap();
+            let mut second = vec![0u8; 1024];
+            let n2 = client.read(&mut second).await.unwrap_or(0);
+            second[..n2].to_vec()
+        } else {
+            first
+        };
+
+        // Close the client so the server's post-auth command loop (which blocks
+        // on read) observes EOF and returns instead of hanging the test.
+        drop(client);
+        let _ = server.await;
+        response
+    }
+
+    #[tokio::test]
+    async fn admin_console_disabled_is_refused() {
+        // Default: console disabled -> immediate FATAL ErrorResponse, no auth.
+        let admin = AdminConfig::default();
+        let resp = admin_handshake(admin, None).await;
+        assert_eq!(resp[0], b'E', "disabled console must return an ErrorResponse");
+        assert!(resp.windows(5).any(|w| w == b"28000"));
+    }
+
+    #[tokio::test]
+    async fn admin_console_enabled_without_credential_is_refused() {
+        // Enabled but no password configured -> still refused (fail closed).
+        let admin = AdminConfig { enabled: true, admin_users: None, admin_password: None };
+        let resp = admin_handshake(admin, None).await;
+        assert_eq!(resp[0], b'E');
+        assert!(resp.windows(5).any(|w| w == b"28000"));
+    }
+
+    #[tokio::test]
+    async fn admin_console_wrong_password_is_refused() {
+        let admin = AdminConfig {
+            enabled: true,
+            admin_users: None,
+            admin_password: Some("correct-horse".to_string()),
+        };
+        let resp = admin_handshake(admin, Some("wrong-password")).await;
+        assert_eq!(resp[0], b'E', "wrong password must return an ErrorResponse");
+        assert!(resp.windows(5).any(|w| w == b"28P01"));
+    }
+
+    #[tokio::test]
+    async fn admin_console_correct_password_authenticates() {
+        let admin = AdminConfig {
+            enabled: true,
+            admin_users: None,
+            admin_password: Some("correct-horse".to_string()),
+        };
+        let resp = admin_handshake(admin, Some("correct-horse")).await;
+        // AuthenticationOk is 'R' with auth-type 0.
+        assert_eq!(resp[0], b'R', "correct password must yield AuthenticationOk");
+        assert_eq!(&resp[1..9], &[0, 0, 0, 8, 0, 0, 0, 0]);
     }
 
     #[tokio::test]
