@@ -32,7 +32,10 @@ pub struct ProxyMetrics {
     health: Arc<HealthMonitor>,
     start_time: Instant,
     active_connections: Arc<AtomicUsize>,
-    circuit_breaker: Arc<RwLock<Option<Arc<crate::resilience::CircuitBreaker>>>>,
+    /// Per-backend circuit breakers, keyed by backend/database identity, so one
+    /// failing backend does not trip the breaker for healthy ones (P3 §4.1/§5.4).
+    circuit_breakers:
+        Arc<RwLock<std::collections::HashMap<String, Arc<crate::resilience::CircuitBreaker>>>>,
     /// Maximum connections limit (for Prometheus export)
     max_connections: Arc<AtomicUsize>,
     /// Counter of connections rejected due to limit
@@ -53,15 +56,25 @@ impl ProxyMetrics {
             health: Arc::new(HealthMonitor::new(health_config)),
             start_time: Instant::now(),
             active_connections: Arc::new(AtomicUsize::new(0)),
-            circuit_breaker: Arc::new(RwLock::new(None)),
+            circuit_breakers: Arc::new(RwLock::new(std::collections::HashMap::new())),
             max_connections: Arc::new(AtomicUsize::new(0)),
             connections_rejected: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    /// Set the circuit breaker (called from server setup)
-    pub fn set_circuit_breaker(&self, cb: Option<Arc<crate::resilience::CircuitBreaker>>) {
-        *self.circuit_breaker.write() = cb;
+    /// Register a per-backend circuit breaker for observability (called from
+    /// server setup, once per backend/database pool).
+    pub fn register_circuit_breaker(
+        &self,
+        backend: String,
+        cb: Arc<crate::resilience::CircuitBreaker>,
+    ) {
+        self.circuit_breakers.write().insert(backend, cb);
+    }
+
+    /// Remove all registered circuit breakers (breaker disabled).
+    pub fn clear_circuit_breakers(&self) {
+        self.circuit_breakers.write().clear();
     }
 
     /// Record a completed query with timeline breakdown
@@ -187,9 +200,16 @@ impl ProxyMetrics {
         self.start_time.elapsed()
     }
 
-    /// Get circuit breaker metrics if circuit breaker is enabled
-    pub fn circuit_breaker_metrics(&self) -> Option<crate::resilience::CircuitBreakerMetrics> {
-        self.circuit_breaker.read().as_ref().map(|cb| cb.get_metrics())
+    /// Per-backend circuit breaker metrics, sorted by backend name for stable
+    /// Prometheus output.
+    pub fn circuit_breaker_metrics_all(
+        &self,
+    ) -> Vec<(String, crate::resilience::CircuitBreakerMetrics)> {
+        let map = self.circuit_breakers.read();
+        let mut out: Vec<_> =
+            map.iter().map(|(name, cb)| (name.clone(), cb.get_metrics())).collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
     }
 }
 

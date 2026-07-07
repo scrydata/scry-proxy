@@ -148,29 +148,15 @@ impl ProxyServer {
             info!(database_count = config.databases.len(), "Multi-database routing enabled");
         }
 
-        // Create circuit breaker if enabled (shared across all pools)
-        let circuit_breaker = if config.resilience.circuit_breaker.enabled {
-            let health_monitor = if config.resilience.circuit_breaker.use_health_monitor {
-                Some(Arc::clone(metrics.health_monitor()))
-            } else {
-                None
-            };
-
-            let cb = Arc::new(CircuitBreaker::new(
-                config.resilience.circuit_breaker.clone(),
-                health_monitor,
-            ));
-
-            // Store circuit breaker in metrics for observability
-            metrics.set_circuit_breaker(Some(Arc::clone(&cb)));
-
-            info!("Circuit breaker created and enabled");
-            Some(cb)
+        // Circuit breakers are created per-backend (per pool) below, so one
+        // failing backend cannot trip the breaker for healthy backends
+        // (P3 §4.1/§5.4). Nothing shared is created here.
+        if config.resilience.circuit_breaker.enabled {
+            info!("Per-backend circuit breakers enabled");
         } else {
             info!("Circuit breaker disabled");
-            metrics.set_circuit_breaker(None);
-            None
-        };
+            metrics.clear_circuit_breakers();
+        }
 
         // Pass retry config if enabled
         let retry_config = if config.resilience.connection_retry.enabled {
@@ -194,57 +180,77 @@ impl ProxyServer {
             // Backend connect+TLS timeout, shared by every pool.
             let connect_timeout_ms = config.backend.connection_timeout_ms;
 
+            // Captured for per-backend breaker creation inside the closure.
+            let breaker_config = config.resilience.circuit_breaker.clone();
+            let breaker_metrics = Arc::clone(&metrics);
+
             // Helper to create a pool manager for a database config
-            let create_pool_manager =
-                |db_config: &DatabaseConfig,
-                 protocol: &Arc<dyn Protocol>,
-                 tls_config: &crate::config::TlsConfig,
-                 perf_config: &crate::config::PerformanceConfig,
-                 circuit_breaker: &Option<Arc<CircuitBreaker>>,
-                 retry_config: &Option<crate::config::ConnectionRetryConfig>|
-                 -> Result<Arc<PoolManager>> {
-                    let pool_size = db_config.pool_size.unwrap_or(perf_config.pool_size);
-                    let min_idle = std::cmp::min(perf_config.pool_min_idle, pool_size);
+            let create_pool_manager = |db_config: &DatabaseConfig,
+                                       protocol: &Arc<dyn Protocol>,
+                                       tls_config: &crate::config::TlsConfig,
+                                       perf_config: &crate::config::PerformanceConfig,
+                                       retry_config: &Option<
+                crate::config::ConnectionRetryConfig,
+            >|
+             -> Result<Arc<PoolManager>> {
+                let pool_size = db_config.pool_size.unwrap_or(perf_config.pool_size);
+                let min_idle = std::cmp::min(perf_config.pool_min_idle, pool_size);
 
-                    let protocol_config = ProtocolConfig {
-                        host: db_config.host.clone(),
-                        port: db_config.port,
-                        database: Some(db_config.database.clone()),
-                        user: Some(db_config.user.clone()),
-                        password: Some(db_config.password.clone()),
+                // One circuit breaker per backend, registered for per-backend
+                // observability, so a single bad backend is isolated.
+                let circuit_breaker = if breaker_config.enabled {
+                    let health_monitor = if breaker_config.use_health_monitor {
+                        Some(Arc::clone(breaker_metrics.health_monitor()))
+                    } else {
+                        None
                     };
-
-                    let pool = TcpConnectionPool::new(
-                        Arc::clone(protocol),
-                        protocol_config,
-                        tls_config,
-                        pool_size,
-                        Some(min_idle),
-                        circuit_breaker.clone(),
-                        retry_config.clone(),
-                        perf_config.pool_lifo,
-                        connect_timeout_ms,
-                    )
-                    .context(format!("Failed to create pool for database '{}'", db_config.name))?;
-
-                    let wait_queue = WaitQueue::new(perf_config.pool_queue_depth);
-                    let pm_config = PoolManagerConfig {
-                        lifo: perf_config.pool_lifo,
-                        queue_depth: perf_config.pool_queue_depth,
-                        idle_unpin_secs: perf_config.pool_idle_unpin_secs,
-                        wait_timeout_ms: perf_config.pool_timeout_secs * 1000,
-                    };
-
-                    info!(
-                        database = %db_config.name,
-                        pool_size = pool_size,
-                        host = %db_config.host,
-                        port = db_config.port,
-                        "Created pool for database"
-                    );
-
-                    Ok(PoolManager::new(Arc::new(pool), wait_queue, pm_config))
+                    let cb = Arc::new(CircuitBreaker::new(breaker_config.clone(), health_monitor));
+                    breaker_metrics
+                        .register_circuit_breaker(db_config.name.clone(), Arc::clone(&cb));
+                    Some(cb)
+                } else {
+                    None
                 };
+
+                let protocol_config = ProtocolConfig {
+                    host: db_config.host.clone(),
+                    port: db_config.port,
+                    database: Some(db_config.database.clone()),
+                    user: Some(db_config.user.clone()),
+                    password: Some(db_config.password.clone()),
+                };
+
+                let pool = TcpConnectionPool::new(
+                    Arc::clone(protocol),
+                    protocol_config,
+                    tls_config,
+                    pool_size,
+                    Some(min_idle),
+                    circuit_breaker,
+                    retry_config.clone(),
+                    perf_config.pool_lifo,
+                    connect_timeout_ms,
+                )
+                .context(format!("Failed to create pool for database '{}'", db_config.name))?;
+
+                let wait_queue = WaitQueue::new(perf_config.pool_queue_depth);
+                let pm_config = PoolManagerConfig {
+                    lifo: perf_config.pool_lifo,
+                    queue_depth: perf_config.pool_queue_depth,
+                    idle_unpin_secs: perf_config.pool_idle_unpin_secs,
+                    wait_timeout_ms: perf_config.pool_timeout_secs * 1000,
+                };
+
+                info!(
+                    database = %db_config.name,
+                    pool_size = pool_size,
+                    host = %db_config.host,
+                    port = db_config.port,
+                    "Created pool for database"
+                );
+
+                Ok(PoolManager::new(Arc::new(pool), wait_queue, pm_config))
+            };
 
             // Create pool for default backend ("*")
             let default_db_config = router.default_config();
@@ -253,7 +259,6 @@ impl ProxyServer {
                 &protocol,
                 &config.tls,
                 &config.performance,
-                &circuit_breaker,
                 &retry_config,
             )?;
             pool_managers.insert("*".to_string(), default_pm);
@@ -265,7 +270,6 @@ impl ProxyServer {
                     &protocol,
                     &config.tls,
                     &config.performance,
-                    &circuit_breaker,
                     &retry_config,
                 )?;
                 pool_managers.insert(db_config.name.clone(), pm);
