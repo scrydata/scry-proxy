@@ -66,7 +66,22 @@ pub struct ProxyConfig {
     pub shutdown_timeout_secs: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Debug placeholder for a present secret value. Renders as `<redacted>` with no
+/// surrounding quotes, so secrets never leak through `{:?}` (P1 §4.7).
+struct RedactedSecret;
+
+impl std::fmt::Debug for RedactedSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+/// Render an optional secret's *presence* for Debug output, never its value.
+fn redacted_opt(value: &Option<String>) -> Option<RedactedSecret> {
+    value.as_ref().map(|_| RedactedSecret)
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct BackendConfig {
     /// Database protocol to use
     pub protocol: DatabaseProtocol,
@@ -77,6 +92,22 @@ pub struct BackendConfig {
     pub password: String,
     pub pool_size: usize,
     pub connection_timeout_ms: u64,
+}
+
+// Manual Debug so the backend password never renders in logs/panics (P1 §4.7).
+impl std::fmt::Debug for BackendConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackendConfig")
+            .field("protocol", &self.protocol)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("database", &self.database)
+            .field("user", &self.user)
+            .field("password", &RedactedSecret)
+            .field("pool_size", &self.pool_size)
+            .field("connection_timeout_ms", &self.connection_timeout_ms)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,7 +130,7 @@ pub struct ProtocolConfig {
     pub max_prepared_statements: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct PublisherConfig {
     pub enabled: bool,
     pub batch_size: usize,
@@ -139,6 +170,30 @@ pub struct PublisherConfig {
     /// Behavior when query parsing/anonymization fails for an observed query.
     #[serde(default)]
     pub parse_failure_mode: ParseFailureMode,
+}
+
+// Manual Debug so the API key and anonymization salt never render in
+// logs/panics; their presence is shown but not their value (P1 §4.7).
+impl std::fmt::Debug for PublisherConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PublisherConfig")
+            .field("enabled", &self.enabled)
+            .field("batch_size", &self.batch_size)
+            .field("flush_interval_ms", &self.flush_interval_ms)
+            .field("anonymize", &self.anonymize)
+            .field("publisher_type", &self.publisher_type)
+            .field("max_queue_size", &self.max_queue_size)
+            .field("http_endpoint", &self.http_endpoint)
+            .field("http_timeout_ms", &self.http_timeout_ms)
+            .field("http_max_retries", &self.http_max_retries)
+            .field("http_api_key", &redacted_opt(&self.http_api_key))
+            .field("http_compression", &self.http_compression)
+            .field("shadow_id", &self.shadow_id)
+            .field("allow_insecure", &self.allow_insecure)
+            .field("anonymize_salt", &redacted_opt(&self.anonymize_salt))
+            .field("parse_failure_mode", &self.parse_failure_mode)
+            .finish()
+    }
 }
 
 /// Behavior when query parsing (or anonymization) fails for an observed query.
@@ -252,7 +307,7 @@ impl Default for AuthConfig {
 /// Disabled by default; enabling it exposes SHOW/PAUSE/RESUME/RELOAD style
 /// commands, so it must be explicitly turned on and (when enabled) should be
 /// paired with a userlist or inline credential.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AdminConfig {
     /// Enable the admin console (disabled by default).
     #[serde(default)]
@@ -263,6 +318,17 @@ pub struct AdminConfig {
     /// Admin password (when not using a userlist file).
     #[serde(default)]
     pub admin_password: Option<String>,
+}
+
+// Manual Debug so the admin password never renders in logs/panics (P1 §4.7).
+impl std::fmt::Debug for AdminConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdminConfig")
+            .field("enabled", &self.enabled)
+            .field("admin_users", &self.admin_users)
+            .field("admin_password", &redacted_opt(&self.admin_password))
+            .finish()
+    }
 }
 
 impl Default for AdminConfig {
@@ -906,6 +972,38 @@ mod validation_tests {
             "Should not warn when threshold is 0: {:?}",
             warnings
         );
+    }
+}
+
+#[cfg(test)]
+mod redacting_debug_tests {
+    use super::*;
+
+    #[test]
+    fn debug_output_never_contains_secrets() {
+        let mut config = Config::default();
+        config.backend.password = "BACKEND_SECRET_PW".to_string();
+        config.publisher.http_api_key = Some("API_KEY_SECRET".to_string());
+        config.publisher.anonymize_salt = Some("SALT_SECRET".to_string());
+        config.admin.admin_password = Some("ADMIN_SECRET_PW".to_string());
+
+        let dbg = format!("{config:?}");
+
+        for secret in ["BACKEND_SECRET_PW", "API_KEY_SECRET", "SALT_SECRET", "ADMIN_SECRET_PW"] {
+            assert!(!dbg.contains(secret), "Debug output leaked secret {secret}");
+        }
+        // The redaction placeholder should be present where secrets were set.
+        assert!(dbg.contains("<redacted>"), "expected redaction placeholder in: {dbg}");
+        // Presence (Some/None) of optional secrets is still observable.
+        assert!(dbg.contains("Some(<redacted>)"));
+    }
+
+    #[test]
+    fn debug_output_shows_none_for_unset_optional_secrets() {
+        let config = Config::default(); // api_key/salt/admin_password all None
+        let dbg = format!("{config:?}");
+        // Unset optional secrets render as None, not a redaction placeholder.
+        assert!(dbg.contains("http_api_key: None"));
     }
 }
 

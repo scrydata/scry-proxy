@@ -33,7 +33,7 @@ pub enum AuthResult {
 }
 
 /// User credentials from auth_file
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct UserCredentials {
     /// Username
     pub username: String,
@@ -41,8 +41,18 @@ pub struct UserCredentials {
     pub password: PasswordEntry,
 }
 
+// Manual Debug so credentials never render their secret in logs/panics (P1 §4.7).
+impl std::fmt::Debug for UserCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserCredentials")
+            .field("username", &self.username)
+            .field("password", &self.password)
+            .finish()
+    }
+}
+
 /// Password entry type (how it's stored in auth_file)
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum PasswordEntry {
     /// Plain text password
     Plain(String),
@@ -50,6 +60,18 @@ pub enum PasswordEntry {
     Md5(String),
     /// SCRAM-SHA-256 verifier
     ScramSha256(String),
+}
+
+// Manual Debug: reveal only the storage kind, never the secret value (P1 §4.7).
+impl std::fmt::Debug for PasswordEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = match self {
+            PasswordEntry::Plain(_) => "Plain",
+            PasswordEntry::Md5(_) => "Md5",
+            PasswordEntry::ScramSha256(_) => "ScramSha256",
+        };
+        write!(f, "{kind}(<redacted>)")
+    }
 }
 
 impl PasswordEntry {
@@ -64,5 +86,36 @@ impl PasswordEntry {
             PasswordEntry::Plain(p) => Some(p),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod redacting_debug_tests {
+    use super::*;
+
+    #[test]
+    fn password_entry_debug_hides_value_keeps_kind() {
+        let entry = PasswordEntry::Plain("hunter2-secret".to_string());
+        let dbg = format!("{entry:?}");
+        assert!(!dbg.contains("hunter2-secret"), "leaked password: {dbg}");
+        assert!(dbg.contains("Plain"), "should keep the storage kind: {dbg}");
+        assert!(dbg.contains("<redacted>"));
+
+        assert_eq!(format!("{:?}", PasswordEntry::Md5("md5deadbeef".into())), "Md5(<redacted>)");
+        assert_eq!(
+            format!("{:?}", PasswordEntry::ScramSha256("SCRAM$secret".into())),
+            "ScramSha256(<redacted>)"
+        );
+    }
+
+    #[test]
+    fn user_credentials_debug_hides_password_keeps_username() {
+        let creds = UserCredentials {
+            username: "alice".to_string(),
+            password: PasswordEntry::Md5("md5-secret-hash".to_string()),
+        };
+        let dbg = format!("{creds:?}");
+        assert!(dbg.contains("alice"), "username should be visible: {dbg}");
+        assert!(!dbg.contains("md5-secret-hash"), "leaked password hash: {dbg}");
     }
 }
