@@ -26,6 +26,8 @@ benchmarks/results/
 .env
 .env.local
 config.local.toml
+scry.toml
+*.local.toml
 
 # Logs
 *.log

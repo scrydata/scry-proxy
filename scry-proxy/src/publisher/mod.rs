@@ -45,6 +45,7 @@ pub fn create_publisher(config: &PublisherConfig) -> Result<Arc<dyn EventPublish
                 config.http_api_key.clone(),
                 shadow_id,
                 config.http_compression,
+                config.allow_insecure,
             )?;
 
             Ok(Arc::new(publisher))

@@ -3,22 +3,185 @@ use super::{
     PoolingMode, PreparedStatement, PreparedStatementCache, StateReplayer, TransactionTracker,
 };
 use crate::auth::{Authenticator, FileAuthenticator};
-use crate::config::{BackpressureMode, Config, PoolingStrategy};
+use crate::config::{BackpressureMode, Config, ParseFailureMode, PoolingStrategy};
 use crate::observability::{ProxyMetrics, QueryTimeline};
 use crate::protocol::{
-    decode_params, CommandDetector, DetectedCommand, Message, MessageExtractor, QueryAnonymizer,
+    build_error_response, decode_params, Message, MessageExtractor, QueryAnonymizer,
 };
-use crate::publisher::QueryEventBuilder;
+use crate::publisher::{QueryEvent, QueryEventBuilder};
 use crate::tls::ClientTransport;
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use scry_protocol::ParamValue;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{debug, error, info, instrument, warn};
+
+/// Placeholder substituted for a query the anonymizer could not parse when
+/// `ParseFailureMode::Redact` is in effect. Fixed and value-free.
+const REDACTED_QUERY: &str = "<redacted: unparseable>";
+
+/// Resolved anonymization policy for a connection.
+///
+/// Centralizes every privacy-sensitive transform (P1 §4.4) so that no
+/// event-construction site can accidentally ship raw query text, raw
+/// parameter values, or a literal-echoing error message:
+/// - the event `query` is the normalized (never raw) form when enabled;
+/// - a query the parser rejects is dropped or hard-redacted per
+///   [`ParseFailureMode`], never shipped raw;
+/// - parameters are replaced with type-only shapes;
+/// - the error field is scrubbed to severity + SQLSTATE.
+#[derive(Clone)]
+struct AnonymizationSettings {
+    enabled: bool,
+    anonymizer: Arc<QueryAnonymizer>,
+    parse_failure: ParseFailureMode,
+}
+
+impl AnonymizationSettings {
+    fn from_config(config: &Config) -> Self {
+        // `Config::validate()` guarantees a salt is present when `anonymize` is
+        // enabled; fall back to the default only for the disabled path.
+        let anonymizer = match &config.publisher.anonymize_salt {
+            Some(salt) => QueryAnonymizer::with_salt(salt.clone().into_bytes()),
+            None => QueryAnonymizer::new(),
+        };
+        Self {
+            enabled: config.publisher.anonymize,
+            anonymizer: Arc::new(anonymizer),
+            parse_failure: config.publisher.parse_failure_mode.clone(),
+        }
+    }
+
+    /// Choose the error field for an event: the scrubbed severity+SQLSTATE form
+    /// when anonymizing, otherwise the full message (consistent with shipping
+    /// the raw query when anonymization is off).
+    fn error_field(
+        &self,
+        extractor: &MessageExtractor,
+        data: &[u8],
+        full_error: String,
+    ) -> Option<String> {
+        if self.enabled {
+            extractor.extract_error_scrubbed(data)
+        } else {
+            Some(full_error)
+        }
+    }
+
+    /// Replace parameter values with type-only shapes when anonymizing, so no
+    /// raw literal (PII) is ever published. When disabled, params pass through.
+    fn redact_params(&self, params: Vec<ParamValue>) -> Vec<ParamValue> {
+        if !self.enabled {
+            return params;
+        }
+        params.iter().map(redact_param).collect()
+    }
+
+    /// Build a fully-formed [`QueryEvent`] under the anonymization policy.
+    ///
+    /// Returns `None` when the event must be dropped entirely
+    /// (`ParseFailureMode::Drop` on a query the parser rejected). The returned
+    /// fingerprints are for hot-data metrics.
+    #[allow(clippy::too_many_arguments)]
+    fn build_event(
+        &self,
+        query: &str,
+        params: Vec<ParamValue>,
+        params_incomplete: bool,
+        duration: Duration,
+        success: bool,
+        error: Option<String>,
+        connection_id: &str,
+        database: &str,
+    ) -> Option<(QueryEvent, Vec<String>)> {
+        let (query_text, normalized, fingerprints) = if !self.enabled {
+            // Anonymization disabled: raw query is expected behavior.
+            (query.to_string(), None, Vec::new())
+        } else {
+            match self.anonymizer.anonymize(query) {
+                Some(anon) => {
+                    // Never ship raw: the event query IS the normalized form.
+                    (
+                        anon.normalized_query.clone(),
+                        Some(anon.normalized_query),
+                        anon.value_fingerprints,
+                    )
+                }
+                None => match self.parse_failure {
+                    // Fail closed: a query we cannot parse is never shipped raw.
+                    ParseFailureMode::Drop => return None,
+                    ParseFailureMode::Redact => {
+                        (REDACTED_QUERY.to_string(), Some(REDACTED_QUERY.to_string()), Vec::new())
+                    }
+                },
+            }
+        };
+
+        let mut builder = QueryEventBuilder::new(query_text)
+            .connection_id(connection_id)
+            .database(database)
+            .params(self.redact_params(params))
+            .params_incomplete(params_incomplete)
+            .duration(duration)
+            .success(success);
+        if let Some(nq) = normalized {
+            builder = builder.normalized_query(nq);
+        }
+        if !fingerprints.is_empty() {
+            builder = builder.value_fingerprints(fingerprints.clone());
+        }
+        if let Some(err) = error {
+            builder = builder.error(err);
+        }
+        Some((builder.build(), fingerprints))
+    }
+}
+
+/// Replace a single parameter value with a type-preserving, value-free shape.
+///
+/// Keeps the variant (and OID for `Unknown`) so downstream analytics still see
+/// the parameter's type, but strips every value so no literal/PII leaks.
+/// Recurses into composite/array/range shapes.
+fn redact_param(p: &ParamValue) -> ParamValue {
+    match p {
+        ParamValue::Null => ParamValue::Null,
+        ParamValue::Bool(_) => ParamValue::Bool(false),
+        ParamValue::Int16(_) => ParamValue::Int16(0),
+        ParamValue::Int32(_) => ParamValue::Int32(0),
+        ParamValue::Int64(_) => ParamValue::Int64(0),
+        ParamValue::Float32(_) => ParamValue::Float32(0.0),
+        ParamValue::Float64(_) => ParamValue::Float64(0.0),
+        ParamValue::Numeric(_) => ParamValue::Numeric(String::new()),
+        ParamValue::Text(_) => ParamValue::Text(String::new()),
+        ParamValue::Bytes(_) => ParamValue::Bytes(Vec::new()),
+        ParamValue::Date(_) => ParamValue::Date(0),
+        ParamValue::Time(_) => ParamValue::Time(0),
+        ParamValue::Timestamp(_) => ParamValue::Timestamp(0),
+        ParamValue::TimestampTz(_) => ParamValue::TimestampTz(0),
+        ParamValue::Interval { .. } => ParamValue::Interval { months: 0, days: 0, microseconds: 0 },
+        ParamValue::Uuid(_) => ParamValue::Uuid([0u8; 16]),
+        ParamValue::Json(_) => ParamValue::Json(String::new()),
+        ParamValue::Array { elements, dimensions } => ParamValue::Array {
+            elements: elements.iter().map(redact_param).collect(),
+            dimensions: dimensions.clone(),
+        },
+        ParamValue::Range { lower, upper, lower_inc, upper_inc } => ParamValue::Range {
+            lower: lower.as_ref().map(|b| Box::new(redact_param(b))),
+            upper: upper.as_ref().map(|b| Box::new(redact_param(b))),
+            lower_inc: *lower_inc,
+            upper_inc: *upper_inc,
+        },
+        ParamValue::Composite { fields } => {
+            ParamValue::Composite { fields: fields.iter().map(redact_param).collect() }
+        }
+        // Preserve the OID (type identity) but drop the raw payload bytes.
+        ParamValue::Unknown { oid, .. } => ParamValue::Unknown { oid: *oid, data: Vec::new() },
+    }
+}
 
 /// Handles a single client connection, forwarding messages to/from the backend
 pub struct ConnectionHandler {
@@ -85,46 +248,10 @@ impl ConnectionHandler {
         }
     }
 
-    /// Build a QueryEventBuilder with anonymization if enabled
-    /// Returns (builder, value_fingerprints) for hot data tracking
-    ///
-    /// Optimized to minimize allocations:
-    /// - Takes ownership of query (no clone)
-    /// - Uses Arc<str> for connection_id and database (cheap pointer copy)
-    fn build_query_event(
-        query: String,
-        connection_id: &str,
-        database: &str,
-        anonymize: bool,
-    ) -> (QueryEventBuilder, Vec<String>) {
-        // Process anonymization first (needs to borrow query)
-        let (final_query, normalized, fingerprints) = if anonymize {
-            let anonymizer = QueryAnonymizer::new();
-            if let Some(anon) = anonymizer.anonymize(&query) {
-                // Clone fingerprints for builder, move original for return
-                let fps = anon.value_fingerprints;
-                (query, Some(anon.normalized_query), fps)
-            } else {
-                (query, None, Vec::new())
-            }
-        } else {
-            (query, None, Vec::new())
-        };
-
-        // Move query into builder (no clone!)
-        let mut builder = QueryEventBuilder::new(final_query);
-        builder = builder.connection_id(connection_id).database(database);
-
-        if let Some(nq) = normalized {
-            builder = builder.normalized_query(nq);
-        }
-        if !fingerprints.is_empty() {
-            // Clone for builder, return original
-            builder = builder.value_fingerprints(fingerprints.clone());
-        }
-
-        (builder, fingerprints)
-    }
+    // Query-event construction now lives on `AnonymizationSettings`
+    // (see below): it resolves the query text, params, and error under the
+    // fail-closed anonymization policy so no call site can accidentally ship
+    // raw data.
 
     /// Build PostgreSQL ErrorResponse for queue full condition
     ///
@@ -469,7 +596,7 @@ impl ConnectionHandler {
         // Use Arc<str> for database to avoid repeated String clones
         let database: Arc<str> = Arc::from(self.config.backend.database.as_str());
         let batcher = Arc::clone(&self.batcher);
-        let anonymize = self.config.publisher.anonymize;
+        let anon_settings = AnonymizationSettings::from_config(&self.config);
         let metrics = Arc::clone(&self.metrics);
 
         let extractor = MessageExtractor::new();
@@ -486,12 +613,23 @@ impl ConnectionHandler {
         let mut client_buffer = vec![0u8; self.config.performance.buffer_size];
         let mut backend_buffer = vec![0u8; self.config.performance.buffer_size];
 
+        // Query execution deadline (P3 §4.3). When a query is dispatched, arm a
+        // deadline; if the backend has not completed the response by then, the
+        // query is cancelled by closing the (now unknown-state) connection.
+        let query_timeout_secs = self.config.performance.query_timeout_secs;
+        let query_timeout_enabled = query_timeout_secs > 0;
+        let query_timeout_dur = Duration::from_secs(query_timeout_secs);
+        let mut query_deadline: Option<tokio::time::Instant> = None;
+
         // Perform authentication and startup handshake
         self.perform_startup_handshake(managed_conn.stream_mut())
             .await
             .context("Startup handshake failed")?;
 
         loop {
+            // Copy the deadline for this iteration so the timeout branch owns it
+            // and the other arms remain free to mutate `query_deadline`.
+            let iter_deadline = query_deadline;
             tokio::select! {
                 // Client -> Backend
                 result = self.client_stream.read(&mut client_buffer) => {
@@ -510,7 +648,7 @@ impl ConnectionHandler {
                                     Message::Parse { ref name, ref query, ref param_oids } => {
                                         // Validate command against pooling mode
                                         if let Err(err_msg) = mode_enforcer.validate(query, txn_tracker.is_in_transaction()) {
-                                            warn!(query = %query, error = %err_msg, "Command rejected by pooling mode");
+                                            warn!(query = %crate::observability::loggable(query), error = %err_msg, "Command rejected by pooling mode");
                                             let error_response = ModeEnforcer::build_error_response(&err_msg);
                                             self.client_stream.write_all(&error_response).await.context("Failed to send error to client")?;
                                             // Send ReadyForQuery to complete the error cycle
@@ -520,7 +658,7 @@ impl ConnectionHandler {
                                             break;
                                         }
 
-                                        debug!(name = %name, query = %query, "Cached prepared statement");
+                                        debug!(name = %name, query = %crate::observability::loggable(query), "Cached prepared statement");
                                         stmt_cache.insert_statement(name.clone(), PreparedStatement {
                                             query: query.clone(),
                                             param_oids: param_oids.clone(),
@@ -566,7 +704,7 @@ impl ConnectionHandler {
                                     Message::Query { ref query } => {
                                         // Validate command against pooling mode
                                         if let Err(err_msg) = mode_enforcer.validate(query, txn_tracker.is_in_transaction()) {
-                                            warn!(query = %query, error = %err_msg, "Command rejected by pooling mode");
+                                            warn!(query = %crate::observability::loggable(query), error = %err_msg, "Command rejected by pooling mode");
                                             let error_response = ModeEnforcer::build_error_response(&err_msg);
                                             self.client_stream.write_all(&error_response).await.context("Failed to send error to client")?;
                                             let ready_for_query = Self::build_ready_for_query(txn_tracker.state());
@@ -575,7 +713,7 @@ impl ConnectionHandler {
                                             break;
                                         }
 
-                                        debug!(query = %query, "Simple query");
+                                        debug!(query = %crate::observability::loggable(query), "Simple query");
                                         stmt_cache.set_pending(String::new(), PendingExecution {
                                             query: query.clone(),
                                             params: vec![],
@@ -583,7 +721,7 @@ impl ConnectionHandler {
                                             started_at: Instant::now(),
                                         });
 
-                                        Self::update_connection_state(&mut conn_state, query);
+                                        conn_state.apply_query(query);
                                     }
                                     Message::Close { kind, ref name } => {
                                         match kind {
@@ -602,6 +740,11 @@ impl ConnectionHandler {
                             // Forward to backend if not rejected
                             if should_forward {
                                 managed_conn.stream_mut().write_all(data).await.context("Failed to write to backend")?;
+                            }
+
+                            // Arm the query deadline once a query is in flight.
+                            if query_timeout_enabled && query_deadline.is_none() && stmt_cache.has_pending("") {
+                                query_deadline = Some(tokio::time::Instant::now() + query_timeout_dur);
                             }
                         }
                         Err(e) => {
@@ -625,50 +768,59 @@ impl ConnectionHandler {
                             if let Some(error_msg) = extractor.extract_error(data) {
                                 if let Some(pending) = stmt_cache.take_pending("") {
                                     let duration = pending.started_at.elapsed();
-                                    warn!(query = %pending.query, error = %error_msg, duration_ms = duration.as_millis(), "Query failed");
+                                    warn!(query = %crate::observability::loggable(&pending.query), error = %crate::observability::loggable(&error_msg), duration_ms = duration.as_millis(), "Query failed");
 
-                                    let (builder, fingerprints) = Self::build_query_event(pending.query, &connection_id_str, &database, anonymize);
-                                    let event = builder
-                                        .params(pending.params)
-                                        .params_incomplete(pending.params_incomplete)
-                                        .duration(duration)
-                                        .success(false)
-                                        .error(error_msg)
-                                        .build();
-
-                                    if let Err(e) = batcher.send_event(event) {
-                                        warn!(error = %e, "Failed to send event to batcher");
+                                    let error_field = anon_settings.error_field(&extractor, data, error_msg);
+                                    if let Some((event, fingerprints)) = anon_settings.build_event(
+                                        &pending.query,
+                                        pending.params,
+                                        pending.params_incomplete,
+                                        duration,
+                                        false,
+                                        error_field,
+                                        &connection_id_str,
+                                        &database,
+                                    ) {
+                                        if let Err(e) = batcher.send_event(event) {
+                                            warn!(error = %e, "Failed to send event to batcher");
+                                        }
+                                        if !fingerprints.is_empty() {
+                                            metrics.record_hot_data(&fingerprints);
+                                        }
                                     }
-
-                                    metrics.record_query(&QueryTimeline::new(), false);
-                                    if !fingerprints.is_empty() {
-                                        metrics.record_hot_data(&fingerprints);
-                                    }
+                                    metrics.record_query(&QueryTimeline::for_completed(pending.started_at), false);
                                 }
                             }
                             // Check for query completion
                             else if extractor.is_query_complete(data) {
                                 if let Some(pending) = stmt_cache.take_pending("") {
                                     let duration = pending.started_at.elapsed();
-                                    debug!(query = %pending.query, duration_ms = duration.as_millis(), "Query completed successfully");
+                                    debug!(query = %crate::observability::loggable(&pending.query), duration_ms = duration.as_millis(), "Query completed successfully");
 
-                                    let (builder, fingerprints) = Self::build_query_event(pending.query, &connection_id_str, &database, anonymize);
-                                    let event = builder
-                                        .params(pending.params)
-                                        .params_incomplete(pending.params_incomplete)
-                                        .duration(duration)
-                                        .success(true)
-                                        .build();
-
-                                    if let Err(e) = batcher.send_event(event) {
-                                        warn!(error = %e, "Failed to send event to batcher");
+                                    if let Some((event, fingerprints)) = anon_settings.build_event(
+                                        &pending.query,
+                                        pending.params,
+                                        pending.params_incomplete,
+                                        duration,
+                                        true,
+                                        None,
+                                        &connection_id_str,
+                                        &database,
+                                    ) {
+                                        if let Err(e) = batcher.send_event(event) {
+                                            warn!(error = %e, "Failed to send event to batcher");
+                                        }
+                                        if !fingerprints.is_empty() {
+                                            metrics.record_hot_data(&fingerprints);
+                                        }
                                     }
-
-                                    metrics.record_query(&QueryTimeline::new(), true);
-                                    if !fingerprints.is_empty() {
-                                        metrics.record_hot_data(&fingerprints);
-                                    }
+                                    metrics.record_query(&QueryTimeline::for_completed(pending.started_at), true);
                                 }
+                            }
+
+                            // Disarm the query deadline once no query is in flight.
+                            if query_timeout_enabled && !stmt_cache.has_pending("") {
+                                query_deadline = None;
                             }
 
                             // Track transaction state from ReadyForQuery messages
@@ -783,6 +935,38 @@ impl ConnectionHandler {
                         }
                     }
                 }
+
+                // Query execution deadline expired (P3 §4.3). The backend has
+                // not answered within query_timeout; cancel by closing the
+                // (now unknown-state) connection so it is never reused.
+                _ = async move {
+                    match iter_deadline {
+                        Some(d) => tokio::time::sleep_until(d).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                }, if query_timeout_enabled && iter_deadline.is_some() => {
+                    warn!(
+                        connection_id = connection_id,
+                        timeout_secs = query_timeout_secs,
+                        "Query exceeded query_timeout; cancelling and closing backend connection"
+                    );
+
+                    metrics.record_query(&QueryTimeline::new(), false);
+                    // Mark the connection unusable so it is not returned clean.
+                    conn_state.mark_unknown_command();
+
+                    // Tell the client the statement was cancelled (SQLSTATE 57014).
+                    let err = build_error_response(
+                        "ERROR",
+                        "57014",
+                        "canceling statement due to query timeout",
+                    );
+                    let _ = self.client_stream.write_all(&err).await;
+                    let ready = Self::build_ready_for_query(txn_tracker.state());
+                    let _ = self.client_stream.write_all(&ready).await;
+
+                    break;
+                }
             }
         }
 
@@ -810,54 +994,6 @@ impl ConnectionHandler {
     }
 
     /// Update connection state based on detected SQL command
-    fn update_connection_state(conn_state: &mut ConnectionState, query: &str) {
-        if let Some(cmd) = CommandDetector::detect(query) {
-            match cmd {
-                DetectedCommand::Set { name, value } => {
-                    conn_state.add_session_variable(name, value);
-                }
-                DetectedCommand::Reset { name } => {
-                    conn_state.remove_session_variable(&name);
-                }
-                DetectedCommand::ResetAll => {
-                    conn_state.clear_session_variables();
-                }
-                DetectedCommand::CreateTempTable { name } => {
-                    conn_state.add_temp_table(name);
-                }
-                DetectedCommand::DropTable { name } => {
-                    // Only remove if it's a known temp table
-                    conn_state.remove_temp_table(&name);
-                }
-                DetectedCommand::DeclareCursor { name, .. } => {
-                    conn_state.add_cursor(name);
-                }
-                DetectedCommand::CloseCursor { name } => {
-                    conn_state.remove_cursor(&name);
-                }
-                DetectedCommand::AdvisoryLock { key } => {
-                    if let Some(k) = key {
-                        conn_state.add_advisory_lock(k);
-                    }
-                }
-                DetectedCommand::AdvisoryUnlock { key } => {
-                    if let Some(k) = key {
-                        conn_state.remove_advisory_lock(k);
-                    }
-                }
-                DetectedCommand::DiscardAll => {
-                    conn_state.clear_all();
-                }
-                DetectedCommand::Deallocate { name } => {
-                    conn_state.remove_prepared_statement(&name);
-                }
-                DetectedCommand::DeallocateAll => {
-                    conn_state.clear_prepared_statements();
-                }
-            }
-        }
-    }
-
     /// Handle connection with an owned backend TCP stream
     async fn handle_with_owned_backend(mut self, mut backend_stream: TcpStream) -> Result<()> {
         // Perform authentication and startup handshake
@@ -876,7 +1012,7 @@ impl ConnectionHandler {
         let database: Arc<str> = Arc::from(self.config.backend.database.as_str());
         let batcher_clone = Arc::clone(&self.batcher);
         let config_clone = Arc::clone(&self.config);
-        let anonymize = self.config.publisher.anonymize;
+        let anon_settings = AnonymizationSettings::from_config(&self.config);
         let metrics = Arc::clone(&self.metrics);
         let max_stmts = self.config.protocol.max_prepared_statements;
 
@@ -906,7 +1042,7 @@ impl ConnectionHandler {
                             for msg in messages {
                                 match msg {
                                     Message::Parse { name, query, param_oids } => {
-                                        debug!(name = %name, query = %query, "Cached prepared statement");
+                                        debug!(name = %name, query = %crate::observability::loggable(&query), "Cached prepared statement");
                                         cache.insert_statement(
                                             name.clone(),
                                             PreparedStatement { query: query.clone(), param_oids },
@@ -967,7 +1103,7 @@ impl ConnectionHandler {
                                         );
                                     }
                                     Message::Query { query } => {
-                                        debug!(query = %query, "Simple query");
+                                        debug!(query = %crate::observability::loggable(&query), "Simple query");
                                         cache.set_pending(
                                             String::new(),
                                             PendingExecution {
@@ -1023,34 +1159,35 @@ impl ConnectionHandler {
                             if let Some(pending) = cache.take_pending("") {
                                 let duration = pending.started_at.elapsed();
                                 warn!(
-                                    query = %pending.query,
-                                    error = %error_msg,
+                                    query = %crate::observability::loggable(&pending.query),
+                                    error = %crate::observability::loggable(&error_msg),
                                     duration_ms = duration.as_millis(),
                                     "Query failed"
                                 );
 
-                                let (builder, fingerprints) = Self::build_query_event(
-                                    pending.query,
+                                let error_field =
+                                    anon_settings.error_field(&extractor, data, error_msg);
+                                if let Some((event, fingerprints)) = anon_settings.build_event(
+                                    &pending.query,
+                                    pending.params,
+                                    pending.params_incomplete,
+                                    duration,
+                                    false,
+                                    error_field,
                                     &connection_id_str,
                                     &database,
-                                    anonymize,
+                                ) {
+                                    if let Err(e) = batcher_clone.send_event(event) {
+                                        warn!(error = %e, "Failed to send event to batcher");
+                                    }
+                                    if !fingerprints.is_empty() {
+                                        metrics.record_hot_data(&fingerprints);
+                                    }
+                                }
+                                metrics.record_query(
+                                    &QueryTimeline::for_completed(pending.started_at),
+                                    false,
                                 );
-                                let event = builder
-                                    .params(pending.params)
-                                    .params_incomplete(pending.params_incomplete)
-                                    .duration(duration)
-                                    .success(false)
-                                    .error(error_msg)
-                                    .build();
-
-                                if let Err(e) = batcher_clone.send_event(event) {
-                                    warn!(error = %e, "Failed to send event to batcher");
-                                }
-
-                                metrics.record_query(&QueryTimeline::new(), false);
-                                if !fingerprints.is_empty() {
-                                    metrics.record_hot_data(&fingerprints);
-                                }
                             }
                         }
                         // Check if this is a successful query completion
@@ -1059,32 +1196,32 @@ impl ConnectionHandler {
                             if let Some(pending) = cache.take_pending("") {
                                 let duration = pending.started_at.elapsed();
                                 debug!(
-                                    query = %pending.query,
+                                    query = %crate::observability::loggable(&pending.query),
                                     duration_ms = duration.as_millis(),
                                     "Query completed successfully"
                                 );
 
-                                let (builder, fingerprints) = Self::build_query_event(
-                                    pending.query,
+                                if let Some((event, fingerprints)) = anon_settings.build_event(
+                                    &pending.query,
+                                    pending.params,
+                                    pending.params_incomplete,
+                                    duration,
+                                    true,
+                                    None,
                                     &connection_id_str,
                                     &database,
-                                    anonymize,
+                                ) {
+                                    if let Err(e) = batcher_clone.send_event(event) {
+                                        warn!(error = %e, "Failed to send event to batcher");
+                                    }
+                                    if !fingerprints.is_empty() {
+                                        metrics.record_hot_data(&fingerprints);
+                                    }
+                                }
+                                metrics.record_query(
+                                    &QueryTimeline::for_completed(pending.started_at),
+                                    true,
                                 );
-                                let event = builder
-                                    .params(pending.params)
-                                    .params_incomplete(pending.params_incomplete)
-                                    .duration(duration)
-                                    .success(true)
-                                    .build();
-
-                                if let Err(e) = batcher_clone.send_event(event) {
-                                    warn!(error = %e, "Failed to send event to batcher");
-                                }
-
-                                metrics.record_query(&QueryTimeline::new(), true);
-                                if !fingerprints.is_empty() {
-                                    metrics.record_hot_data(&fingerprints);
-                                }
                             }
                         }
 
@@ -1114,6 +1251,265 @@ impl ConnectionHandler {
 
         info!("Connection handler completed");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod anonymization_tests {
+    use super::*;
+
+    fn enabled_settings(parse_failure: ParseFailureMode) -> AnonymizationSettings {
+        AnonymizationSettings {
+            enabled: true,
+            anonymizer: Arc::new(QueryAnonymizer::with_salt(b"unit-test-salt".to_vec())),
+            parse_failure,
+        }
+    }
+
+    fn disabled_settings() -> AnonymizationSettings {
+        AnonymizationSettings {
+            enabled: false,
+            anonymizer: Arc::new(QueryAnonymizer::new()),
+            parse_failure: ParseFailureMode::Redact,
+        }
+    }
+
+    #[test]
+    fn enabled_event_query_is_normalized_never_raw() {
+        let settings = enabled_settings(ParseFailureMode::Redact);
+        let raw = "SELECT * FROM users WHERE email = 'bob@example.com' AND id = 42";
+        let (event, fingerprints) = settings
+            .build_event(raw, vec![], false, Duration::from_millis(1), true, None, "c1", "db")
+            .expect("event should be produced");
+
+        // The literal must never appear in the shipped query or normalized form.
+        assert!(!event.query.contains("bob@example.com"), "query leaked literal: {}", event.query);
+        assert!(!event.query.contains("42 "), "query leaked literal: {}", event.query);
+        assert_eq!(event.query, event.normalized_query.clone().unwrap());
+        assert!(
+            event.query.contains('?'),
+            "normalized query should use placeholders: {}",
+            event.query
+        );
+        // Two literals → two fingerprints.
+        assert_eq!(fingerprints.len(), 2);
+    }
+
+    #[test]
+    fn disabled_event_ships_raw_query() {
+        let settings = disabled_settings();
+        let raw = "SELECT * FROM users WHERE email = 'bob@example.com'";
+        let (event, _fps) = settings
+            .build_event(raw, vec![], false, Duration::from_millis(1), true, None, "c1", "db")
+            .expect("event should be produced");
+        assert_eq!(event.query, raw);
+        assert!(event.normalized_query.is_none());
+    }
+
+    #[test]
+    fn parse_failure_redact_hides_raw_query() {
+        let settings = enabled_settings(ParseFailureMode::Redact);
+        // Unparseable / vendor syntax that carries a secret literal.
+        let raw = "CREATE ROLE admin PASSWORD 'super-secret-pw' NOSUPERUSER GIBBERISH";
+        let (event, fps) = settings
+            .build_event(raw, vec![], false, Duration::from_millis(1), false, None, "c1", "db")
+            .expect("redact mode still produces an event");
+        assert_eq!(event.query, REDACTED_QUERY);
+        assert!(!event.query.contains("super-secret-pw"));
+        assert!(fps.is_empty());
+    }
+
+    #[test]
+    fn parse_failure_drop_drops_event() {
+        let settings = enabled_settings(ParseFailureMode::Drop);
+        let raw = "CREATE ROLE admin PASSWORD 'super-secret-pw' GIBBERISH";
+        let result = settings.build_event(
+            raw,
+            vec![],
+            false,
+            Duration::from_millis(1),
+            false,
+            None,
+            "c1",
+            "db",
+        );
+        assert!(result.is_none(), "drop mode must drop the event entirely");
+    }
+
+    #[test]
+    fn params_are_redacted_when_enabled() {
+        let settings = enabled_settings(ParseFailureMode::Redact);
+        let params = vec![
+            ParamValue::Text("bob@example.com".to_string()),
+            ParamValue::Int32(31337),
+            ParamValue::Json(r#"{"ssn":"123-45-6789"}"#.to_string()),
+        ];
+        let (event, _fps) = settings
+            .build_event(
+                "SELECT * FROM users WHERE id = $1",
+                params,
+                false,
+                Duration::from_millis(1),
+                true,
+                None,
+                "c1",
+                "db",
+            )
+            .expect("event");
+        // Same arity, but no raw values survive.
+        assert_eq!(event.params.len(), 3);
+        assert_eq!(event.params[0], ParamValue::Text(String::new()));
+        assert_eq!(event.params[1], ParamValue::Int32(0));
+        assert_eq!(event.params[2], ParamValue::Json(String::new()));
+    }
+
+    #[test]
+    fn params_pass_through_when_disabled() {
+        let settings = disabled_settings();
+        let params = vec![ParamValue::Text("keep-me".to_string()), ParamValue::Int32(7)];
+        let redacted = settings.redact_params(params.clone());
+        assert_eq!(redacted, params);
+    }
+
+    #[test]
+    fn redact_param_recurses_into_composites() {
+        let nested = ParamValue::Array {
+            elements: vec![
+                ParamValue::Text("secret".to_string()),
+                ParamValue::Composite { fields: vec![ParamValue::Int64(999)] },
+            ],
+            dimensions: vec![2],
+        };
+        let redacted = redact_param(&nested);
+        match redacted {
+            ParamValue::Array { elements, dimensions } => {
+                assert_eq!(dimensions, vec![2]);
+                assert_eq!(elements[0], ParamValue::Text(String::new()));
+                match &elements[1] {
+                    ParamValue::Composite { fields } => {
+                        assert_eq!(fields[0], ParamValue::Int64(0));
+                    }
+                    other => panic!("expected composite, got {other:?}"),
+                }
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+    }
+}
+
+/// The crown-jewel guardrail (P1 §5.3): with anonymization enabled, no produced
+/// event and no gated log line may contain any input literal or parameter value.
+#[cfg(test)]
+mod anonymization_fuzz {
+    use super::*;
+    use crate::observability::{loggable, set_unsafe_debug_logging};
+    use proptest::prelude::*;
+
+    fn enabled(mode: ParseFailureMode) -> AnonymizationSettings {
+        AnonymizationSettings {
+            enabled: true,
+            anonymizer: Arc::new(QueryAnonymizer::with_salt(b"fuzz-salt".to_vec())),
+            parse_failure: mode,
+        }
+    }
+
+    fn build(
+        settings: &AnonymizationSettings,
+        query: &str,
+        params: Vec<ParamValue>,
+    ) -> Option<QueryEvent> {
+        settings
+            .build_event(query, params, false, Duration::from_millis(1), true, None, "conn", "db")
+            .map(|(event, _fps)| event)
+    }
+
+    /// Serialized event JSON — the exact bytes that would be published.
+    fn event_json(
+        settings: &AnonymizationSettings,
+        query: &str,
+        params: Vec<ParamValue>,
+    ) -> Option<String> {
+        build(settings, query, params).map(|e| serde_json::to_string(&e).expect("serialize event"))
+    }
+
+    proptest! {
+        // High-entropy sentinel literals cannot collide with SQL keywords/idents,
+        // so their absence from the event JSON is a clean signal of redaction.
+        #[test]
+        fn parameterized_event_never_leaks_literals(
+            strlit in "SEC_[A-Za-z0-9]{8,24}",
+            numlit in 100_000_000i64..9_999_999_999,
+        ) {
+            let settings = enabled(ParseFailureMode::Redact);
+            let query = format!(
+                "SELECT * FROM accounts WHERE token = '{strlit}' AND balance = {numlit}"
+            );
+            let params = vec![
+                ParamValue::Text(strlit.clone()),
+                ParamValue::Int64(numlit),
+                ParamValue::Json(format!("{{\"secret\":\"{strlit}\"}}")),
+            ];
+            let event = build(&settings, &query, params).expect("redact mode keeps the event");
+            let json = serde_json::to_string(&event).unwrap();
+            // High-entropy string literal must not appear anywhere in the payload.
+            prop_assert!(!json.contains(&strlit), "event leaked string literal {strlit}: {json}");
+            // The numeric literal is checked against the query text fields only
+            // (a raw digit-string could otherwise coincidentally match the event
+            // timestamp/UUID in the full JSON — a false positive, not a leak).
+            let numstr = numlit.to_string();
+            prop_assert!(!event.query.contains(&numstr), "query leaked numeric literal {numstr}: {}", event.query);
+            if let Some(nq) = &event.normalized_query {
+                prop_assert!(!nq.contains(&numstr), "normalized_query leaked numeric literal {numstr}: {nq}");
+            }
+        }
+
+        // With the flag off, the log redactor must never echo a literal.
+        #[test]
+        fn loggable_never_leaks_literal_when_disabled(lit in "SEC_[A-Za-z0-9]{8,24}") {
+            set_unsafe_debug_logging(false);
+            prop_assert!(!loggable(&lit).contains(&lit));
+        }
+    }
+
+    /// Explicit adversarial corpus: DDL echoing secrets, unparseable vendor
+    /// syntax, and multi-literal statements. Under both parse-failure modes,
+    /// neither the event nor the log redactor may surface any listed secret.
+    #[test]
+    fn adversarial_corpus_never_leaks() {
+        set_unsafe_debug_logging(false);
+        // (query, secrets that must never appear anywhere)
+        let corpus: &[(&str, &[&str])] = &[
+            ("CREATE ROLE deploy PASSWORD 'super-secret-pw'", &["super-secret-pw"]),
+            ("SELECT * FROM patients WHERE ssn = '123-45-6789'", &["123-45-6789"]),
+            (
+                "INSERT INTO t (a, b) VALUES ('alice@example.com', 'hunter2')",
+                &["alice@example.com", "hunter2"],
+            ),
+            (
+                "UPDATE users SET pw = 'secretA' WHERE email = 'secretB@x.io'",
+                &["secretA", "secretB@x.io"],
+            ),
+            ("$$ totally @@ unparseable ## vendor 'embedded-secret' syntax", &["embedded-secret"]),
+        ];
+
+        for mode in [ParseFailureMode::Redact, ParseFailureMode::Drop] {
+            let settings = enabled(mode);
+            for (query, secrets) in corpus {
+                // Event guarantee (only present in Redact mode; Drop yields None).
+                if let Some(json) = event_json(&settings, query, vec![]) {
+                    for secret in *secrets {
+                        assert!(
+                            !json.contains(secret),
+                            "event leaked '{secret}' for query {query:?}: {json}"
+                        );
+                    }
+                }
+                // Log guarantee: the redactor never echoes a secret with the flag off.
+                for secret in *secrets {
+                    assert!(!loggable(secret).contains(secret));
+                }
+            }
+        }
     }
 }
 
@@ -1254,7 +1650,7 @@ mod tests {
     #[test]
     fn test_update_connection_state_set() {
         let mut conn_state = ConnectionState::new(100);
-        ConnectionHandler::update_connection_state(&mut conn_state, "SET timezone = 'UTC'");
+        conn_state.apply_query("SET timezone = 'UTC'");
         assert!(conn_state.is_pinned());
     }
 
@@ -1264,7 +1660,7 @@ mod tests {
         conn_state.add_session_variable("timezone".to_string(), "UTC".to_string());
         assert!(conn_state.is_pinned());
 
-        ConnectionHandler::update_connection_state(&mut conn_state, "RESET timezone");
+        conn_state.apply_query("RESET timezone");
         assert!(!conn_state.is_pinned());
     }
 
@@ -1275,17 +1671,14 @@ mod tests {
         conn_state.add_session_variable("search_path".to_string(), "public".to_string());
         assert!(conn_state.is_pinned());
 
-        ConnectionHandler::update_connection_state(&mut conn_state, "RESET ALL");
+        conn_state.apply_query("RESET ALL");
         assert!(!conn_state.is_pinned());
     }
 
     #[test]
     fn test_update_connection_state_create_temp_table() {
         let mut conn_state = ConnectionState::new(100);
-        ConnectionHandler::update_connection_state(
-            &mut conn_state,
-            "CREATE TEMP TABLE tmp_users (id int)",
-        );
+        conn_state.apply_query("CREATE TEMP TABLE tmp_users (id int)");
         assert!(conn_state.is_pinned());
         assert!(conn_state.has_unsafe_state());
     }
@@ -1293,10 +1686,7 @@ mod tests {
     #[test]
     fn test_update_connection_state_declare_cursor() {
         let mut conn_state = ConnectionState::new(100);
-        ConnectionHandler::update_connection_state(
-            &mut conn_state,
-            "DECLARE my_cursor CURSOR FOR SELECT 1",
-        );
+        conn_state.apply_query("DECLARE my_cursor CURSOR FOR SELECT 1");
         assert!(conn_state.is_pinned());
         assert!(conn_state.has_unsafe_state());
     }
@@ -1307,17 +1697,14 @@ mod tests {
         conn_state.add_cursor("my_cursor".to_string());
         assert!(conn_state.has_unsafe_state());
 
-        ConnectionHandler::update_connection_state(&mut conn_state, "CLOSE my_cursor");
+        conn_state.apply_query("CLOSE my_cursor");
         assert!(!conn_state.has_unsafe_state());
     }
 
     #[test]
     fn test_update_connection_state_advisory_lock() {
         let mut conn_state = ConnectionState::new(100);
-        ConnectionHandler::update_connection_state(
-            &mut conn_state,
-            "SELECT pg_advisory_lock(12345)",
-        );
+        conn_state.apply_query("SELECT pg_advisory_lock(12345)");
         assert!(conn_state.is_pinned());
         assert!(conn_state.has_unsafe_state());
     }
@@ -1328,10 +1715,7 @@ mod tests {
         conn_state.add_advisory_lock(12345);
         assert!(conn_state.has_unsafe_state());
 
-        ConnectionHandler::update_connection_state(
-            &mut conn_state,
-            "SELECT pg_advisory_unlock(12345)",
-        );
+        conn_state.apply_query("SELECT pg_advisory_unlock(12345)");
         assert!(!conn_state.has_unsafe_state());
     }
 
@@ -1344,7 +1728,7 @@ mod tests {
         assert!(conn_state.is_pinned());
         assert!(conn_state.has_unsafe_state());
 
-        ConnectionHandler::update_connection_state(&mut conn_state, "DISCARD ALL");
+        conn_state.apply_query("DISCARD ALL");
         assert!(!conn_state.is_pinned());
         assert!(!conn_state.has_unsafe_state());
     }
@@ -1355,7 +1739,7 @@ mod tests {
         conn_state.add_prepared_statement("stmt1".to_string(), "SELECT 1".to_string(), vec![]);
         assert!(conn_state.is_pinned());
 
-        ConnectionHandler::update_connection_state(&mut conn_state, "DEALLOCATE stmt1");
+        conn_state.apply_query("DEALLOCATE stmt1");
         assert!(!conn_state.is_pinned());
     }
 
@@ -1366,14 +1750,14 @@ mod tests {
         conn_state.add_prepared_statement("stmt2".to_string(), "SELECT 2".to_string(), vec![]);
         assert!(conn_state.is_pinned());
 
-        ConnectionHandler::update_connection_state(&mut conn_state, "DEALLOCATE ALL");
+        conn_state.apply_query("DEALLOCATE ALL");
         assert!(!conn_state.is_pinned());
     }
 
     #[test]
     fn test_update_connection_state_regular_query_no_effect() {
         let mut conn_state = ConnectionState::new(100);
-        ConnectionHandler::update_connection_state(&mut conn_state, "SELECT * FROM users");
+        conn_state.apply_query("SELECT * FROM users");
         assert!(!conn_state.is_pinned());
     }
 
@@ -1383,7 +1767,7 @@ mod tests {
         conn_state.add_temp_table("tmp_users".to_string());
         assert!(conn_state.has_unsafe_state());
 
-        ConnectionHandler::update_connection_state(&mut conn_state, "DROP TABLE tmp_users");
+        conn_state.apply_query("DROP TABLE tmp_users");
         assert!(!conn_state.has_unsafe_state());
     }
 

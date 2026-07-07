@@ -1,8 +1,9 @@
 use blake3::Hasher;
-use sqlparser::ast::{Expr, Query, SetExpr, Statement, Value, Visit, Visitor};
+use sqlparser::ast::{Expr, Statement, Value, Visit, VisitMut, Visitor, VisitorMut};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
-use tracing::{debug, warn};
+use std::ops::ControlFlow;
+use tracing::debug;
 
 /// Result of anonymizing a query
 #[derive(Debug, Clone, PartialEq)]
@@ -43,7 +44,15 @@ impl QueryAnonymizer {
         let statements = match Parser::parse_sql(&dialect, query) {
             Ok(stmts) => stmts,
             Err(e) => {
-                warn!(error = %e, query = %query, "Failed to parse query for anonymization");
+                // Never log the raw query here: on parse failure the caller
+                // fails closed (redact/drop), and echoing the unparsed text
+                // would leak the very literals anonymization exists to protect
+                // (P1 §4.4). Log only the parser error and the query length.
+                debug!(
+                    error = %e,
+                    query_len = query.len(),
+                    "Failed to parse query for anonymization; failing closed"
+                );
                 return None;
             }
         };
@@ -58,12 +67,14 @@ impl QueryAnonymizer {
             let _ = stmt.visit(&mut collector);
         }
 
-        // Generate normalized query by replacing values with placeholders
-        let normalized = self.normalize_statements(&statements);
+        // Generate the normalized query by replacing every literal with a
+        // placeholder. `normalize_statements` fails closed (returns None) if any
+        // literal survives the replacement, so a partially-anonymized statement
+        // is never emitted (P1 §4.4, §5.3).
+        let normalized = self.normalize_statements(&statements)?;
 
         debug!(
-            query = %query,
-            normalized = %normalized,
+            query_len = query.len(),
             fingerprint_count = collector.fingerprints.len(),
             "Anonymized query"
         );
@@ -74,27 +85,42 @@ impl QueryAnonymizer {
         })
     }
 
-    /// Normalize statements by converting them to SQL with placeholders
-    fn normalize_statements(&self, statements: &[Statement]) -> String {
+    /// Normalize statements by converting them to SQL with placeholders.
+    ///
+    /// Returns `None` if any statement could not be fully normalized (a literal
+    /// survived), so the caller fails closed rather than shipping raw values.
+    fn normalize_statements(&self, statements: &[Statement]) -> Option<String> {
         let mut normalized = String::new();
         for (i, stmt) in statements.iter().enumerate() {
             if i > 0 {
                 normalized.push_str("; ");
             }
-            let stmt_normalized = self.normalize_statement(stmt);
-            normalized.push_str(&stmt_normalized);
+            normalized.push_str(&self.normalize_statement(stmt)?);
         }
-        normalized
+        Some(normalized)
     }
 
-    /// Normalize a single statement
-    fn normalize_statement(&self, stmt: &Statement) -> String {
-        // Use sqlparser's Display trait but replace values
-        // For now, we'll use a simple approach: convert to string and use visitor
+    /// Normalize a single statement by replacing every literal `Expr::Value`
+    /// with a `?` placeholder, using sqlparser's comprehensive `VisitorMut` so
+    /// all statement kinds (DDL included, e.g. `CREATE ROLE ... PASSWORD 'x'`)
+    /// are covered — not just SELECT/INSERT/UPDATE/DELETE.
+    ///
+    /// After replacement it re-scans the statement for any surviving literal;
+    /// if one remains, normalization is considered incomplete and `None` is
+    /// returned so the caller fails closed.
+    fn normalize_statement(&self, stmt: &Statement) -> Option<String> {
         let mut normalized_stmt = stmt.clone();
         let mut replacer = ValueReplacer;
-        replacer.visit_statement(&mut normalized_stmt);
-        normalized_stmt.to_string()
+        let _ = VisitMut::visit(&mut normalized_stmt, &mut replacer);
+
+        // Defense in depth: verify no literal survived the replacement.
+        let mut residual = ResidualLiteralDetector::default();
+        let _ = Visit::visit(&normalized_stmt, &mut residual);
+        if residual.found_literal {
+            return None;
+        }
+
+        Some(normalized_stmt.to_string())
     }
 }
 
@@ -144,116 +170,61 @@ impl Visitor for ValueCollector {
     }
 }
 
-/// Visitor that replaces all literal values with placeholders
+/// Returns true if a `Value` is a literal that must be redacted (as opposed to
+/// a placeholder or other non-sensitive value). Kept in sync with
+/// [`ValueCollector`]'s fingerprinting arms.
+fn is_sensitive_literal(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Number(_, _)
+            | Value::SingleQuotedString(_)
+            | Value::DoubleQuotedString(_)
+            | Value::Boolean(_)
+            | Value::Null
+    )
+}
+
+/// `VisitorMut` that replaces every literal value in a statement with a `?`
+/// placeholder.
+///
+/// Uses sqlparser's comprehensive AST walk, so it covers *all* statement kinds
+/// (including DDL such as `CREATE ROLE ... PASSWORD 'secret'`), not just the
+/// DML the previous hand-rolled traversal knew about — that gap leaked literals
+/// into the "normalized" output.
 struct ValueReplacer;
 
-impl ValueReplacer {
-    fn visit_statement(&mut self, stmt: &mut Statement) {
-        match stmt {
-            Statement::Query(query) => self.visit_query(query),
-            Statement::Insert(insert) => {
-                if let Some(source) = &mut insert.source {
-                    self.visit_query(source);
-                }
-            }
-            Statement::Update { selection, assignments, .. } => {
-                if let Some(sel) = selection {
-                    self.visit_expr(sel);
-                }
-                for assignment in assignments {
-                    self.visit_expr(&mut assignment.value);
-                }
-            }
-            Statement::Delete(delete) => {
-                if let Some(selection) = &mut delete.selection {
-                    self.visit_expr(selection);
-                }
-            }
-            _ => {}
-        }
-    }
+impl VisitorMut for ValueReplacer {
+    type Break = ();
 
-    fn visit_query(&mut self, query: &mut Box<Query>) {
-        match query.body.as_mut() {
-            SetExpr::Select(select) => {
-                // Replace values in WHERE clause
-                if let Some(selection) = &mut select.selection {
-                    self.visit_expr(selection);
-                }
-                // Replace values in SELECT list
-                for projection in &mut select.projection {
-                    if let sqlparser::ast::SelectItem::UnnamedExpr(expr) = projection {
-                        self.visit_expr(expr);
-                    } else if let sqlparser::ast::SelectItem::ExprWithAlias { expr, .. } =
-                        projection
-                    {
-                        self.visit_expr(expr);
-                    }
-                }
-            }
-            SetExpr::Values(values) => {
-                for row in &mut values.rows {
-                    for expr in row {
-                        self.visit_expr(expr);
-                    }
-                }
-            }
-            SetExpr::Query(inner_query) => {
-                self.visit_query(inner_query);
-            }
-            _ => {}
-        }
-    }
-
-    fn visit_expr(&mut self, expr: &mut Expr) {
-        match expr {
-            Expr::Value(_) => {
-                // Replace with placeholder
+    fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
+        if let Expr::Value(value) = expr {
+            if is_sensitive_literal(value) {
                 *expr = Expr::Value(Value::Placeholder("?".to_string()));
             }
-            Expr::BinaryOp { left, right, .. } => {
-                self.visit_expr(left);
-                self.visit_expr(right);
-            }
-            Expr::UnaryOp { expr: inner, .. } => {
-                self.visit_expr(inner);
-            }
-            Expr::Cast { expr: inner, .. } => {
-                self.visit_expr(inner);
-            }
-            Expr::Between { expr: inner, low, high, .. } => {
-                self.visit_expr(inner);
-                self.visit_expr(low);
-                self.visit_expr(high);
-            }
-            Expr::InList { expr: inner, list, .. } => {
-                self.visit_expr(inner);
-                for item in list {
-                    self.visit_expr(item);
-                }
-            }
-            Expr::Function(func) => match &mut func.args {
-                sqlparser::ast::FunctionArguments::None => {}
-                sqlparser::ast::FunctionArguments::Subquery(_) => {}
-                sqlparser::ast::FunctionArguments::List(arg_list) => {
-                    for arg in &mut arg_list.args {
-                        if let sqlparser::ast::FunctionArg::Unnamed(
-                            sqlparser::ast::FunctionArgExpr::Expr(e),
-                        ) = arg
-                        {
-                            self.visit_expr(e);
-                        }
-                    }
-                }
-            },
-            Expr::Nested(inner) => {
-                self.visit_expr(inner);
-            }
-            Expr::Subquery(query) => {
-                self.visit_query(query);
-            }
-            _ => {}
         }
+        ControlFlow::Continue(())
+    }
+}
+
+/// `Visitor` that reports whether any sensitive literal survived replacement.
+/// Used as a fail-closed check: if a literal remains after normalization, the
+/// statement is not emitted at all.
+#[derive(Default)]
+struct ResidualLiteralDetector {
+    found_literal: bool,
+}
+
+impl Visitor for ResidualLiteralDetector {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+        if let Expr::Value(value) = expr {
+            if is_sensitive_literal(value) {
+                self.found_literal = true;
+                return ControlFlow::Break(());
+            }
+        }
+        ControlFlow::Continue(())
     }
 }
 

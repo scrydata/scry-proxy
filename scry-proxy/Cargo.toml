@@ -11,8 +11,11 @@ name = "scry"
 path = "src/main.rs"
 
 [dependencies]
-# Protocol dependency (published on crates.io)
-scry-protocol = "0.1.0"
+# Event protocol crate, from crates.io. The proxy does not currently consume any
+# unreleased schema changes, so it depends on the published version (reproducible
+# in CI). When a coordinated schema change is needed, bump to a newly-released
+# version (a path dep can be reintroduced locally for that development, per WP-11/WP-15).
+scry-protocol = "0.1"
 
 # Async runtime
 tokio = { workspace = true }
@@ -74,7 +77,6 @@ indexmap = "2.7"
 # TLS support
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
 webpki-roots = { workspace = true }
 
 # Authentication
@@ -101,4 +103,11 @@ postgres-native-tls = "0.5"
 
 [[bench]]
 name = "proxy_throughput"
+harness = false
+
+# Non-blocking perf signal: measures the proxy's added latency (direct-vs-proxy
+# delta) against the configured budget and prints a report. Exits 0 regardless
+# so CI can run it as an informational signal (flips to blocking in WP-13).
+[[bench]]
+name = "overhead_delta"
 harness = false

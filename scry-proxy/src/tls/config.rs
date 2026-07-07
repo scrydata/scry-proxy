@@ -1,12 +1,20 @@
 use crate::config::{TlsConfig, TlsSslMode};
+use rustls::pki_types::pem::{Error as PemError, PemObject};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
-use rustls_pemfile::{certs, private_key};
-use std::fs::File;
-use std::io::BufReader;
 use std::sync::Arc;
 use thiserror::Error;
+
+/// Convert a PEM parsing error into an `io::Error`, preserving the underlying
+/// I/O error (e.g. file not found) where available so callers can distinguish
+/// "couldn't read the file" from "file had no usable PEM section".
+fn pem_error_to_io(err: PemError) -> std::io::Error {
+    match err {
+        PemError::Io(io_err) => io_err,
+        other => std::io::Error::new(std::io::ErrorKind::InvalidData, other.to_string()),
+    }
+}
 
 #[derive(Error, Debug)]
 pub enum TlsError {
@@ -37,9 +45,9 @@ pub enum TlsError {
 
 /// Load certificates from a PEM file
 fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>, TlsError> {
-    let file = File::open(path).map_err(TlsError::CertificateReadError)?;
-    let mut reader = BufReader::new(file);
-    let certs: Vec<_> = certs(&mut reader).filter_map(|cert| cert.ok()).collect();
+    let iter = CertificateDer::pem_file_iter(path)
+        .map_err(|e| TlsError::CertificateReadError(pem_error_to_io(e)))?;
+    let certs: Vec<_> = iter.filter_map(|cert| cert.ok()).collect();
 
     if certs.is_empty() {
         return Err(TlsError::NoCertificatesFound(path.to_string()));
@@ -50,21 +58,17 @@ fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>, TlsError> {
 
 /// Load private key from a PEM file
 fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>, TlsError> {
-    let file = File::open(path).map_err(TlsError::KeyReadError)?;
-    let mut reader = BufReader::new(file);
-
-    private_key(&mut reader)
-        .map_err(|e| {
-            TlsError::KeyReadError(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-        })?
-        .ok_or_else(|| TlsError::NoPrivateKeyFound(path.to_string()))
+    PrivateKeyDer::from_pem_file(path).map_err(|e| match e {
+        PemError::NoItemsFound => TlsError::NoPrivateKeyFound(path.to_string()),
+        other => TlsError::KeyReadError(pem_error_to_io(other)),
+    })
 }
 
 /// Load CA certificates into a RootCertStore
 fn load_ca_certs(path: &str) -> Result<RootCertStore, TlsError> {
-    let file = File::open(path).map_err(TlsError::CaReadError)?;
-    let mut reader = BufReader::new(file);
-    let certs = certs(&mut reader).filter_map(|cert| cert.ok()).collect::<Vec<_>>();
+    let iter = CertificateDer::pem_file_iter(path)
+        .map_err(|e| TlsError::CaReadError(pem_error_to_io(e)))?;
+    let certs = iter.filter_map(|cert| cert.ok()).collect::<Vec<_>>();
 
     let mut root_store = RootCertStore::empty();
     for cert in certs {

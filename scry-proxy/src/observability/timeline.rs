@@ -39,6 +39,31 @@ impl QueryTimeline {
         }
     }
 
+    /// Build a timeline for a query whose receive instant is already known
+    /// (retained in the pending-execution cache), anchoring `received_at` and
+    /// `backend_start` at that instant and `backend_end` at now.
+    ///
+    /// This is the per-query timeline recorded at completion: `total` and
+    /// `backend` reflect the real observed latency of the query round-trip, so
+    /// the latency histograms are populated with real data rather than a zeroed
+    /// `QueryTimeline::new()` (P5 §4.1, §5.2).
+    pub fn for_completed(received_at: Instant) -> Self {
+        Self {
+            received_at,
+            pool_acquire_start: None,
+            pool_acquire_end: None,
+            backend_start: Some(received_at),
+            backend_end: Some(Instant::now()),
+        }
+    }
+
+    /// Record a pool-acquisition span measured outside this timeline (e.g. a
+    /// mid-session re-acquire), folding it into the phase breakdown.
+    pub fn set_pool_acquire(&mut self, start: Instant, end: Instant) {
+        self.pool_acquire_start = Some(start);
+        self.pool_acquire_end = Some(end);
+    }
+
     /// Mark the start of pool connection acquisition
     pub fn mark_pool_acquire_start(&mut self) {
         self.pool_acquire_start = Some(Instant::now());
@@ -87,13 +112,33 @@ impl QueryTimeline {
 
     /// Get all phase durations in microseconds (for histogram recording)
     pub fn phase_durations_micros(&self) -> TimelinePhases {
+        let queue = self.queue_time().map(|d| d.as_micros() as u64);
+        let pool = self.pool_acquire_time().map(|d| d.as_micros() as u64);
+        let backend = self.backend_time().map(|d| d.as_micros() as u64);
+        let total = self.total_time().as_micros() as u64;
         TimelinePhases {
-            queue_time_micros: self.queue_time().map(|d| d.as_micros() as u64),
-            pool_acquire_micros: self.pool_acquire_time().map(|d| d.as_micros() as u64),
-            backend_micros: self.backend_time().map(|d| d.as_micros() as u64),
-            total_micros: self.total_time().as_micros() as u64,
+            queue_time_micros: queue,
+            pool_acquire_micros: pool,
+            backend_micros: backend,
+            total_micros: total,
+            proxy_overhead_micros: proxy_overhead_micros(total, backend, pool, queue),
         }
     }
+}
+
+/// Derive the proxy's own added latency: whatever of the total is not explained
+/// by the backend round-trip, pool acquisition, or queue wait (P5 §4.1).
+/// Saturating so it never underflows if phases overlap or are unmeasured.
+fn proxy_overhead_micros(
+    total: u64,
+    backend: Option<u64>,
+    pool: Option<u64>,
+    queue: Option<u64>,
+) -> u64 {
+    total
+        .saturating_sub(backend.unwrap_or(0))
+        .saturating_sub(pool.unwrap_or(0))
+        .saturating_sub(queue.unwrap_or(0))
 }
 
 impl Default for QueryTimeline {
@@ -109,6 +154,8 @@ pub struct TimelinePhases {
     pub pool_acquire_micros: Option<u64>,
     pub backend_micros: Option<u64>,
     pub total_micros: u64,
+    /// The proxy's own added latency (total minus backend/pool/queue).
+    pub proxy_overhead_micros: u64,
 }
 
 #[cfg(test)]
@@ -179,6 +226,32 @@ mod tests {
 
         // Backend should be >= 1000 microseconds
         assert!(phases.backend_micros.unwrap() >= 1000);
+    }
+
+    #[test]
+    fn test_for_completed_populates_backend_and_total() {
+        let received = Instant::now();
+        sleep(Duration::from_millis(3));
+        let timeline = QueryTimeline::for_completed(received);
+        let phases = timeline.phase_durations_micros();
+
+        // Both total and backend are real, non-zero measurements (not a zeroed
+        // QueryTimeline::new()).
+        assert!(phases.total_micros >= 3_000, "total should be >= 3ms: {}", phases.total_micros);
+        assert_eq!(phases.backend_micros, Some(phases.total_micros));
+        // With backend anchored at receipt, proxy overhead is ~0 for the
+        // passthrough path.
+        assert_eq!(phases.proxy_overhead_micros, 0);
+    }
+
+    #[test]
+    fn test_proxy_overhead_derivation() {
+        // total 1000us, backend 600us, pool 100us, queue 50us -> overhead 250us.
+        assert_eq!(super::proxy_overhead_micros(1000, Some(600), Some(100), Some(50)), 250);
+        // Saturating: never underflows when phases exceed total.
+        assert_eq!(super::proxy_overhead_micros(500, Some(600), None, None), 0);
+        // Missing phases treated as 0.
+        assert_eq!(super::proxy_overhead_micros(1000, None, None, None), 1000);
     }
 
     #[test]

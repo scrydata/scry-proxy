@@ -32,7 +32,10 @@ pub struct ProxyMetrics {
     health: Arc<HealthMonitor>,
     start_time: Instant,
     active_connections: Arc<AtomicUsize>,
-    circuit_breaker: Arc<RwLock<Option<Arc<crate::resilience::CircuitBreaker>>>>,
+    /// Per-backend circuit breakers, keyed by backend/database identity, so one
+    /// failing backend does not trip the breaker for healthy ones (P3 §4.1/§5.4).
+    circuit_breakers:
+        Arc<RwLock<std::collections::HashMap<String, Arc<crate::resilience::CircuitBreaker>>>>,
     /// Maximum connections limit (for Prometheus export)
     max_connections: Arc<AtomicUsize>,
     /// Counter of connections rejected due to limit
@@ -53,15 +56,33 @@ impl ProxyMetrics {
             health: Arc::new(HealthMonitor::new(health_config)),
             start_time: Instant::now(),
             active_connections: Arc::new(AtomicUsize::new(0)),
-            circuit_breaker: Arc::new(RwLock::new(None)),
+            circuit_breakers: Arc::new(RwLock::new(std::collections::HashMap::new())),
             max_connections: Arc::new(AtomicUsize::new(0)),
             connections_rejected: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    /// Set the circuit breaker (called from server setup)
-    pub fn set_circuit_breaker(&self, cb: Option<Arc<crate::resilience::CircuitBreaker>>) {
-        *self.circuit_breaker.write() = cb;
+    /// Register a per-backend circuit breaker for observability (called from
+    /// server setup, once per backend/database pool).
+    pub fn register_circuit_breaker(
+        &self,
+        backend: String,
+        cb: Arc<crate::resilience::CircuitBreaker>,
+    ) {
+        self.circuit_breakers.write().insert(backend, cb);
+    }
+
+    /// Remove all registered circuit breakers (breaker disabled).
+    pub fn clear_circuit_breakers(&self) {
+        self.circuit_breakers.write().clear();
+    }
+
+    /// Look up a registered per-backend circuit breaker by backend identity.
+    pub fn get_circuit_breaker(
+        &self,
+        backend: &str,
+    ) -> Option<Arc<crate::resilience::CircuitBreaker>> {
+        self.circuit_breakers.read().get(backend).cloned()
     }
 
     /// Record a completed query with timeline breakdown
@@ -187,9 +208,16 @@ impl ProxyMetrics {
         self.start_time.elapsed()
     }
 
-    /// Get circuit breaker metrics if circuit breaker is enabled
-    pub fn circuit_breaker_metrics(&self) -> Option<crate::resilience::CircuitBreakerMetrics> {
-        self.circuit_breaker.read().as_ref().map(|cb| cb.get_metrics())
+    /// Per-backend circuit breaker metrics, sorted by backend name for stable
+    /// Prometheus output.
+    pub fn circuit_breaker_metrics_all(
+        &self,
+    ) -> Vec<(String, crate::resilience::CircuitBreakerMetrics)> {
+        let map = self.circuit_breakers.read();
+        let mut out: Vec<_> =
+            map.iter().map(|(name, cb)| (name.clone(), cb.get_metrics())).collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
     }
 }
 
@@ -200,6 +228,7 @@ pub struct QueryMetrics {
     queue_time_histogram: RwLock<Histogram<u64>>,
     pool_acquire_histogram: RwLock<Histogram<u64>>,
     backend_time_histogram: RwLock<Histogram<u64>>,
+    proxy_overhead_histogram: RwLock<Histogram<u64>>,
 
     // Atomic counters
     pub total_queries: AtomicU64,
@@ -222,6 +251,9 @@ impl QueryMetrics {
             backend_time_histogram: RwLock::new(
                 Histogram::<u64>::new_with_bounds(1, 3_600_000_000, 3).unwrap(),
             ),
+            proxy_overhead_histogram: RwLock::new(
+                Histogram::<u64>::new_with_bounds(1, 3_600_000_000, 3).unwrap(),
+            ),
             total_queries: AtomicU64::new(0),
             total_errors: AtomicU64::new(0),
         }
@@ -241,6 +273,24 @@ impl QueryMetrics {
         }
         if let Some(backend_micros) = phases.backend_micros {
             let _ = self.backend_time_histogram.write().record(backend_micros);
+        }
+        // Derived proxy overhead (HDR histograms require a value >= 1).
+        if phases.proxy_overhead_micros > 0 {
+            let _ = self.proxy_overhead_histogram.write().record(phases.proxy_overhead_micros);
+        }
+    }
+
+    /// Proxy-overhead latency percentiles (the proxy's own added latency).
+    pub fn proxy_overhead_percentiles(&self) -> LatencyPercentiles {
+        let hist = self.proxy_overhead_histogram.read();
+        LatencyPercentiles {
+            p50_micros: hist.value_at_quantile(0.50),
+            p90_micros: hist.value_at_quantile(0.90),
+            p95_micros: hist.value_at_quantile(0.95),
+            p99_micros: hist.value_at_quantile(0.99),
+            p999_micros: hist.value_at_quantile(0.999),
+            max_micros: hist.max(),
+            mean_micros: hist.mean(),
         }
     }
 
@@ -339,6 +389,7 @@ pub struct PoolMetrics {
     pin_temp_table: AtomicU64,
     pin_cursor: AtomicU64,
     pin_advisory_lock: AtomicU64,
+    pin_unknown_command: AtomicU64,
 
     // Wait time histogram (microseconds)
     wait_histogram: RwLock<Histogram<u64>>,
@@ -359,6 +410,7 @@ impl PoolMetrics {
             pin_temp_table: AtomicU64::new(0),
             pin_cursor: AtomicU64::new(0),
             pin_advisory_lock: AtomicU64::new(0),
+            pin_unknown_command: AtomicU64::new(0),
             // HDR histogram: 3 significant figures, up to 1 hour in microseconds
             wait_histogram: RwLock::new(
                 Histogram::<u64>::new_with_bounds(1, 3_600_000_000, 3).unwrap(),
@@ -398,6 +450,9 @@ impl PoolMetrics {
             }
             PinReason::AdvisoryLock => {
                 self.pin_advisory_lock.fetch_add(1, Ordering::Relaxed);
+            }
+            PinReason::UnknownCommand => {
+                self.pin_unknown_command.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -464,6 +519,7 @@ impl PoolMetrics {
             temp_table: self.pin_temp_table.load(Ordering::Relaxed),
             cursor: self.pin_cursor.load(Ordering::Relaxed),
             advisory_lock: self.pin_advisory_lock.load(Ordering::Relaxed),
+            unknown_command: self.pin_unknown_command.load(Ordering::Relaxed),
         }
     }
 
@@ -557,6 +613,7 @@ pub struct PinReasonCounts {
     pub temp_table: u64,
     pub cursor: u64,
     pub advisory_lock: u64,
+    pub unknown_command: u64,
 }
 
 /// Histogram snapshots for Prometheus export

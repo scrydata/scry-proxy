@@ -115,8 +115,13 @@ max_retries = 2
 compression = true
 
 [performance]
-target_latency_ms = 1
 buffer_size = 8192
+
+[performance.latency_budget]
+overhead_p50_micros = 250
+overhead_p95_micros = 750
+overhead_p99_micros = 1000
+reference_workload = "oltp-point-select"
 
 [resilience.circuit_breaker]
 enabled = true
@@ -264,7 +269,11 @@ Performance tuning settings.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `target_latency_ms` | u64 | `1` | Target added latency in milliseconds |
+| `latency_budget.overhead_p50_micros` | u64 | `250` | p50 budget for the proxy's *added* latency (µs) |
+| `latency_budget.overhead_p95_micros` | u64 | `750` | p95 added-latency budget (µs) |
+| `latency_budget.overhead_p99_micros` | u64 | `1000` | p99 added-latency budget (µs) |
+| `latency_budget.reference_workload` | String | `oltp-point-select` | Reference workload the budget is measured against |
+| `query_timeout_secs` | u64 | `0` | Max seconds a query may run on the backend before the proxy cancels it by closing the connection (0 = disabled) |
 | `buffer_size` | usize | `8192` | TCP buffer size in bytes |
 | `pool_size` | usize | `50` | Backend connection pool size |
 | `pool_min_idle` | usize | `5` | Minimum idle connections to maintain |
@@ -274,7 +283,7 @@ Performance tuning settings.
 
 **Environment Variables**:
 ```bash
-SCRY_PERFORMANCE__TARGET_LATENCY_MS=1
+SCRY_PERFORMANCE__LATENCY_BUDGET__OVERHEAD_P99_MICROS=1000
 SCRY_PERFORMANCE__BUFFER_SIZE=16384
 SCRY_PERFORMANCE__POOL_SIZE=50
 SCRY_PERFORMANCE__POOL_QUEUE_DEPTH=500
@@ -484,13 +493,8 @@ Health monitoring and anomaly detection.
 | `pool_saturation_threshold` | f64 | `0.95` | Pool utilization threshold (0.0-1.0) |
 | `ema_alpha` | f64 | `0.1` | EMA smoothing factor (0.0-1.0) |
 
-**Environment Variables**:
-```bash
-SCRY_HEALTH__ERROR_RATE_SPIKE_FACTOR=5.0
-SCRY_HEALTH__LATENCY_SPIKE_FACTOR=3.0
-SCRY_HEALTH__POOL_SATURATION_THRESHOLD=0.90
-SCRY_HEALTH__EMA_ALPHA=0.2
-```
+> **Note:** These passive health-monitor thresholds currently use built-in
+> defaults and are not yet environment-configurable.
 
 ## Common Scenarios
 

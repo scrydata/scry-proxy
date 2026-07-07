@@ -211,6 +211,12 @@ fn export_pooling_metrics(output: &mut String, metrics: &ProxyMetrics) {
         pin_counts.advisory_lock
     )
     .unwrap();
+    writeln!(
+        output,
+        "scry_pool_pin_reason_total{{reason=\"unknown_command\"}} {}",
+        pin_counts.unknown_command
+    )
+    .unwrap();
 
     // Queue depth gauge
     writeln!(output, "# HELP scry_pool_queue_depth Current wait queue depth").unwrap();
@@ -315,79 +321,103 @@ fn export_uptime(output: &mut String, metrics: &ProxyMetrics) {
 }
 
 fn export_circuit_breaker_metrics(output: &mut String, metrics: &ProxyMetrics) {
-    if let Some(cb_metrics) = metrics.circuit_breaker_metrics() {
-        // Circuit breaker state (0=Closed, 1=Open, 2=HalfOpen)
-        let state_value = match cb_metrics.state.as_str() {
+    let breakers = metrics.circuit_breaker_metrics_all();
+    if breakers.is_empty() {
+        return;
+    }
+
+    // Emit HELP/TYPE once, then one labeled series per backend so a single bad
+    // backend is visible in isolation (P3 §4.1).
+    writeln!(
+        output,
+        "# HELP scry_circuit_breaker_state Circuit breaker state (0=Closed, 1=Open, 2=HalfOpen)"
+    )
+    .unwrap();
+    writeln!(output, "# TYPE scry_circuit_breaker_state gauge").unwrap();
+    for (backend, cb) in &breakers {
+        let state_value = match cb.state.as_str() {
             "closed" => 0,
             "open" => 1,
             "half_open" => 2,
             _ => 0,
         };
-
         writeln!(
             output,
-            "# HELP scry_circuit_breaker_state Circuit breaker state (0=Closed, 1=Open, 2=HalfOpen)"
-        )
-        .unwrap();
-        writeln!(output, "# TYPE scry_circuit_breaker_state gauge").unwrap();
-        writeln!(output, "scry_circuit_breaker_state {}", state_value).unwrap();
-
-        // Consecutive failures
-        writeln!(
-            output,
-            "# HELP scry_circuit_breaker_consecutive_failures Consecutive failures in current window"
-        )
-        .unwrap();
-        writeln!(output, "# TYPE scry_circuit_breaker_consecutive_failures gauge").unwrap();
-        writeln!(
-            output,
-            "scry_circuit_breaker_consecutive_failures {}",
-            cb_metrics.consecutive_failures
-        )
-        .unwrap();
-
-        // Consecutive successes
-        writeln!(
-            output,
-            "# HELP scry_circuit_breaker_consecutive_successes Consecutive successes in half-open state"
-        )
-        .unwrap();
-        writeln!(output, "# TYPE scry_circuit_breaker_consecutive_successes gauge").unwrap();
-        writeln!(
-            output,
-            "scry_circuit_breaker_consecutive_successes {}",
-            cb_metrics.consecutive_successes
-        )
-        .unwrap();
-
-        // Requests allowed
-        writeln!(
-            output,
-            "# HELP scry_circuit_breaker_requests_allowed_total Total requests allowed through"
-        )
-        .unwrap();
-        writeln!(output, "# TYPE scry_circuit_breaker_requests_allowed_total counter").unwrap();
-        writeln!(
-            output,
-            "scry_circuit_breaker_requests_allowed_total {}",
-            cb_metrics.requests_allowed
-        )
-        .unwrap();
-
-        // Requests rejected
-        writeln!(
-            output,
-            "# HELP scry_circuit_breaker_requests_rejected_total Total requests rejected (circuit open)"
-        )
-        .unwrap();
-        writeln!(output, "# TYPE scry_circuit_breaker_requests_rejected_total counter").unwrap();
-        writeln!(
-            output,
-            "scry_circuit_breaker_requests_rejected_total {}",
-            cb_metrics.requests_rejected
+            "scry_circuit_breaker_state{{backend=\"{}\"}} {}",
+            escape_label(backend),
+            state_value
         )
         .unwrap();
     }
+
+    writeln!(
+        output,
+        "# HELP scry_circuit_breaker_consecutive_failures Consecutive failures in current window"
+    )
+    .unwrap();
+    writeln!(output, "# TYPE scry_circuit_breaker_consecutive_failures gauge").unwrap();
+    for (backend, cb) in &breakers {
+        writeln!(
+            output,
+            "scry_circuit_breaker_consecutive_failures{{backend=\"{}\"}} {}",
+            escape_label(backend),
+            cb.consecutive_failures
+        )
+        .unwrap();
+    }
+
+    writeln!(
+        output,
+        "# HELP scry_circuit_breaker_consecutive_successes Consecutive successes in half-open state"
+    )
+    .unwrap();
+    writeln!(output, "# TYPE scry_circuit_breaker_consecutive_successes gauge").unwrap();
+    for (backend, cb) in &breakers {
+        writeln!(
+            output,
+            "scry_circuit_breaker_consecutive_successes{{backend=\"{}\"}} {}",
+            escape_label(backend),
+            cb.consecutive_successes
+        )
+        .unwrap();
+    }
+
+    writeln!(
+        output,
+        "# HELP scry_circuit_breaker_requests_allowed_total Total requests allowed through"
+    )
+    .unwrap();
+    writeln!(output, "# TYPE scry_circuit_breaker_requests_allowed_total counter").unwrap();
+    for (backend, cb) in &breakers {
+        writeln!(
+            output,
+            "scry_circuit_breaker_requests_allowed_total{{backend=\"{}\"}} {}",
+            escape_label(backend),
+            cb.requests_allowed
+        )
+        .unwrap();
+    }
+
+    writeln!(
+        output,
+        "# HELP scry_circuit_breaker_requests_rejected_total Total requests rejected (circuit open)"
+    )
+    .unwrap();
+    writeln!(output, "# TYPE scry_circuit_breaker_requests_rejected_total counter").unwrap();
+    for (backend, cb) in &breakers {
+        writeln!(
+            output,
+            "scry_circuit_breaker_requests_rejected_total{{backend=\"{}\"}} {}",
+            escape_label(backend),
+            cb.requests_rejected
+        )
+        .unwrap();
+    }
+}
+
+/// Escape a Prometheus label value (backslash, double-quote, newline).
+fn escape_label(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
 }
 
 /// Helper to export quantiles for a histogram

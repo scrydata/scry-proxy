@@ -367,13 +367,11 @@ export SCRY_RESILIENCE__HEALTHCHECK__ACTIVE_ENABLED=true
 export SCRY_RESILIENCE__HEALTHCHECK__INTERVAL_SECS=30
 export SCRY_RESILIENCE__HEALTHCHECK__TIMEOUT_MS=1000
 export SCRY_RESILIENCE__HEALTHCHECK__FAILURE_THRESHOLD=3
-
-# Health monitoring
-export SCRY_HEALTH__ERROR_RATE_SPIKE_FACTOR=3.0
-export SCRY_HEALTH__LATENCY_SPIKE_FACTOR=2.0
-export SCRY_HEALTH__POOL_SATURATION_THRESHOLD=0.95
-export SCRY_HEALTH__EMA_ALPHA=0.1
 ```
+
+> **Note:** The passive health-monitor thresholds (error-rate/latency spike
+> factors, pool-saturation threshold, EMA smoothing) currently use built-in
+> defaults and are not yet environment-configurable.
 
 ### Tuning for Different Environments
 

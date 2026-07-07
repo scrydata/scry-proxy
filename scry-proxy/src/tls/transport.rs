@@ -45,6 +45,26 @@ impl ClientTransport {
             )),
         }
     }
+
+    /// Returns true if the peer presented a certificate that rustls accepted
+    /// during the TLS handshake.
+    ///
+    /// `rustls` only populates `peer_certificates()` when the client sent a
+    /// certificate chain that the configured client-certificate verifier
+    /// accepted, so a non-empty chain here means a verified client certificate
+    /// was actually presented. Non-TLS transports (plain TCP, UNIX socket)
+    /// always return `false`. Used by cert auth as a fail-closed defense-in-depth
+    /// check (P1 §4.1) before trusting the connection identity.
+    pub fn has_verified_peer_cert(&self) -> bool {
+        match self {
+            ClientTransport::Tls(stream) => {
+                stream.get_ref().1.peer_certificates().is_some_and(|certs| !certs.is_empty())
+            }
+            ClientTransport::Plain(_) => false,
+            #[cfg(unix)]
+            ClientTransport::Unix(_) => false,
+        }
+    }
 }
 
 impl AsyncRead for ClientTransport {
@@ -157,5 +177,31 @@ impl AsyncWrite for BackendTransport {
             BackendTransportProj::Plain(stream) => stream.poll_shutdown(cx),
             BackendTransportProj::Tls(stream) => stream.poll_shutdown(cx),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    /// A plain (unencrypted) client transport never counts as having presented
+    /// a verified client certificate — cert auth must fail closed on it.
+    #[tokio::test]
+    async fn plain_transport_has_no_verified_peer_cert() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            stream
+        });
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let server = accept.await.unwrap();
+
+        let transport = ClientTransport::Plain(server);
+        assert!(
+            !transport.has_verified_peer_cert(),
+            "plain TCP transport must not report a verified client certificate"
+        );
     }
 }

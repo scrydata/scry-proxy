@@ -20,11 +20,32 @@ impl RetryStrategy {
         Self { config }
     }
 
-    /// Execute an operation with retry logic
+    /// Execute an operation with retry logic (retrying on any error).
     ///
     /// Retries the operation up to max_attempts times with exponential backoff.
     /// Returns the successful result or the last error encountered.
     pub async fn execute<F, Fut, T, E>(&self, operation: F) -> Result<T, E>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = Result<T, E>>,
+        E: std::fmt::Display,
+    {
+        self.execute_with_classifier(operation, |_| true).await
+    }
+
+    /// Execute an operation with retry logic, retrying only errors the
+    /// `is_retryable` classifier accepts.
+    ///
+    /// This is how the connection pool avoids retrying *permanent* failures
+    /// (a closed pool, a misconfiguration) while still retrying *transient*
+    /// connect/transport failures (P3 §4.5, §5.5). Because retries only ever
+    /// wrap connection **acquisition** — never query execution — no query is
+    /// replayed, so retries can never re-run a non-idempotent statement.
+    pub async fn execute_with_classifier<F, Fut, T, E>(
+        &self,
+        operation: F,
+        is_retryable: impl Fn(&E) -> bool,
+    ) -> Result<T, E>
     where
         F: Fn() -> Fut,
         Fut: Future<Output = Result<T, E>>,
@@ -48,6 +69,12 @@ impl RetryStrategy {
                     return Ok(result);
                 }
                 Err(e) => {
+                    // Fail fast on errors that will not resolve by retrying.
+                    if !is_retryable(&e) {
+                        warn!(error = %e, "Operation failed with a non-retryable error; not retrying");
+                        return Err(e);
+                    }
+
                     if attempt >= self.config.max_attempts {
                         warn!(
                             attempts = attempt,
@@ -193,6 +220,70 @@ mod tests {
         assert_eq!(call_count.load(Ordering::Relaxed), 3);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "persistent error");
+    }
+
+    #[tokio::test]
+    async fn test_non_retryable_error_is_not_retried() {
+        // Retry safety: a classifier that rejects the error must stop after the
+        // first attempt, even with retries enabled and attempts remaining.
+        let config = ConnectionRetryConfig {
+            enabled: true,
+            max_attempts: 5,
+            initial_backoff_ms: 10,
+            max_backoff_ms: 100,
+            backoff_multiplier: 2.0,
+            jitter_factor: 0.0,
+        };
+        let strategy = RetryStrategy::new(config);
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls_c = calls.clone();
+
+        let result: Result<(), &str> = strategy
+            .execute_with_classifier(
+                || {
+                    let c = calls_c.clone();
+                    async move {
+                        c.fetch_add(1, Ordering::Relaxed);
+                        Err("permanent: pool closed")
+                    }
+                },
+                |_e| false, // never retryable
+            )
+            .await;
+
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "non-retryable error must not be retried");
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_retryable_error_is_retried_to_exhaustion() {
+        let config = ConnectionRetryConfig {
+            enabled: true,
+            max_attempts: 3,
+            initial_backoff_ms: 5,
+            max_backoff_ms: 50,
+            backoff_multiplier: 2.0,
+            jitter_factor: 0.0,
+        };
+        let strategy = RetryStrategy::new(config);
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls_c = calls.clone();
+
+        let result: Result<(), &str> = strategy
+            .execute_with_classifier(
+                || {
+                    let c = calls_c.clone();
+                    async move {
+                        c.fetch_add(1, Ordering::Relaxed);
+                        Err("transient: connect refused")
+                    }
+                },
+                |_e| true, // retryable
+            )
+            .await;
+
+        assert_eq!(calls.load(Ordering::Relaxed), 3, "retryable error should exhaust attempts");
+        assert!(result.is_err());
     }
 
     #[test]

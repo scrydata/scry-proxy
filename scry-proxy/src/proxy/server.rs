@@ -3,9 +3,12 @@ use super::{
 };
 use crate::admin::{AdminConsole, AdminResponse, ADMIN_DATABASE};
 use crate::auth::FileAuthenticator;
-use crate::config::{AuthType, Config, DatabaseConfig, PoolingStrategy, TlsSslMode};
+use crate::config::{AdminConfig, AuthType, Config, DatabaseConfig, PoolingStrategy, TlsSslMode};
 use crate::observability::ProxyMetrics;
-use crate::protocol::{Protocol, ProtocolConfig, ProtocolRegistry, StartupMessage};
+use crate::protocol::{
+    build_auth_cleartext_password, build_auth_ok, build_error_response, parse_password_message,
+    Protocol, ProtocolConfig, ProtocolRegistry, StartupMessage,
+};
 use crate::resilience::{ActiveHealthcheck, CircuitBreaker};
 use crate::routing::DatabaseRouter;
 use crate::tls::{handle_ssl_startup, load_client_tls_config, ClientTransport, SslStartupResult};
@@ -106,6 +109,11 @@ impl ProxyServer {
                 Arc::clone(&protocol),
                 protocol_config,
             ));
+            // The healthcheck probes the default backend; its verdict gates that
+            // backend's ("*") circuit breaker (P3 §4.2/§5.3). Breakers are
+            // registered during pool creation below, so the loop looks them up
+            // lazily each tick.
+            let hc_metrics = Arc::clone(&metrics);
 
             tokio::spawn(async move {
                 let mut interval =
@@ -116,6 +124,10 @@ impl ProxyServer {
 
                     match healthcheck.check().await {
                         Ok(is_healthy) => {
+                            // Gate the default backend's breaker on the probe.
+                            if let Some(cb) = hc_metrics.get_circuit_breaker("*") {
+                                cb.report_health(is_healthy);
+                            }
                             if is_healthy {
                                 tracing::debug!("Active healthcheck passed");
                             } else {
@@ -123,6 +135,11 @@ impl ProxyServer {
                             }
                         }
                         Err(e) => {
+                            // A probe that could not even connect is an unhealthy
+                            // signal — shed via the breaker.
+                            if let Some(cb) = hc_metrics.get_circuit_breaker("*") {
+                                cb.report_health(false);
+                            }
                             tracing::error!(error = %e, "Active healthcheck error");
                         }
                     }
@@ -145,29 +162,15 @@ impl ProxyServer {
             info!(database_count = config.databases.len(), "Multi-database routing enabled");
         }
 
-        // Create circuit breaker if enabled (shared across all pools)
-        let circuit_breaker = if config.resilience.circuit_breaker.enabled {
-            let health_monitor = if config.resilience.circuit_breaker.use_health_monitor {
-                Some(Arc::clone(metrics.health_monitor()))
-            } else {
-                None
-            };
-
-            let cb = Arc::new(CircuitBreaker::new(
-                config.resilience.circuit_breaker.clone(),
-                health_monitor,
-            ));
-
-            // Store circuit breaker in metrics for observability
-            metrics.set_circuit_breaker(Some(Arc::clone(&cb)));
-
-            info!("Circuit breaker created and enabled");
-            Some(cb)
+        // Circuit breakers are created per-backend (per pool) below, so one
+        // failing backend cannot trip the breaker for healthy backends
+        // (P3 §4.1/§5.4). Nothing shared is created here.
+        if config.resilience.circuit_breaker.enabled {
+            info!("Per-backend circuit breakers enabled");
         } else {
             info!("Circuit breaker disabled");
-            metrics.set_circuit_breaker(None);
-            None
-        };
+            metrics.clear_circuit_breakers();
+        }
 
         // Pass retry config if enabled
         let retry_config = if config.resilience.connection_retry.enabled {
@@ -188,56 +191,80 @@ impl ProxyServer {
                 "Creating connection pools"
             );
 
+            // Backend connect+TLS timeout, shared by every pool.
+            let connect_timeout_ms = config.backend.connection_timeout_ms;
+
+            // Captured for per-backend breaker creation inside the closure.
+            let breaker_config = config.resilience.circuit_breaker.clone();
+            let breaker_metrics = Arc::clone(&metrics);
+
             // Helper to create a pool manager for a database config
-            let create_pool_manager =
-                |db_config: &DatabaseConfig,
-                 protocol: &Arc<dyn Protocol>,
-                 tls_config: &crate::config::TlsConfig,
-                 perf_config: &crate::config::PerformanceConfig,
-                 circuit_breaker: &Option<Arc<CircuitBreaker>>,
-                 retry_config: &Option<crate::config::ConnectionRetryConfig>|
-                 -> Result<Arc<PoolManager>> {
-                    let pool_size = db_config.pool_size.unwrap_or(perf_config.pool_size);
-                    let min_idle = std::cmp::min(perf_config.pool_min_idle, pool_size);
+            let create_pool_manager = |db_config: &DatabaseConfig,
+                                       protocol: &Arc<dyn Protocol>,
+                                       tls_config: &crate::config::TlsConfig,
+                                       perf_config: &crate::config::PerformanceConfig,
+                                       retry_config: &Option<
+                crate::config::ConnectionRetryConfig,
+            >|
+             -> Result<Arc<PoolManager>> {
+                let pool_size = db_config.pool_size.unwrap_or(perf_config.pool_size);
+                let min_idle = std::cmp::min(perf_config.pool_min_idle, pool_size);
 
-                    let protocol_config = ProtocolConfig {
-                        host: db_config.host.clone(),
-                        port: db_config.port,
-                        database: Some(db_config.database.clone()),
-                        user: Some(db_config.user.clone()),
-                        password: Some(db_config.password.clone()),
+                // One circuit breaker per backend, registered for per-backend
+                // observability, so a single bad backend is isolated.
+                let circuit_breaker = if breaker_config.enabled {
+                    let health_monitor = if breaker_config.use_health_monitor {
+                        Some(Arc::clone(breaker_metrics.health_monitor()))
+                    } else {
+                        None
                     };
-
-                    let pool = TcpConnectionPool::new(
-                        Arc::clone(protocol),
-                        protocol_config,
-                        tls_config,
-                        pool_size,
-                        Some(min_idle),
-                        circuit_breaker.clone(),
-                        retry_config.clone(),
-                        perf_config.pool_lifo,
-                    )
-                    .context(format!("Failed to create pool for database '{}'", db_config.name))?;
-
-                    let wait_queue = WaitQueue::new(perf_config.pool_queue_depth);
-                    let pm_config = PoolManagerConfig {
-                        lifo: perf_config.pool_lifo,
-                        queue_depth: perf_config.pool_queue_depth,
-                        idle_unpin_secs: perf_config.pool_idle_unpin_secs,
-                        wait_timeout_ms: perf_config.pool_timeout_secs * 1000,
-                    };
-
-                    info!(
-                        database = %db_config.name,
-                        pool_size = pool_size,
-                        host = %db_config.host,
-                        port = db_config.port,
-                        "Created pool for database"
-                    );
-
-                    Ok(PoolManager::new(Arc::new(pool), wait_queue, pm_config))
+                    let cb = Arc::new(CircuitBreaker::new(breaker_config.clone(), health_monitor));
+                    breaker_metrics
+                        .register_circuit_breaker(db_config.name.clone(), Arc::clone(&cb));
+                    Some(cb)
+                } else {
+                    None
                 };
+
+                let protocol_config = ProtocolConfig {
+                    host: db_config.host.clone(),
+                    port: db_config.port,
+                    database: Some(db_config.database.clone()),
+                    user: Some(db_config.user.clone()),
+                    password: Some(db_config.password.clone()),
+                };
+
+                let pool = TcpConnectionPool::new(
+                    Arc::clone(protocol),
+                    protocol_config,
+                    tls_config,
+                    pool_size,
+                    Some(min_idle),
+                    circuit_breaker,
+                    retry_config.clone(),
+                    perf_config.pool_lifo,
+                    connect_timeout_ms,
+                )
+                .context(format!("Failed to create pool for database '{}'", db_config.name))?;
+
+                let wait_queue = WaitQueue::new(perf_config.pool_queue_depth);
+                let pm_config = PoolManagerConfig {
+                    lifo: perf_config.pool_lifo,
+                    queue_depth: perf_config.pool_queue_depth,
+                    idle_unpin_secs: perf_config.pool_idle_unpin_secs,
+                    wait_timeout_ms: perf_config.pool_timeout_secs * 1000,
+                };
+
+                info!(
+                    database = %db_config.name,
+                    pool_size = pool_size,
+                    host = %db_config.host,
+                    port = db_config.port,
+                    "Created pool for database"
+                );
+
+                Ok(PoolManager::new(Arc::new(pool), wait_queue, pm_config))
+            };
 
             // Create pool for default backend ("*")
             let default_db_config = router.default_config();
@@ -246,7 +273,6 @@ impl ProxyServer {
                 &protocol,
                 &config.tls,
                 &config.performance,
-                &circuit_breaker,
                 &retry_config,
             )?;
             pool_managers.insert("*".to_string(), default_pm);
@@ -258,7 +284,6 @@ impl ProxyServer {
                     &protocol,
                     &config.tls,
                     &config.performance,
-                    &circuit_breaker,
                     &retry_config,
                 )?;
                 pool_managers.insert(db_config.name.clone(), pm);
@@ -573,14 +598,37 @@ impl ProxyServer {
         let mut connection_count = 0u64;
         let mut connection_tasks = JoinSet::new();
 
-        // Setup shutdown signal handling
+        // Setup shutdown signal handling. Both SIGINT (Ctrl+C) and SIGTERM
+        // (the signal orchestrators like Kubernetes/Docker send to stop a
+        // container) trigger the same graceful drain path (P3 §4.4).
         let shutdown = async {
-            match tokio::signal::ctrl_c().await {
-                Ok(()) => {
-                    info!("Received Ctrl+C signal");
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{signal, SignalKind};
+                let mut sigterm = match signal(SignalKind::terminate()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!(error = %e, "Failed to install SIGTERM handler");
+                        // Fall back to SIGINT-only so we still shut down cleanly.
+                        let _ = tokio::signal::ctrl_c().await;
+                        return;
+                    }
+                };
+                tokio::select! {
+                    r = tokio::signal::ctrl_c() => match r {
+                        Ok(()) => info!("Received SIGINT (Ctrl+C); starting graceful shutdown"),
+                        Err(e) => error!(error = %e, "Failed to listen for SIGINT"),
+                    },
+                    _ = sigterm.recv() => {
+                        info!("Received SIGTERM; starting graceful shutdown");
+                    }
                 }
-                Err(e) => {
-                    error!(error = %e, "Failed to listen for Ctrl+C signal");
+            }
+            #[cfg(not(unix))]
+            {
+                match tokio::signal::ctrl_c().await {
+                    Ok(()) => info!("Received Ctrl+C signal; starting graceful shutdown"),
+                    Err(e) => error!(error = %e, "Failed to listen for Ctrl+C signal"),
                 }
             }
         };
@@ -940,6 +988,16 @@ impl ProxyServer {
                         );
                         (ClientTransport::Plain(stream), startup_data)
                     }
+                    Ok(SslStartupResult::Rejected) => {
+                        // TLS downgrade attempt under a require/verify-* sslmode.
+                        // handle_ssl_startup already sent the ErrorResponse and
+                        // closed the stream; refuse to serve the connection.
+                        warn!(
+                            connection_id = conn_id,
+                            "Rejected client connection: TLS required but client sent plaintext"
+                        );
+                        return;
+                    }
                     Err(e) => {
                         error!(connection_id = conn_id, error = %e, "SSL startup failed");
                         return;
@@ -1057,7 +1115,9 @@ impl ProxyServer {
                 "Routing to admin console"
             );
 
-            if let Err(e) = handle_admin_connection(transport, pool_manager, metrics).await {
+            if let Err(e) =
+                handle_admin_connection(transport, pool_manager, metrics, &config.admin).await
+            {
                 error!(
                     connection_id = conn_id,
                     client_addr = %addr_str,
@@ -1100,6 +1160,20 @@ impl ProxyServer {
     }
 }
 
+/// Constant-time byte-slice equality, to avoid leaking the admin password
+/// through comparison timing. WP-12 centralizes constant-time comparisons via
+/// `subtle`; this is the local, dependency-free version for the admin gate.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// Handle an admin console connection
 ///
 /// This handles connections to the virtual "pgbouncer" database,
@@ -1108,10 +1182,49 @@ async fn handle_admin_connection(
     mut client: ClientTransport,
     pool_manager: Option<Arc<PoolManager>>,
     metrics: Arc<ProxyMetrics>,
+    admin: &AdminConfig,
 ) -> Result<()> {
-    // Send AuthenticationOk
+    // Fail closed (P1 §4.6): the admin console is refused unless it has been
+    // explicitly enabled AND an admin password is configured. Without this the
+    // virtual `pgbouncer` database was an unauthenticated control channel.
+    let expected_password = match (admin.enabled, admin.admin_password.as_deref()) {
+        (true, Some(pw)) if !pw.is_empty() => pw,
+        _ => {
+            warn!("Admin console connection refused: console disabled or no credential configured");
+            let err = build_error_response(
+                "FATAL",
+                "28000",
+                "administrative console is disabled on this server",
+            );
+            let _ = client.write_all(&err).await;
+            return Ok(());
+        }
+    };
+
+    // Request a cleartext password (intended for use over TLS / loopback) and
+    // verify it before granting any admin access.
+    client
+        .write_all(&build_auth_cleartext_password())
+        .await
+        .context("Failed to send AuthenticationCleartextPassword")?;
+
+    let mut auth_buf = vec![0u8; 4096];
+    let auth_n = client.read(&mut auth_buf).await.context("Failed to read admin password")?;
+    let provided = parse_password_message(&auth_buf[..auth_n]);
+    let authenticated = provided
+        .as_deref()
+        .is_some_and(|p| constant_time_eq(p.as_bytes(), expected_password.as_bytes()));
+
+    if !authenticated {
+        warn!("Admin console authentication failed");
+        let err = build_error_response("FATAL", "28P01", "admin authentication failed");
+        let _ = client.write_all(&err).await;
+        return Ok(());
+    }
+
+    // Authenticated: send AuthenticationOk
     // Format: 'R' + length(8) + auth_type(0)
-    let auth_ok = [b'R', 0, 0, 0, 8, 0, 0, 0, 0];
+    let auth_ok = build_auth_ok();
     client.write_all(&auth_ok).await.context("Failed to send AuthenticationOk")?;
 
     // Send ReadyForQuery (idle state)
@@ -1182,6 +1295,99 @@ mod tests {
         // Disable active healthchecks for tests
         config.resilience.healthcheck.active_enabled = false;
         config
+    }
+
+    #[test]
+    fn test_constant_time_eq() {
+        assert!(constant_time_eq(b"secret", b"secret"));
+        assert!(!constant_time_eq(b"secret", b"secreT"));
+        assert!(!constant_time_eq(b"secret", b"secret-longer"));
+        assert!(!constant_time_eq(b"", b"x"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    /// Drive `handle_admin_connection` with a raw TCP client and return the
+    /// first server response frame (its message-type byte + body).
+    async fn admin_handshake(admin: AdminConfig, password_to_send: Option<&str>) -> Vec<u8> {
+        use crate::protocol::build_password_message;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let metrics = Arc::new(ProxyMetrics::new(100, HealthConfig::default()));
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let transport = ClientTransport::Plain(stream);
+            let _ = handle_admin_connection(transport, None, metrics, &admin).await;
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let mut first = vec![0u8; 1024];
+        let n = client.read(&mut first).await.unwrap();
+        let first = first[..n].to_vec();
+
+        // If the server asked for a password ('R' auth request) and we have one
+        // to send, send it and read the follow-up frame instead.
+        let response = match password_to_send {
+            Some(pw) if !first.is_empty() && first[0] == b'R' => {
+                client.write_all(&build_password_message(pw)).await.unwrap();
+                let mut second = vec![0u8; 1024];
+                let n2 = client.read(&mut second).await.unwrap_or(0);
+                second[..n2].to_vec()
+            }
+            _ => first,
+        };
+
+        // Close the client so the server's post-auth command loop (which blocks
+        // on read) observes EOF and returns instead of hanging the test.
+        drop(client);
+        let _ = server.await;
+        response
+    }
+
+    #[tokio::test]
+    async fn admin_console_disabled_is_refused() {
+        // Default: console disabled -> immediate FATAL ErrorResponse, no auth.
+        let admin = AdminConfig::default();
+        let resp = admin_handshake(admin, None).await;
+        assert_eq!(resp[0], b'E', "disabled console must return an ErrorResponse");
+        assert!(resp.windows(5).any(|w| w == b"28000"));
+    }
+
+    #[tokio::test]
+    async fn admin_console_enabled_without_credential_is_refused() {
+        // Enabled but no password configured -> still refused (fail closed).
+        let admin = AdminConfig { enabled: true, admin_users: None, admin_password: None };
+        let resp = admin_handshake(admin, None).await;
+        assert_eq!(resp[0], b'E');
+        assert!(resp.windows(5).any(|w| w == b"28000"));
+    }
+
+    #[tokio::test]
+    async fn admin_console_wrong_password_is_refused() {
+        let admin = AdminConfig {
+            enabled: true,
+            admin_users: None,
+            admin_password: Some("correct-horse".to_string()),
+        };
+        let resp = admin_handshake(admin, Some("wrong-password")).await;
+        assert_eq!(resp[0], b'E', "wrong password must return an ErrorResponse");
+        assert!(resp.windows(5).any(|w| w == b"28P01"));
+    }
+
+    #[tokio::test]
+    async fn admin_console_correct_password_authenticates() {
+        let admin = AdminConfig {
+            enabled: true,
+            admin_users: None,
+            admin_password: Some("correct-horse".to_string()),
+        };
+        let resp = admin_handshake(admin, Some("correct-horse")).await;
+        // AuthenticationOk is 'R' with auth-type 0.
+        assert_eq!(resp[0], b'R', "correct password must yield AuthenticationOk");
+        assert_eq!(&resp[1..9], &[0, 0, 0, 8, 0, 0, 0, 0]);
     }
 
     #[tokio::test]

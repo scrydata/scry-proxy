@@ -105,20 +105,36 @@ impl Authenticator {
             }
 
             AuthType::ScramSha256 => {
-                // SCRAM-SHA-256 not yet implemented
-                warn!("SCRAM-SHA-256 authentication not yet implemented, falling back to trust");
-                let backend_startup = self.build_backend_startup(&startup);
-                Ok(AuthHandshakeResult {
-                    startup,
-                    username,
-                    database,
-                    startup_bytes: backend_startup,
-                })
+                // SCRAM-SHA-256 client auth is intentionally unsupported.
+                // `Config::validate()` rejects this auth_type at startup (P1 §4.1),
+                // so reaching this arm means validation was bypassed. Fail closed
+                // rather than the previous silent trust fallback — never
+                // authenticate a client we cannot actually verify.
+                warn!("SCRAM-SHA-256 client authentication is unsupported; refusing connection");
+                Err(anyhow::anyhow!(
+                    "SCRAM-SHA-256 client authentication is unsupported; refusing to \
+                     authenticate client rather than falling back to trust"
+                ))
             }
 
             AuthType::Cert => {
-                // Certificate auth handled at TLS layer
-                debug!("Certificate authentication (validated at TLS layer)");
+                // Certificate identity is established by the TLS layer, but as a
+                // fail-closed defense-in-depth check (P1 §4.1) assert that a
+                // verified client certificate was actually presented on this
+                // connection before trusting it. `validate()` already guarantees
+                // a verifying client TLS mode when auth_type = cert.
+                if !client.has_verified_peer_cert() {
+                    warn!(
+                        username = %username,
+                        "Certificate authentication configured but no verified client \
+                         certificate was presented; refusing connection"
+                    );
+                    return Err(anyhow::anyhow!(
+                        "auth_type = cert requires a verified client certificate, but none \
+                         was presented on the TLS connection"
+                    ));
+                }
+                debug!("Certificate authentication (verified client certificate present)");
                 let backend_startup = self.build_backend_startup(&startup);
                 Ok(AuthHandshakeResult {
                     startup,

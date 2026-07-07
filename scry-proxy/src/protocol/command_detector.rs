@@ -29,10 +29,92 @@ pub enum DetectedCommand {
     DeallocateAll,
 }
 
+/// Multiplexing-safety classification of a client command (P2 §4.1).
+///
+/// Used to decide, fail-closed, whether a connection may be released back to
+/// the pool after a transaction: only `Clean` commands are positively safe.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CommandClass {
+    /// Positively safe to run on a pooled connection and release afterwards —
+    /// standard DML, reads, and transaction control that leave no
+    /// cross-transaction session state.
+    Clean,
+    /// A recognized state-changing command; the connection is pinned per its
+    /// [`DetectedCommand`] reason.
+    Stateful(DetectedCommand),
+    /// Cannot be positively classified as clean (unknown command, a read with a
+    /// session-mutating side effect, unusual/vendor syntax). Fail closed: pin.
+    Unknown,
+}
+
+/// Whether `upper` (already upper-cased) begins with SQL keyword `kw` at a word
+/// boundary — the keyword must be followed by whitespace, `(`, `;`, or the end
+/// of the string, so `END` does not match `ENDPOINT`.
+fn starts_with_keyword(upper: &str, kw: &str) -> bool {
+    match upper.strip_prefix(kw) {
+        Some(rest) => {
+            rest.is_empty() || rest.starts_with(|c: char| c.is_whitespace() || c == '(' || c == ';')
+        }
+        None => false,
+    }
+}
+
 /// Detects state-changing SQL commands
 pub struct CommandDetector;
 
 impl CommandDetector {
+    /// Classify a command for pooling safety (P2 §4.1, §5.4).
+    ///
+    /// Fail-closed: a command is only `Clean` when it positively matches a
+    /// known-safe shape. Anything else is `Stateful` (recognized) or `Unknown`
+    /// (pin) — the blast radius of a detection gap is a performance cost (an
+    /// over-pinned connection), never a correctness bug (leaked session state).
+    pub fn classify(sql: &str) -> CommandClass {
+        if let Some(cmd) = Self::detect(sql) {
+            return CommandClass::Stateful(cmd);
+        }
+        if Self::is_known_clean(sql) {
+            CommandClass::Clean
+        } else {
+            CommandClass::Unknown
+        }
+    }
+
+    /// Whether `sql` is a positively-clean statement: pure DML, a read, or
+    /// transaction control, with no session-mutating side effect. Conservative
+    /// by design — when in doubt this returns `false` so the caller pins.
+    pub fn is_known_clean(sql: &str) -> bool {
+        let upper = sql.trim_start().to_uppercase();
+
+        // Reject reads that carry a session-mutating side effect (e.g.
+        // `SELECT set_config('x','y', false)` changes a GUC for the session).
+        // `pg_advisory_*` is already caught by `detect()`.
+        if upper.contains("SET_CONFIG") {
+            return false;
+        }
+
+        const CLEAN_KEYWORDS: &[&str] = &[
+            "SELECT",
+            "INSERT",
+            "UPDATE",
+            "DELETE",
+            "WITH",
+            "VALUES",
+            "TABLE",
+            "EXPLAIN",
+            "SHOW",
+            "BEGIN",
+            "START",
+            "COMMIT",
+            "ROLLBACK",
+            "END",
+            "ABORT",
+            "SAVEPOINT",
+            "RELEASE",
+        ];
+        CLEAN_KEYWORDS.iter().any(|kw| starts_with_keyword(&upper, kw))
+    }
+
     /// Detect if SQL command affects connection state
     pub fn detect(sql: &str) -> Option<DetectedCommand> {
         let sql_upper = sql.trim().to_uppercase();

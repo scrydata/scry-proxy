@@ -78,6 +78,7 @@ fn create_test_config(backend_host: String, backend_port: u16) -> Config {
             service_name: "scry-test".to_string(),
             enable_metrics_server: false,
             metrics_server_address: "127.0.0.1:9090".to_string(),
+            unsafe_debug_logging: false,
         },
         protocol: ProtocolConfig { max_prepared_statements: 1000 },
         publisher: PublisherConfig {
@@ -93,9 +94,13 @@ fn create_test_config(backend_host: String, backend_port: u16) -> Config {
             http_api_key: None,
             http_compression: true,
             shadow_id: None,
+            allow_insecure: false,
+            anonymize_salt: None,
+            parse_failure_mode: ParseFailureMode::Redact,
         },
         performance: PerformanceConfig {
-            target_latency_ms: 1,
+            latency_budget: scry::config::LatencyBudget::default(),
+            query_timeout_secs: 0,
             connection_pooling: PoolingStrategy::Disabled,
             pool_size: 100,
             pool_min_idle: 10,
@@ -108,6 +113,9 @@ fn create_test_config(backend_host: String, backend_port: u16) -> Config {
             pool_lifo: true,
             pool_reset_timeout_ms: 5000,
             pool_ratio_warning_threshold: 20,
+            pool_backpressure_mode: scry::config::BackpressureMode::RejectImmediate,
+            pool_retry_hint_ms: 200,
+            pool_queue_saturation_warn_threshold: 0.8,
         },
         resilience: ResilienceConfig {
             circuit_breaker: CircuitBreakerConfig {
@@ -135,6 +143,7 @@ fn create_test_config(backend_host: String, backend_port: u16) -> Config {
         },
         tls: TlsConfig::default(),
         auth: AuthConfig::default(),
+        admin: AdminConfig::default(),
     }
 }
 
@@ -856,4 +865,99 @@ async fn test_multi_database_routing() {
     assert!(default_event.is_some(), "Expected event from default connection");
 
     println!("Multi-database routing integration test passed");
+}
+
+/// Start the proxy and return (port, metrics) so the test can inspect the
+/// populated histograms after real queries (WP-5 Task 5.2).
+async fn start_test_proxy_with_metrics(
+    config: Config,
+    publisher: Arc<dyn EventPublisher>,
+) -> anyhow::Result<(u16, Arc<ProxyMetrics>)> {
+    let batcher = EventBatcher::new(
+        publisher,
+        config.publisher.batch_size,
+        config.publisher.flush_interval_ms,
+        config.publisher.max_queue_size,
+    );
+
+    let metrics = Arc::new(ProxyMetrics::new(100, HealthConfig::default()));
+    let server = ProxyServer::new(config.clone(), batcher, Arc::clone(&metrics)).await?;
+    let port = server.local_addr()?.port();
+
+    tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    Ok((port, metrics))
+}
+
+/// Regression guard against the "unwired timeline" state: after real queries the
+/// latency histograms must be non-zero and the phase decomposition present
+/// (P5 §4.1, §5.2). Before WP-5 the proxy passed an empty `QueryTimeline::new()`
+/// to `record_query`, so every histogram recorded ~0.
+#[tokio::test]
+async fn test_query_latency_metrics_are_populated() {
+    let docker = Cli::default();
+    let postgres_image = RunnableImage::from(Postgres::default()).with_tag("16-alpine");
+    let postgres = docker.run(postgres_image);
+
+    let postgres_port = postgres.get_host_port_ipv4(5432);
+    sleep(Duration::from_secs(2)).await;
+
+    let config = create_test_config("127.0.0.1".to_string(), postgres_port);
+    let publisher = Arc::new(TestPublisher::new());
+
+    let (proxy_port, metrics) = start_test_proxy_with_metrics(config.clone(), publisher)
+        .await
+        .expect("Failed to start proxy");
+
+    sleep(Duration::from_millis(100)).await;
+
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user={} password={} dbname={}",
+            proxy_port, config.backend.user, config.backend.password, config.backend.database
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("Failed to connect to proxy");
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("Connection error: {}", e);
+        }
+    });
+
+    // Run several real queries with a small server-side sleep so the measured
+    // latency is comfortably non-zero.
+    for _ in 0..5 {
+        client.execute("SELECT pg_sleep(0.01)", &[]).await.expect("query failed");
+    }
+
+    // Give the backend->client completion path time to record.
+    sleep(Duration::from_millis(200)).await;
+
+    let query = metrics.query_metrics();
+    let total = query.total_queries.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(total >= 5, "expected >=5 recorded queries, got {total}");
+
+    let latency = query.get_latency_percentiles();
+    assert!(
+        latency.max_micros > 0,
+        "total-latency histogram is empty (unwired timeline?): {latency:?}"
+    );
+    assert!(latency.p50_micros > 0, "p50 latency should be non-zero: {latency:?}");
+
+    // Phase decomposition present: backend time is recorded and non-zero.
+    let backend = query.get_backend_percentiles();
+    assert!(
+        backend.max_micros > 0,
+        "backend histogram is empty (backend span not marked): {backend:?}"
+    );
+
+    println!(
+        "metrics populated: total={total} latency_p50={}us backend_p50={}us",
+        latency.p50_micros, backend.p50_micros
+    );
 }

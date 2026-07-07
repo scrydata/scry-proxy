@@ -182,6 +182,12 @@ Retry logic applies to **connection failures only**:
 - Query syntax error
 - Permission denied
 - Circuit breaker open (fail fast)
+- Pool closed or misconfiguration (permanent — fail fast)
+
+Retries wrap **connection acquisition only** — never query execution — so no
+query (idempotent or not) is ever replayed. An explicit classifier decides
+retryability: transient backend/transport failures and acquisition timeouts are
+retried; permanent errors (closed pool, runtime/configuration errors) are not.
 
 ## Feature Integration
 
@@ -326,14 +332,13 @@ active_enabled = true
 interval_secs = 30
 timeout_ms = 1000
 failure_threshold = 3
-
-# Health Monitoring
-[health]
-error_rate_spike_factor = 3.0
-latency_spike_factor = 2.0
-pool_saturation_threshold = 0.95
-ema_alpha = 0.1
 ```
+
+The active healthcheck **gates the circuit breaker**: when the probe reports the
+default backend unhealthy (or cannot connect), it opens that backend's breaker
+proactively so traffic is shed before clients hit failures; when the probe
+succeeds again, an open breaker is moved to half-open to begin recovery without
+waiting out the full open timeout.
 
 ### Environment Variables
 

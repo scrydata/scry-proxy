@@ -78,6 +78,7 @@ fn create_test_config(backend_host: String, backend_port: u16) -> Config {
             service_name: "scry-bench".to_string(),
             metrics_server_address: "127.0.0.1:0".to_string(),
             enable_metrics_server: false,
+            unsafe_debug_logging: false,
         },
         protocol: ProtocolConfig { max_prepared_statements: 1000 },
         publisher: PublisherConfig {
@@ -93,9 +94,13 @@ fn create_test_config(backend_host: String, backend_port: u16) -> Config {
             http_api_key: None,
             http_compression: true,
             shadow_id: None,
+            allow_insecure: false,
+            anonymize_salt: None,
+            parse_failure_mode: ParseFailureMode::Redact,
         },
         performance: PerformanceConfig {
-            target_latency_ms: 1,
+            latency_budget: scry::config::LatencyBudget::default(),
+            query_timeout_secs: 0,
             connection_pooling: PoolingStrategy::Disabled,
             pool_size: 100,
             pool_min_idle: 10,
@@ -106,6 +111,11 @@ fn create_test_config(backend_host: String, backend_port: u16) -> Config {
             pool_queue_depth: 50,
             pool_idle_unpin_secs: 60,
             pool_lifo: true,
+            pool_reset_timeout_ms: 5000,
+            pool_ratio_warning_threshold: 20,
+            pool_backpressure_mode: scry::config::BackpressureMode::RejectImmediate,
+            pool_retry_hint_ms: 200,
+            pool_queue_saturation_warn_threshold: 0.8,
         },
         resilience: ResilienceConfig {
             circuit_breaker: CircuitBreakerConfig {
@@ -133,6 +143,7 @@ fn create_test_config(backend_host: String, backend_port: u16) -> Config {
         },
         tls: TlsConfig::default(),
         auth: AuthConfig::default(),
+        admin: AdminConfig::default(),
         databases: vec![],
     }
 }

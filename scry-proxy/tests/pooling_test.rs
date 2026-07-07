@@ -64,6 +64,7 @@ fn create_pooled_config(backend_host: String, backend_port: u16, pool_size: usiz
             service_name: "scry-test".to_string(),
             enable_metrics_server: false,
             metrics_server_address: "127.0.0.1:9090".to_string(),
+            unsafe_debug_logging: false,
         },
         protocol: ProtocolConfig { max_prepared_statements: 1000 },
         publisher: PublisherConfig {
@@ -79,9 +80,13 @@ fn create_pooled_config(backend_host: String, backend_port: u16, pool_size: usiz
             http_api_key: None,
             http_compression: true,
             shadow_id: None,
+            allow_insecure: false,
+            anonymize_salt: None,
+            parse_failure_mode: ParseFailureMode::Redact,
         },
         performance: PerformanceConfig {
-            target_latency_ms: 1,
+            latency_budget: scry::config::LatencyBudget::default(),
+            query_timeout_secs: 0,
             connection_pooling: PoolingStrategy::Session, // Enable pooling!
             pool_size,
             pool_min_idle: 2,
@@ -94,6 +99,9 @@ fn create_pooled_config(backend_host: String, backend_port: u16, pool_size: usiz
             pool_lifo: true,
             pool_reset_timeout_ms: 5000,
             pool_ratio_warning_threshold: 20,
+            pool_backpressure_mode: scry::config::BackpressureMode::RejectImmediate,
+            pool_retry_hint_ms: 200,
+            pool_queue_saturation_warn_threshold: 0.8,
         },
         resilience: ResilienceConfig {
             circuit_breaker: CircuitBreakerConfig {
@@ -121,6 +129,7 @@ fn create_pooled_config(backend_host: String, backend_port: u16, pool_size: usiz
         },
         tls: TlsConfig::default(),
         auth: AuthConfig::default(),
+        admin: AdminConfig::default(),
     }
 }
 

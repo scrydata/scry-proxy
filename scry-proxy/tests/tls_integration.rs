@@ -91,6 +91,7 @@ fn create_minimal_config() -> Config {
             service_name: "scry-test".to_string(),
             enable_metrics_server: false,
             metrics_server_address: "127.0.0.1:9090".to_string(),
+            unsafe_debug_logging: false,
         },
         protocol: ProtocolConfig { max_prepared_statements: 100 },
         publisher: PublisherConfig {
@@ -106,9 +107,13 @@ fn create_minimal_config() -> Config {
             http_api_key: None,
             http_compression: true,
             shadow_id: None,
+            allow_insecure: false,
+            anonymize_salt: None,
+            parse_failure_mode: ParseFailureMode::Redact,
         },
         performance: PerformanceConfig {
-            target_latency_ms: 1,
+            latency_budget: scry::config::LatencyBudget::default(),
+            query_timeout_secs: 0,
             connection_pooling: PoolingStrategy::Disabled,
             pool_size: 5,
             pool_min_idle: 1,
@@ -121,6 +126,9 @@ fn create_minimal_config() -> Config {
             pool_lifo: true,
             pool_reset_timeout_ms: 5000,
             pool_ratio_warning_threshold: 20,
+            pool_backpressure_mode: scry::config::BackpressureMode::RejectImmediate,
+            pool_retry_hint_ms: 200,
+            pool_queue_saturation_warn_threshold: 0.8,
         },
         resilience: ResilienceConfig {
             circuit_breaker: CircuitBreakerConfig {
@@ -148,6 +156,7 @@ fn create_minimal_config() -> Config {
         },
         tls: TlsConfig::default(),
         auth: AuthConfig::default(),
+        admin: AdminConfig::default(),
     }
 }
 

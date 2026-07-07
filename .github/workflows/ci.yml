@@ -1,0 +1,203 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - '**'
+
+permissions:
+  contents: read
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Rust toolchain (1.85, pinned to match Dockerfile builder)
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master @ 2026-06-30
+        with:
+          toolchain: "1.85"
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Rust toolchain (1.85, pinned to match Dockerfile builder)
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master @ 2026-06-30
+        with:
+          toolchain: "1.85"
+          components: clippy
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Run clippy
+        run: cargo clippy --workspace -- -D warnings -A dead_code
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Rust toolchain (1.85, pinned to match Dockerfile builder)
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master @ 2026-06-30
+        with:
+          toolchain: "1.85"
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Run tests
+        run: cargo test --workspace
+
+      # Crown-jewel privacy guardrail (P1 §5.3): run the anonymization fuzzer
+      # with an elevated case count so it exercises far more adversarial inputs
+      # than the default per-run budget. Asserts no event or log line leaks an
+      # input literal/parameter value when anonymization is enabled.
+      - name: Anonymization fuzzer (elevated cases)
+        run: cargo test -p scry --lib anonymization_fuzz
+        env:
+          PROPTEST_CASES: "4096"
+
+  # Non-blocking proxy added-latency signal (P5 §4.3, WP-5 Task 5.4). Runs a
+  # point-select workload direct vs through-proxy and prints the per-percentile
+  # added latency against the budget. `continue-on-error` keeps it advisory —
+  # it becomes a blocking gate on a stable runner in WP-13. ubuntu-latest ships
+  # Docker, which the benchmark's testcontainers backend needs.
+  perf-signal:
+    name: perf-signal (non-blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Rust toolchain (1.85, pinned to match Dockerfile builder)
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master @ 2026-06-30
+        with:
+          toolchain: "1.85"
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Measure proxy added latency vs budget
+        run: cargo bench -p scry --bench overhead_delta
+
+  audit:
+    name: audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # This job only runs security tooling against Cargo.lock; it does not build
+      # the project, so it uses a recent stable toolchain (not the 1.85 builder
+      # pin) to install current cargo-audit, which parses the latest advisory-db.
+      - name: Install Rust toolchain (stable, for tooling only)
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master @ 2026-06-30
+        with:
+          toolchain: "stable"
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Run cargo audit
+        run: cargo audit
+
+  deny:
+    name: deny
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # Tooling-only job (see audit): stable toolchain so the latest cargo-deny
+      # installs and can parse the current advisory database.
+      - name: Install Rust toolchain (stable, for tooling only)
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master @ 2026-06-30
+        with:
+          toolchain: "stable"
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+
+      - name: Run cargo deny check
+        run: cargo deny check
+
+  pin-lint:
+    name: pin-lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Verify Dockerfile and workflow pins
+        run: |
+          set -euo pipefail
+          fail=0
+
+          echo "== Checking Dockerfile FROM lines for @sha256: digest pins =="
+          while IFS= read -r line; do
+            if [[ "$line" != *"@sha256:"* ]]; then
+              echo "UNPINNED Dockerfile base image: $line"
+              fail=1
+            fi
+          done < <(grep -E '^FROM ' Dockerfile)
+
+          echo "== Checking workflow 'uses:' lines for 40-hex commit SHA pins =="
+          # Anchored so this only matches actual YAML `uses:` step keys, not
+          # the substring "uses:" appearing inside this very script (embedded
+          # in a workflow `run:` block).
+          while IFS= read -r line; do
+            ref=$(sed -E 's/^[[:space:]]*(-[[:space:]]*)?uses:[[:space:]]*[^@]+@([^[:space:]]+).*/\2/' <<<"$line")
+            if [[ ! "$ref" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "UNPINNED action ref: $line"
+              fail=1
+            fi
+          done < <(grep -rhE '^[[:space:]]*(-[[:space:]]*)?uses:[[:space:]]*[^[:space:]]+@' .github/workflows/*.yml)
+
+          if [[ "$fail" -ne 0 ]]; then
+            echo "pin-lint FAILED"
+            exit 1
+          fi
+          echo "pin-lint OK: all base images and actions are pinned"
+
+  secret-scan:
+    name: secret-scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      # scrydata is a GitHub organization, and the gitleaks/gitleaks-action
+      # marketplace action requires a paid GITLEAKS_LICENSE secret for
+      # organization-owned repos. We don't have one configured, so this uses
+      # the free, unlicensed `gitleaks` CLI image directly instead of the
+      # marketplace action, to keep this gate from failing on a licensing
+      # wall rather than an actual finding.
+      - name: Run gitleaks (full history scan)
+        run: |
+          docker run --rm -v "$PWD:/repo" \
+            zricethezav/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f \
+            git /repo -v
