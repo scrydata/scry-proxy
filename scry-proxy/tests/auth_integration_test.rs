@@ -69,6 +69,9 @@ fn create_test_config(backend_host: String, backend_port: u16) -> Config {
             pool_lifo: true,
             pool_reset_timeout_ms: 5000,
             pool_ratio_warning_threshold: 20,
+            pool_backpressure_mode: scry::config::BackpressureMode::RejectImmediate,
+            pool_retry_hint_ms: 200,
+            pool_queue_saturation_warn_threshold: 0.8,
         },
         resilience: ResilienceConfig {
             circuit_breaker: CircuitBreakerConfig {

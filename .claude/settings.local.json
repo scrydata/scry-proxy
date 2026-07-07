@@ -21,7 +21,13 @@
       "Skill(superpowers:test-driven-development)",
       "Skill(superpowers:verification-before-completion)",
       "Bash(cargo fmt:*)",
-      "Skill(superpowers:systematic-debugging)"
+      "Skill(superpowers:systematic-debugging)",
+      "Bash(just:*)",
+      "Read(//home/gmcquillan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/scry-protocol-0.1.1/schema/**)",
+      "Read(//home/gmcquillan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/scry-protocol-0.1.1/**)",
+      "Bash(git -C /home/gmcquillan/src/scry-proxy add docs/superpowers/specs/2026-07-05-p7-supply-chain-release-design.md)",
+      "Bash(git -C /home/gmcquillan/src/scry-proxy commit -q -m \"docs: add P7 supply-chain & release engineering pillar spec\")",
+      "Bash(git -C /home/gmcquillan/src/scry-proxy log --oneline -6)"
     ],
     "deny": [],
     "ask": []
