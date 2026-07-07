@@ -1371,6 +1371,108 @@ mod anonymization_tests {
     }
 }
 
+/// The crown-jewel guardrail (P1 §5.3): with anonymization enabled, no produced
+/// event and no gated log line may contain any input literal or parameter value.
+#[cfg(test)]
+mod anonymization_fuzz {
+    use super::*;
+    use crate::observability::{loggable, set_unsafe_debug_logging};
+    use proptest::prelude::*;
+
+    fn enabled(mode: ParseFailureMode) -> AnonymizationSettings {
+        AnonymizationSettings {
+            enabled: true,
+            anonymizer: Arc::new(QueryAnonymizer::with_salt(b"fuzz-salt".to_vec())),
+            parse_failure: mode,
+        }
+    }
+
+    fn build(settings: &AnonymizationSettings, query: &str, params: Vec<ParamValue>) -> Option<QueryEvent> {
+        settings
+            .build_event(query, params, false, Duration::from_millis(1), true, None, "conn", "db")
+            .map(|(event, _fps)| event)
+    }
+
+    /// Serialized event JSON — the exact bytes that would be published.
+    fn event_json(settings: &AnonymizationSettings, query: &str, params: Vec<ParamValue>) -> Option<String> {
+        build(settings, query, params).map(|e| serde_json::to_string(&e).expect("serialize event"))
+    }
+
+    proptest! {
+        // High-entropy sentinel literals cannot collide with SQL keywords/idents,
+        // so their absence from the event JSON is a clean signal of redaction.
+        #[test]
+        fn parameterized_event_never_leaks_literals(
+            strlit in "SEC_[A-Za-z0-9]{8,24}",
+            numlit in 100_000_000i64..9_999_999_999,
+        ) {
+            let settings = enabled(ParseFailureMode::Redact);
+            let query = format!(
+                "SELECT * FROM accounts WHERE token = '{strlit}' AND balance = {numlit}"
+            );
+            let params = vec![
+                ParamValue::Text(strlit.clone()),
+                ParamValue::Int64(numlit),
+                ParamValue::Json(format!("{{\"secret\":\"{strlit}\"}}")),
+            ];
+            let event = build(&settings, &query, params).expect("redact mode keeps the event");
+            let json = serde_json::to_string(&event).unwrap();
+            // High-entropy string literal must not appear anywhere in the payload.
+            prop_assert!(!json.contains(&strlit), "event leaked string literal {strlit}: {json}");
+            // The numeric literal is checked against the query text fields only
+            // (a raw digit-string could otherwise coincidentally match the event
+            // timestamp/UUID in the full JSON — a false positive, not a leak).
+            let numstr = numlit.to_string();
+            prop_assert!(!event.query.contains(&numstr), "query leaked numeric literal {numstr}: {}", event.query);
+            if let Some(nq) = &event.normalized_query {
+                prop_assert!(!nq.contains(&numstr), "normalized_query leaked numeric literal {numstr}: {nq}");
+            }
+        }
+
+        // With the flag off, the log redactor must never echo a literal.
+        #[test]
+        fn loggable_never_leaks_literal_when_disabled(lit in "SEC_[A-Za-z0-9]{8,24}") {
+            set_unsafe_debug_logging(false);
+            prop_assert!(!loggable(&lit).contains(&lit));
+        }
+    }
+
+    /// Explicit adversarial corpus: DDL echoing secrets, unparseable vendor
+    /// syntax, and multi-literal statements. Under both parse-failure modes,
+    /// neither the event nor the log redactor may surface any listed secret.
+    #[test]
+    fn adversarial_corpus_never_leaks() {
+        set_unsafe_debug_logging(false);
+        // (query, secrets that must never appear anywhere)
+        let corpus: &[(&str, &[&str])] = &[
+            ("CREATE ROLE deploy PASSWORD 'super-secret-pw'", &["super-secret-pw"]),
+            ("SELECT * FROM patients WHERE ssn = '123-45-6789'", &["123-45-6789"]),
+            ("INSERT INTO t (a, b) VALUES ('alice@example.com', 'hunter2')", &["alice@example.com", "hunter2"]),
+            ("UPDATE users SET pw = 'secretA' WHERE email = 'secretB@x.io'", &["secretA", "secretB@x.io"]),
+            ("$$ totally @@ unparseable ## vendor 'embedded-secret' syntax", &["embedded-secret"]),
+        ];
+
+        for mode in [ParseFailureMode::Redact, ParseFailureMode::Drop] {
+            let settings = enabled(mode);
+            for (query, secrets) in corpus {
+                // Event guarantee (only present in Redact mode; Drop yields None).
+                if let Some(json) = event_json(&settings, query, vec![]) {
+                    for secret in *secrets {
+                        assert!(
+                            !json.contains(secret),
+                            "event leaked '{secret}' for query {query:?}: {json}"
+                        );
+                    }
+                }
+                // Log guarantee: the redactor never echoes a secret with the flag off.
+                for secret in *secrets {
+                    assert!(!loggable(secret).contains(secret));
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
