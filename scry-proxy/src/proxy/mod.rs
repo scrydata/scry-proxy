@@ -1,3 +1,4 @@
+mod admin_handles;
 mod cache;
 mod connection;
 mod connection_state;
@@ -9,6 +10,9 @@ mod tcp_pool;
 mod transaction;
 mod wait_queue;
 
+pub use admin_handles::{
+    AdminHandles, ClientEntry, ClientRegistry, ClientState, ServerPoolSnapshot, ServerRegistry,
+};
 pub use cache::{PendingExecution, PreparedStatement, PreparedStatementCache};
 pub use connection::ConnectionHandler;
 pub use connection_state::{ConnectionState, PinReason, PreparedStatementInfo, ReplayableState};

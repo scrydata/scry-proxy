@@ -29,6 +29,9 @@ pub fn export_metrics(metrics: &ProxyMetrics) -> String {
     // Export timeline phase histograms
     export_timeline_metrics(&mut output, metrics);
 
+    // Export proxy self-overhead percentiles (P5 self-overhead signal)
+    export_proxy_overhead_metrics(&mut output, metrics);
+
     // Export pool metrics
     export_pool_metrics(&mut output, metrics);
 
@@ -67,6 +70,30 @@ fn export_query_counters(output: &mut String, metrics: &ProxyMetrics) {
     writeln!(output, "# HELP scry_query_error_rate Query error rate").unwrap();
     writeln!(output, "# TYPE scry_query_error_rate gauge").unwrap();
     writeln!(output, "scry_query_error_rate {:.6}", error_rate).unwrap();
+
+    // Query timeouts (P3 §4.3 `query_timeout` enforcement)
+    let query_timeouts = query_metrics.get_query_timeouts_total();
+    writeln!(output, "# HELP scry_query_timeouts_total Total queries aborted due to query_timeout")
+        .unwrap();
+    writeln!(output, "# TYPE scry_query_timeouts_total counter").unwrap();
+    writeln!(output, "scry_query_timeouts_total {}", query_timeouts).unwrap();
+}
+
+/// Export proxy self-overhead percentiles (the proxy's own added latency,
+/// P5 §self-overhead). Quantile-only summary, matching the style used for the
+/// other timeline phase histograms (`export_timeline_metrics`) which also
+/// omit `_sum`/`_count` since a dedicated per-histogram sample count isn't
+/// tracked for these derived phase histograms.
+fn export_proxy_overhead_metrics(output: &mut String, metrics: &ProxyMetrics) {
+    let percentiles = metrics.query_metrics().proxy_overhead_percentiles();
+
+    writeln!(
+        output,
+        "# HELP scry_proxy_overhead_seconds Proxy's own added latency (total minus backend execution time)"
+    )
+    .unwrap();
+    writeln!(output, "# TYPE scry_proxy_overhead_seconds summary").unwrap();
+    export_quantiles(output, "scry_proxy_overhead_seconds", &percentiles);
 }
 
 fn export_latency_metrics(output: &mut String, metrics: &ProxyMetrics) {
@@ -251,6 +278,18 @@ fn export_pooling_metrics(output: &mut String, metrics: &ProxyMetrics) {
     writeln!(output, "scry_pool_queue_rejected_total {}", pool_metrics.get_queue_rejected_total())
         .unwrap();
 
+    // Requests shed due to an open circuit breaker (P3 §4.1/§5.4) — distinct
+    // from queue-full rejection above, so an operator can tell "we're at
+    // capacity" apart from "a backend is unhealthy and we're failing fast".
+    writeln!(
+        output,
+        "# HELP scry_requests_shed_total Total requests shed because a circuit breaker was open"
+    )
+    .unwrap();
+    writeln!(output, "# TYPE scry_requests_shed_total counter").unwrap();
+    writeln!(output, "scry_requests_shed_total {}", pool_metrics.get_requests_shed_total())
+        .unwrap();
+
     // Wait time histogram (as summary with quantiles)
     let wait_percentiles = pool_metrics.get_wait_percentiles();
     let wait_count = pool_metrics.get_wait_count();
@@ -312,6 +351,30 @@ fn export_connection_metrics(output: &mut String, metrics: &ProxyMetrics) {
     .unwrap();
     writeln!(output, "# TYPE scry_connections_rejected_total counter").unwrap();
     writeln!(output, "scry_connections_rejected_total {}", rejected).unwrap();
+
+    // Connection/pool acquisition timeouts (P3 §4.5), labeled by which
+    // configured deadline was hit: `pool_wait` is `pool_timeout_secs`/
+    // `wait_timeout_ms` (exact — typed `AcquireError::WaitTimeout`);
+    // `backend_connect` is `connection_timeout_ms` (best-effort — classified
+    // from the generic pool error message, since the underlying deadpool/
+    // anyhow error type isn't preserved through the pool's error chain).
+    let pool_metrics = metrics.pool_metrics();
+    let pool_wait_timeouts = pool_metrics.get_pool_wait_timeouts_total();
+    let backend_connect_timeouts = pool_metrics.get_backend_connect_timeouts_total();
+    writeln!(
+        output,
+        "# HELP scry_connection_timeouts_total Total backend connect/acquire timeouts, by kind"
+    )
+    .unwrap();
+    writeln!(output, "# TYPE scry_connection_timeouts_total counter").unwrap();
+    writeln!(output, "scry_connection_timeouts_total{{kind=\"pool_wait\"}} {}", pool_wait_timeouts)
+        .unwrap();
+    writeln!(
+        output,
+        "scry_connection_timeouts_total{{kind=\"backend_connect\"}} {}",
+        backend_connect_timeouts
+    )
+    .unwrap();
 }
 
 fn export_uptime(output: &mut String, metrics: &ProxyMetrics) {
@@ -322,34 +385,48 @@ fn export_uptime(output: &mut String, metrics: &ProxyMetrics) {
     writeln!(output, "scry_uptime_seconds {}", uptime_secs).unwrap();
 }
 
+/// Sentinel backend label used when no per-backend circuit breaker is
+/// currently registered (feature disabled, or connection pooling disabled so
+/// no backend pool/breaker was ever created). Chosen approach (P4 §4.5):
+/// always emit the `scry_circuit_breaker_*` family with one `backend="none"`
+/// series of zeros, rather than omitting the family entirely, so a scraper
+/// can tell "no breakers registered" apart from "the whole feature isn't
+/// wired" (which would show no HELP/TYPE lines at all) — and apart from a
+/// real, healthy backend (which always carries its own backend name label,
+/// never the literal string `"none"`).
+const NO_BREAKER_SENTINEL: &str = "none";
+
 fn export_circuit_breaker_metrics(output: &mut String, metrics: &ProxyMetrics) {
     let breakers = metrics.circuit_breaker_metrics_all();
-    if breakers.is_empty() {
-        return;
-    }
 
-    // Emit HELP/TYPE once, then one labeled series per backend so a single bad
-    // backend is visible in isolation (P3 §4.1).
+    // Emit HELP/TYPE once, then one labeled series per backend (or the
+    // sentinel series when empty) so a single bad backend is visible in
+    // isolation (P3 §4.1) AND the family itself is always present (P4 §4.5).
     writeln!(
         output,
-        "# HELP scry_circuit_breaker_state Circuit breaker state (0=Closed, 1=Open, 2=HalfOpen)"
+        "# HELP scry_circuit_breaker_state Circuit breaker state (0=Closed, 1=Open, 2=HalfOpen); backend=\"none\" is a sentinel meaning no per-backend breaker is currently registered"
     )
     .unwrap();
     writeln!(output, "# TYPE scry_circuit_breaker_state gauge").unwrap();
-    for (backend, cb) in &breakers {
-        let state_value = match cb.state.as_str() {
-            "closed" => 0,
-            "open" => 1,
-            "half_open" => 2,
-            _ => 0,
-        };
-        writeln!(
-            output,
-            "scry_circuit_breaker_state{{backend=\"{}\"}} {}",
-            escape_label(backend),
-            state_value
-        )
-        .unwrap();
+    if breakers.is_empty() {
+        writeln!(output, "scry_circuit_breaker_state{{backend=\"{NO_BREAKER_SENTINEL}\"}} 0")
+            .unwrap();
+    } else {
+        for (backend, cb) in &breakers {
+            let state_value = match cb.state.as_str() {
+                "closed" => 0,
+                "open" => 1,
+                "half_open" => 2,
+                _ => 0,
+            };
+            writeln!(
+                output,
+                "scry_circuit_breaker_state{{backend=\"{}\"}} {}",
+                escape_label(backend),
+                state_value
+            )
+            .unwrap();
+        }
     }
 
     writeln!(
@@ -358,14 +435,22 @@ fn export_circuit_breaker_metrics(output: &mut String, metrics: &ProxyMetrics) {
     )
     .unwrap();
     writeln!(output, "# TYPE scry_circuit_breaker_consecutive_failures gauge").unwrap();
-    for (backend, cb) in &breakers {
+    if breakers.is_empty() {
         writeln!(
             output,
-            "scry_circuit_breaker_consecutive_failures{{backend=\"{}\"}} {}",
-            escape_label(backend),
-            cb.consecutive_failures
+            "scry_circuit_breaker_consecutive_failures{{backend=\"{NO_BREAKER_SENTINEL}\"}} 0"
         )
         .unwrap();
+    } else {
+        for (backend, cb) in &breakers {
+            writeln!(
+                output,
+                "scry_circuit_breaker_consecutive_failures{{backend=\"{}\"}} {}",
+                escape_label(backend),
+                cb.consecutive_failures
+            )
+            .unwrap();
+        }
     }
 
     writeln!(
@@ -374,14 +459,22 @@ fn export_circuit_breaker_metrics(output: &mut String, metrics: &ProxyMetrics) {
     )
     .unwrap();
     writeln!(output, "# TYPE scry_circuit_breaker_consecutive_successes gauge").unwrap();
-    for (backend, cb) in &breakers {
+    if breakers.is_empty() {
         writeln!(
             output,
-            "scry_circuit_breaker_consecutive_successes{{backend=\"{}\"}} {}",
-            escape_label(backend),
-            cb.consecutive_successes
+            "scry_circuit_breaker_consecutive_successes{{backend=\"{NO_BREAKER_SENTINEL}\"}} 0"
         )
         .unwrap();
+    } else {
+        for (backend, cb) in &breakers {
+            writeln!(
+                output,
+                "scry_circuit_breaker_consecutive_successes{{backend=\"{}\"}} {}",
+                escape_label(backend),
+                cb.consecutive_successes
+            )
+            .unwrap();
+        }
     }
 
     writeln!(
@@ -390,14 +483,22 @@ fn export_circuit_breaker_metrics(output: &mut String, metrics: &ProxyMetrics) {
     )
     .unwrap();
     writeln!(output, "# TYPE scry_circuit_breaker_requests_allowed_total counter").unwrap();
-    for (backend, cb) in &breakers {
+    if breakers.is_empty() {
         writeln!(
             output,
-            "scry_circuit_breaker_requests_allowed_total{{backend=\"{}\"}} {}",
-            escape_label(backend),
-            cb.requests_allowed
+            "scry_circuit_breaker_requests_allowed_total{{backend=\"{NO_BREAKER_SENTINEL}\"}} 0"
         )
         .unwrap();
+    } else {
+        for (backend, cb) in &breakers {
+            writeln!(
+                output,
+                "scry_circuit_breaker_requests_allowed_total{{backend=\"{}\"}} {}",
+                escape_label(backend),
+                cb.requests_allowed
+            )
+            .unwrap();
+        }
     }
 
     writeln!(
@@ -406,14 +507,22 @@ fn export_circuit_breaker_metrics(output: &mut String, metrics: &ProxyMetrics) {
     )
     .unwrap();
     writeln!(output, "# TYPE scry_circuit_breaker_requests_rejected_total counter").unwrap();
-    for (backend, cb) in &breakers {
+    if breakers.is_empty() {
         writeln!(
             output,
-            "scry_circuit_breaker_requests_rejected_total{{backend=\"{}\"}} {}",
-            escape_label(backend),
-            cb.requests_rejected
+            "scry_circuit_breaker_requests_rejected_total{{backend=\"{NO_BREAKER_SENTINEL}\"}} 0"
         )
         .unwrap();
+    } else {
+        for (backend, cb) in &breakers {
+            writeln!(
+                output,
+                "scry_circuit_breaker_requests_rejected_total{{backend=\"{}\"}} {}",
+                escape_label(backend),
+                cb.requests_rejected
+            )
+            .unwrap();
+        }
     }
 }
 

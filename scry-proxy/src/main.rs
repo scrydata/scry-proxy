@@ -42,6 +42,7 @@ async fn main() -> Result<()> {
     if config.observability.enable_metrics_server {
         let metrics_server_config = observability::metrics_server::MetricsServerConfig {
             listen_address: config.observability.metrics_server_address.clone(),
+            enable_debug_endpoints: config.observability.enable_debug_endpoints,
         };
         let metrics_server =
             observability::MetricsServer::new(Arc::clone(&metrics), metrics_server_config);

@@ -1,11 +1,16 @@
 /// HTTP metrics server using Axum
 ///
-/// Provides 5 endpoints for observability:
+/// Always mounts 2 endpoints (no secrets, safe to expose to a scraper):
 /// 1. GET /metrics - Prometheus text format
 /// 2. GET /health - JSON health status with warnings
+///
+/// Optionally mounts 3 more (P4 §4.5/§5.5) — off by default, and even when
+/// `enable_debug_endpoints` is true, only ever mounted on a loopback bind
+/// (see `serve`):
 /// 3. GET /debug/pool - Pool internals and utilization
 /// 4. GET /debug/timeline - Query timeline phase breakdown
-/// 5. GET /debug/hotdata - Hot data fingerprints (top-K)
+/// 5. GET /debug/hotdata - Hot data fingerprints (top-K; blake3 value
+///    fingerprints — the most sensitive endpoint here)
 use super::metrics::ProxyMetrics;
 use super::prometheus;
 use axum::{
@@ -26,11 +31,17 @@ use tracing::info;
 #[derive(Debug, Clone)]
 pub struct MetricsServerConfig {
     pub listen_address: String,
+    /// Mount `/debug/*` (pool internals, query timeline, and blake3 hot-data
+    /// value fingerprints). Off by default (P4 §4.5). Even when `true`,
+    /// `/debug/*` is only mounted if the server ends up bound to a loopback
+    /// address — see `MetricsServer::serve`. `/metrics` and `/health` are
+    /// always mounted regardless of this flag.
+    pub enable_debug_endpoints: bool,
 }
 
 impl Default for MetricsServerConfig {
     fn default() -> Self {
-        Self { listen_address: "127.0.0.1:9090".to_string() }
+        Self { listen_address: "127.0.0.1:9090".to_string(), enable_debug_endpoints: false }
     }
 }
 
@@ -46,28 +57,58 @@ impl MetricsServer {
         Self { metrics, config }
     }
 
-    /// Run the metrics server (blocking)
+    /// Run the metrics server (blocking): binds `config.listen_address`, then
+    /// serves.
     pub async fn run(self) -> anyhow::Result<()> {
         let addr: SocketAddr = self.config.listen_address.parse()?;
+        let listener = TcpListener::bind(&addr).await?;
+        self.serve(listener).await
+    }
+
+    /// Serve on an already-bound `listener` (blocking).
+    ///
+    /// Split out from `run` so tests can bind an ephemeral port (`:0`) and
+    /// discover the real bound address via `TcpListener::local_addr()` before
+    /// handing the listener here — see `tests/metrics_surface_test.rs`.
+    ///
+    /// The public-exposure guarantee (P4 §4.5/§5.5): `/debug/*` is mounted
+    /// only if `config.enable_debug_endpoints` is true AND the listener's
+    /// bound address is loopback. This is re-derived from the actual bound
+    /// address (not the pre-bind config string) so it holds even for
+    /// wildcard/ephemeral binds like `0.0.0.0:0`.
+    pub async fn serve(self, listener: TcpListener) -> anyhow::Result<()> {
+        let bound_addr = listener.local_addr()?;
 
         info!(
-            listen_address = %addr,
+            listen_address = %bound_addr,
             "Starting metrics server"
         );
 
-        // Build router with all endpoints
-        let app = Router::new()
-            .route("/metrics", get(metrics_handler))
-            .route("/health", get(health_handler))
-            .route("/debug/pool", get(pool_handler))
-            .route("/debug/timeline", get(timeline_handler))
-            .route("/debug/hotdata", get(hotdata_handler))
-            .layer(TraceLayer::new_for_http())
-            .with_state(self.metrics);
+        let mount_debug = self.config.enable_debug_endpoints && bound_addr.ip().is_loopback();
+        if self.config.enable_debug_endpoints && !mount_debug {
+            tracing::warn!(
+                listen_address = %bound_addr,
+                "observability.enable_debug_endpoints is true but the metrics server is not \
+                 bound to a loopback address; /debug/* endpoints are loopback-only by design \
+                 (P4 §4.5) and will NOT be mounted"
+            );
+        }
 
-        // Start server
-        let listener = TcpListener::bind(&addr).await?;
-        info!("Metrics server listening on {}", addr);
+        // /metrics and /health carry no secrets: always mounted.
+        let mut app = Router::new()
+            .route("/metrics", get(metrics_handler))
+            .route("/health", get(health_handler));
+
+        if mount_debug {
+            app = app
+                .route("/debug/pool", get(pool_handler))
+                .route("/debug/timeline", get(timeline_handler))
+                .route("/debug/hotdata", get(hotdata_handler));
+        }
+
+        let app = app.layer(TraceLayer::new_for_http()).with_state(self.metrics);
+
+        info!("Metrics server listening on {}", bound_addr);
 
         axum::serve(listener, app).await?;
 

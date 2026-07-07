@@ -95,6 +95,7 @@ mod tests {
             database: "default_db".to_string(),
             user: "default_user".to_string(),
             password: "default_pass".to_string(),
+            password_file: None,
             pool_size: 10,
             connection_timeout_ms: 5000,
         }

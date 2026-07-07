@@ -18,6 +18,15 @@ pub struct PendingExecution {
     pub params: Vec<ParamValue>,
     pub params_incomplete: bool,
     pub started_at: Instant,
+    /// The query's tracing span (Task 9, P4 §4.6), created at dispatch
+    /// (Parse/Bind/simple-Query) and closed at completion once the caller
+    /// records the final `duration_ms`/`success` fields on it. Held here
+    /// because dispatch and completion happen in different iterations of the
+    /// connection's read loop; storing the `Span` handle on the pending
+    /// execution is what lets the span's lifetime bridge that gap without any
+    /// extra bookkeeping. Never carries raw SQL beyond the same
+    /// `loggable()`-gated field every other query log site uses.
+    pub span: tracing::Span,
 }
 
 /// Per-connection cache for prepared statements and pending executions.
@@ -188,6 +197,7 @@ mod tests {
                 params: vec![],
                 params_incomplete: false,
                 started_at: Instant::now(),
+                span: tracing::Span::none(),
             },
         );
 
@@ -210,6 +220,7 @@ mod tests {
                 params: vec![],
                 params_incomplete: false,
                 started_at: Instant::now(),
+                span: tracing::Span::none(),
             },
         );
 

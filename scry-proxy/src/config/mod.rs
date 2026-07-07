@@ -68,7 +68,12 @@ pub struct ProxyConfig {
 
 /// Debug placeholder for a present secret value. Renders as `<redacted>` with no
 /// surrounding quotes, so secrets never leak through `{:?}` (P1 §4.7).
-struct RedactedSecret;
+///
+/// `pub(crate)` so other in-crate consumers that need to report secret
+/// *presence* without ever touching the plaintext (e.g. `SHOW CONFIG`,
+/// WP-10 P4 §4.3/§5.5) can reuse this exact redaction instead of hand-rolling
+/// a second one that could drift from this Debug impl.
+pub(crate) struct RedactedSecret;
 
 impl std::fmt::Debug for RedactedSecret {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -77,7 +82,7 @@ impl std::fmt::Debug for RedactedSecret {
 }
 
 /// Render an optional secret's *presence* for Debug output, never its value.
-fn redacted_opt(value: &Option<String>) -> Option<RedactedSecret> {
+pub(crate) fn redacted_opt(value: &Option<String>) -> Option<RedactedSecret> {
     value.as_ref().map(|_| RedactedSecret)
 }
 
@@ -90,6 +95,14 @@ pub struct BackendConfig {
     pub database: String,
     pub user: String,
     pub password: String,
+    /// Filesystem path to a file whose (trimmed) contents are used as the
+    /// backend password (`SCRY_BACKEND__PASSWORD_FILE`, WP-10 Task 6, P4
+    /// §4.4). Mutually exclusive with `password`: resolved in `Config::load()`
+    /// before `validate()` runs, and fails closed (refuses to start) if the
+    /// path is unreadable, missing, or empty. Not a secret itself (it's a
+    /// path), so it renders plainly in `Debug`/`SHOW CONFIG`.
+    #[serde(default)]
+    pub password_file: Option<String>,
     pub pool_size: usize,
     pub connection_timeout_ms: u64,
 }
@@ -104,6 +117,8 @@ impl std::fmt::Debug for BackendConfig {
             .field("database", &self.database)
             .field("user", &self.user)
             .field("password", &RedactedSecret)
+            // `password_file` is a path, not a secret value: show it plainly.
+            .field("password_file", &self.password_file)
             .field("pool_size", &self.pool_size)
             .field("connection_timeout_ms", &self.connection_timeout_ms)
             .finish()
@@ -121,6 +136,21 @@ pub struct ObservabilityConfig {
     /// or credentials. Must be explicitly opted into (P1 §4.7).
     #[serde(default)]
     pub unsafe_debug_logging: bool,
+    /// Mount the `/debug/*` endpoints (pool internals, query timeline, and —
+    /// most sensitively — blake3 hot-data value fingerprints). Off by
+    /// default (P4 §4.5/§5.5). Even when `true`, `/debug/*` is only ever
+    /// mounted if `metrics_server_address` resolves to a loopback address;
+    /// see `MetricsServer::serve`. `/metrics` and `/health` are unaffected by
+    /// this flag — they carry no secrets and are always mounted.
+    #[serde(default)]
+    pub enable_debug_endpoints: bool,
+    /// Explicitly acknowledge binding the metrics/health HTTP server
+    /// (`metrics_server_address`) to a non-loopback address. Mirrors
+    /// `auth.allow_trust`: `validate()` refuses to start otherwise. Does NOT
+    /// unlock `/debug/*` on a non-loopback bind — that stays loopback-only
+    /// regardless (P4 §4.5/§5.5).
+    #[serde(default)]
+    pub metrics_allow_non_loopback: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -576,6 +606,7 @@ impl Default for Config {
                 // No default backend password: an unset password is caught by
                 // `validate()` (fail closed rather than shipping a guessable default).
                 password: String::new(),
+                password_file: None,
                 pool_size: 10,
                 connection_timeout_ms: 5000,
             },
@@ -587,6 +618,8 @@ impl Default for Config {
                 metrics_server_address: "127.0.0.1:9090".to_string(),
                 enable_metrics_server: true,
                 unsafe_debug_logging: false,
+                enable_debug_endpoints: false,
+                metrics_allow_non_loopback: false,
             },
             protocol: ProtocolConfig { max_prepared_statements: 1000 },
             publisher: PublisherConfig {
@@ -668,6 +701,8 @@ impl Config {
     /// - SCRY_PROXY__LISTEN_ADDRESS=127.0.0.1:5433
     /// - SCRY_BACKEND__HOST=localhost
     /// - SCRY_BACKEND__PORT=5432
+    /// - SCRY_BACKEND__PASSWORD_FILE=/var/run/secrets/db/password (mutually
+    ///   exclusive with SCRY_BACKEND__PASSWORD; resolved here, fails closed)
     /// - SCRY_OBSERVABILITY__ENABLE_TRACING=true
     /// - SCRY_PUBLISHER__ENABLED=true
     pub fn load() -> anyhow::Result<Self> {
@@ -711,15 +746,49 @@ impl Config {
             if !unknown.is_empty() {
                 anyhow::bail!(
                     "unknown SCRY_* configuration variable(s): {}. Check for typos, or set \
-                     SCRY_ALLOW_UNKNOWN_KEYS=true to ignore. (This catches keys like \
-                     SCRY_BACKEND__PASSWORD_FILE that would otherwise silently no-op.)",
+                     SCRY_ALLOW_UNKNOWN_KEYS=true to ignore. (This catches typo'd keys that \
+                     would otherwise silently no-op.)",
                     unknown.join(", ")
                 );
             }
         }
 
         let config = builder.build()?;
-        let loaded: Config = config.try_deserialize()?;
+        let mut loaded: Config = config.try_deserialize()?;
+
+        // Resolve `backend.password_file` (SCRY_BACKEND__PASSWORD_FILE, WP-10
+        // Task 6, P4 §4.4) into an effective `backend.password` BEFORE
+        // `validate()` runs. This is a security-relevant secret load: fail
+        // closed (refuse to start) rather than falling back to an empty or
+        // stale password on any misconfiguration.
+        if let Some(path) = loaded.backend.password_file.clone() {
+            // Exactly one backend-password source is allowed; ambiguity
+            // between a direct value and a file is a hard error rather than
+            // an implicit precedence rule.
+            if !loaded.backend.password.is_empty() {
+                anyhow::bail!(
+                    "backend.password and backend.password_file are both set; exactly one \
+                     backend-password source is allowed. Unset one of \
+                     SCRY_BACKEND__PASSWORD or SCRY_BACKEND__PASSWORD_FILE (backend.password \
+                     or backend.password_file in a config file)."
+                );
+            }
+
+            let contents = std::fs::read_to_string(&path).map_err(|e| {
+                anyhow::anyhow!(
+                    "backend.password_file is set to '{path}' but the file could not be \
+                     read ({e}); refusing to start with an unresolved backend password."
+                )
+            })?;
+            let secret = contents.trim().to_string();
+            if secret.is_empty() {
+                anyhow::bail!(
+                    "backend.password_file ('{path}') is empty; refusing to start with an \
+                     empty backend password."
+                );
+            }
+            loaded.backend.password = secret;
+        }
 
         Ok(loaded)
     }
@@ -841,6 +910,47 @@ impl Config {
                  pool_size or performance.connection_pooling = disabled.",
                 self.performance.connection_pooling
             );
+        }
+
+        // --- Fail-closed operability checks (P4 §4.5/§5.5) ---
+
+        // 10. The metrics/health HTTP server binding to a non-loopback address
+        // must be explicitly acknowledged, mirroring `auth.allow_trust`: a
+        // config mistake should not silently expose it to the network.
+        // `/debug/*` (which can leak blake3 value fingerprints, the most
+        // sensitive of the bunch) stays loopback-only regardless of this ack
+        // — if that combination is a no-op, warn rather than erroring, since
+        // `/metrics`/`/health` themselves are safe to expose.
+        if self.observability.enable_metrics_server {
+            let addr =
+                self.observability.metrics_server_address.parse::<std::net::SocketAddr>().map_err(
+                    |e| {
+                        anyhow::anyhow!(
+                            "observability.metrics_server_address ({}) is not a valid socket \
+                         address: {e}",
+                            self.observability.metrics_server_address
+                        )
+                    },
+                )?;
+
+            if !addr.ip().is_loopback() {
+                if !self.observability.metrics_allow_non_loopback {
+                    anyhow::bail!(
+                        "observability.metrics_server_address ({addr}) is not a loopback \
+                         address; the metrics/health HTTP server would be reachable from \
+                         the network. Set observability.metrics_allow_non_loopback = true \
+                         to acknowledge this and start anyway."
+                    );
+                }
+                if self.observability.enable_debug_endpoints {
+                    warnings.push(format!(
+                        "observability.enable_debug_endpoints = true but \
+                         observability.metrics_server_address ({addr}) is not loopback; \
+                         /debug/* endpoints are loopback-only by design (P4 §4.5) and will \
+                         NOT be mounted."
+                    ));
+                }
+            }
         }
 
         // --- Non-fatal warnings ---
@@ -1258,8 +1368,10 @@ mod capacity_and_unknown_key_tests {
             paths.contains("resilience.circuit_breaker.enabled"),
             "missing nested resilience.circuit_breaker.enabled"
         );
-        // The typo'd key this pillar exists to catch is NOT a valid path.
-        assert!(!paths.contains("backend.password_file"));
+        // password_file is now implemented (WP-10 Task 6, P4 §4.4) and must be
+        // a valid path so the unknown-key guard accepts
+        // SCRY_BACKEND__PASSWORD_FILE.
+        assert!(paths.contains("backend.password_file"), "missing backend.password_file");
     }
 
     #[test]
@@ -1269,7 +1381,7 @@ mod capacity_and_unknown_key_tests {
             "SCRY_BACKEND__PASSWORD".to_string(),                    // known
             "SCRY_PROXY__LISTEN_ADDRESS".to_string(),                // known
             "SCRY_RESILIENCE__CIRCUIT_BREAKER__ENABLED".to_string(), // known nested
-            "SCRY_BACKEND__PASSWORD_FILE".to_string(),               // UNKNOWN (the target bug)
+            "SCRY_BACKEND__PASSWORD_FILE".to_string(),               // known (WP-10 Task 6)
             "SCRY_TOTALLY__BOGUS".to_string(),                       // UNKNOWN
             "SCRY_CONFIG_FILE".to_string(),                          // meta, ignored
             "SCRY_ALLOW_UNKNOWN_KEYS".to_string(),                   // meta, ignored
@@ -1277,9 +1389,9 @@ mod capacity_and_unknown_key_tests {
             "PATH".to_string(),                                      // non-SCRY, ignored
         ];
         let unknown = unknown_scry_env_keys(env, &valid);
-        assert!(unknown.contains(&"SCRY_BACKEND__PASSWORD_FILE".to_string()));
+        assert!(!unknown.contains(&"SCRY_BACKEND__PASSWORD_FILE".to_string()));
         assert!(unknown.contains(&"SCRY_TOTALLY__BOGUS".to_string()));
-        assert_eq!(unknown.len(), 2, "unexpected unknowns: {unknown:?}");
+        assert_eq!(unknown.len(), 1, "unexpected unknowns: {unknown:?}");
     }
 }
 
@@ -1480,5 +1592,149 @@ mod backpressure_tests {
         let mode: BackpressureMode =
             serde_json::from_value(value["pool_backpressure_mode"].clone()).unwrap();
         assert_eq!(mode, BackpressureMode::LogAndReject);
+    }
+}
+
+#[cfg(test)]
+mod password_file_tests {
+    use super::*;
+    use std::io::Write;
+    use std::sync::Mutex;
+
+    // `Config::load()` reads real process environment variables, so these
+    // tests must be serialized against each other (and against any other test
+    // in this binary that touches SCRY_* env vars) to avoid cross-talk when
+    // the test harness runs tests in parallel threads within one process.
+    static ENV_TEST_MUTEX: Mutex<()> = Mutex::new(());
+
+    fn clear_backend_password_env() {
+        std::env::remove_var("SCRY_BACKEND__PASSWORD");
+        std::env::remove_var("SCRY_BACKEND__PASSWORD_FILE");
+    }
+
+    fn write_secret_file(contents: &str) -> tempfile::NamedTempFile {
+        let mut file = tempfile::NamedTempFile::new().expect("create temp secret file");
+        file.write_all(contents.as_bytes()).expect("write temp secret file");
+        file.flush().expect("flush temp secret file");
+        file
+    }
+
+    #[test]
+    fn password_file_loads_secret_as_backend_password() {
+        let _guard = ENV_TEST_MUTEX.lock().unwrap();
+        clear_backend_password_env();
+
+        let file = write_secret_file("hunter2-from-file\n");
+        std::env::set_var("SCRY_BACKEND__PASSWORD_FILE", file.path());
+
+        let result = Config::load();
+
+        clear_backend_password_env();
+
+        let loaded = result.expect("Config::load() should succeed with a readable password_file");
+        assert_eq!(loaded.backend.password, "hunter2-from-file");
+        assert_eq!(loaded.backend.password_file.as_deref(), Some(file.path().to_str().unwrap()));
+    }
+
+    #[test]
+    fn password_file_missing_fails_closed() {
+        let _guard = ENV_TEST_MUTEX.lock().unwrap();
+        clear_backend_password_env();
+
+        std::env::set_var(
+            "SCRY_BACKEND__PASSWORD_FILE",
+            "/nonexistent/path/does-not-exist-scry-test.secret",
+        );
+
+        let result = Config::load();
+
+        clear_backend_password_env();
+
+        let err = result.expect_err("missing password_file must fail Config::load() closed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("password_file") || msg.contains("does-not-exist-scry-test.secret"),
+            "error should reference the unreadable password_file path: {msg}"
+        );
+    }
+
+    #[test]
+    fn password_file_empty_fails_closed() {
+        let _guard = ENV_TEST_MUTEX.lock().unwrap();
+        clear_backend_password_env();
+
+        let file = write_secret_file("");
+        std::env::set_var("SCRY_BACKEND__PASSWORD_FILE", file.path());
+
+        let result = Config::load();
+
+        clear_backend_password_env();
+
+        let err = result.expect_err("empty password_file must fail Config::load() closed");
+        assert!(
+            err.to_string().contains("empty"),
+            "error should mention the file is empty: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn password_file_whitespace_only_fails_closed() {
+        let _guard = ENV_TEST_MUTEX.lock().unwrap();
+        clear_backend_password_env();
+
+        let file = write_secret_file("   \n\t\n");
+        std::env::set_var("SCRY_BACKEND__PASSWORD_FILE", file.path());
+
+        let result = Config::load();
+
+        clear_backend_password_env();
+
+        let err =
+            result.expect_err("whitespace-only password_file must fail Config::load() closed");
+        assert!(
+            err.to_string().contains("empty"),
+            "error should mention the file is effectively empty: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn password_and_password_file_both_set_is_a_conflict_error() {
+        let _guard = ENV_TEST_MUTEX.lock().unwrap();
+        clear_backend_password_env();
+
+        let file = write_secret_file("file-secret\n");
+        std::env::set_var("SCRY_BACKEND__PASSWORD", "direct-secret");
+        std::env::set_var("SCRY_BACKEND__PASSWORD_FILE", file.path());
+
+        let result = Config::load();
+
+        clear_backend_password_env();
+
+        let err = result.expect_err(
+            "setting both backend.password and backend.password_file must be a conflict error",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("password_file") && msg.contains("password"),
+            "error should name both conflicting sources: {msg}"
+        );
+    }
+
+    #[test]
+    fn no_password_file_leaves_password_untouched() {
+        let _guard = ENV_TEST_MUTEX.lock().unwrap();
+        clear_backend_password_env();
+
+        std::env::set_var("SCRY_BACKEND__PASSWORD", "direct-secret");
+
+        let result = Config::load();
+
+        clear_backend_password_env();
+
+        let loaded = result.expect("Config::load() should succeed with only backend.password set");
+        assert_eq!(loaded.backend.password, "direct-secret");
+        assert!(loaded.backend.password_file.is_none());
     }
 }

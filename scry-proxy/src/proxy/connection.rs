@@ -184,6 +184,116 @@ fn redact_param(p: &ParamValue) -> ParamValue {
     }
 }
 
+/// A bounded, non-sensitive command tag for a SQL statement (Task 9, P4 §4.6):
+/// the leading clause keyword, upper-cased, from a small known-safe set, or
+/// `"OTHER"` for anything else. Cheap (no parsing, unlike `CommandDetector`/
+/// `QueryAnonymizer`) and never a raw-SQL leak — it's always one of a fixed
+/// handful of strings, independent of the statement's literal content, so
+/// it's safe to attach to a span field unconditionally.
+fn command_tag(sql: &str) -> &'static str {
+    const KEYWORDS: &[&str] = &[
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE",
+        "WITH",
+        "VALUES",
+        "TABLE",
+        "BEGIN",
+        "START",
+        "COMMIT",
+        "ROLLBACK",
+        "SAVEPOINT",
+        "RELEASE",
+        "SET",
+        "SHOW",
+        "EXPLAIN",
+        "CREATE",
+        "DROP",
+        "ALTER",
+        "DECLARE",
+        "CLOSE",
+        "DEALLOCATE",
+        "LISTEN",
+        "UNLISTEN",
+        "NOTIFY",
+    ];
+    let upper = sql.trim_start().to_uppercase();
+    for kw in KEYWORDS {
+        if let Some(rest) = upper.strip_prefix(kw) {
+            if rest.is_empty()
+                || rest.starts_with(|c: char| c.is_whitespace() || c == '(' || c == ';')
+            {
+                return kw;
+            }
+        }
+    }
+    "OTHER"
+}
+
+/// A one-way, unsalted fingerprint of a query's exact text (Task 9, P4 §4.6):
+/// 16 hex characters of a BLAKE3 hash. Safe to expose unconditionally — even
+/// with `unsafe_debug_logging` off — because a cryptographic hash cannot be
+/// inverted to recover the query text; it only lets a trace correlate
+/// repeated occurrences of the same statement. Deliberately distinct from
+/// `QueryAnonymizer`'s per-VALUE fingerprints (which require the query to
+/// parse successfully): this covers every query, parseable or not, at
+/// negligible cost, so it's always available for a span field.
+fn query_fingerprint(sql: &str) -> String {
+    blake3::hash(sql.as_bytes()).to_hex()[..16].to_string()
+}
+
+/// Build the per-query span (Task 9, P4 §4.6): dispatch → backend → response.
+/// Created as a child of whatever span is active when a query/statement is
+/// dispatched (the connection span from `handle_client_connection` and the
+/// `handle()` span above it), and exported through the existing OTLP layer
+/// configured by `observability::init` — near-zero cost when no subscriber is
+/// interested (the default, no OTLP endpoint configured).
+///
+/// Deliberately does NOT put the raw query or parameter values in an
+/// always-on field: `command` and `query_fingerprint` are bounded/one-way and
+/// therefore safe unconditionally, and the `query` field itself is gated by
+/// the exact same `loggable()` redaction every other query log site in this
+/// file already uses — it only reveals raw SQL when `unsafe_debug_logging` is
+/// explicitly enabled, never by default, and never a new leak surface beyond
+/// what logs already allow. `duration_ms`/`success` start `Empty` and are
+/// filled in via `record_query_span_outcome` once the query completes —
+/// bridging dispatch and completion across read-loop iterations is what
+/// storing this `Span` on `PendingExecution` is for.
+///
+/// Phase durations: only the total/backend `duration_ms` is cheaply available
+/// today. `queue`/`pool-acquire` durations are tracked by `QueryTimeline` but
+/// are never marked by any production call site in this file (only by
+/// `observability::metrics`'s own unit tests) — fabricating them here would
+/// be dishonest, so they're deliberately left off rather than always-zero.
+fn new_query_span(
+    connection_id: u64,
+    pooling_mode: &str,
+    backend_id: &str,
+    query: &str,
+) -> tracing::Span {
+    tracing::info_span!(
+        "pg_query",
+        conn_id = connection_id,
+        pooling_mode = %pooling_mode,
+        backend_id = %backend_id,
+        command = %command_tag(query),
+        query_fingerprint = %query_fingerprint(query),
+        query = %crate::observability::loggable(query),
+        duration_ms = tracing::field::Empty,
+        success = tracing::field::Empty,
+    )
+}
+
+/// Record a query span's outcome at completion (Task 9, P4 §4.6). The span
+/// itself closes (and is exported) when its last handle — the one stored on
+/// the taken `PendingExecution` — is dropped at the end of the caller's
+/// block, so no explicit close call is needed here.
+fn record_query_span_outcome(span: &tracing::Span, duration: Duration, success: bool) {
+    span.record("duration_ms", duration.as_millis() as u64);
+    span.record("success", success);
+}
+
 /// Handles a single client connection, forwarding messages to/from the backend
 pub struct ConnectionHandler {
     client_stream: ClientTransport,
@@ -413,6 +523,49 @@ impl ConnectionHandler {
         response
     }
 
+    /// Build a PostgreSQL ErrorResponse for an administratively paused pool
+    /// (admin `PAUSE`, WP-10 Task 4). Honest rejection so a new client's query
+    /// fails cleanly instead of hanging. SQLSTATE 57P03 (`cannot_connect_now`)
+    /// is the standard "server is not currently accepting connections" code.
+    fn build_pool_paused_error() -> Vec<u8> {
+        let mut response = Vec::new();
+        response.push(b'E'); // ErrorResponse
+
+        let mut fields = Vec::new();
+
+        // Severity (S)
+        fields.push(b'S');
+        fields.extend_from_slice(b"ERROR");
+        fields.push(0);
+
+        // SQLSTATE (C) - 57P03 = cannot_connect_now
+        fields.push(b'C');
+        fields.extend_from_slice(b"57P03");
+        fields.push(0);
+
+        // Message (M)
+        fields.push(b'M');
+        fields.extend_from_slice(b"pool is paused");
+        fields.push(0);
+
+        // Hint (H)
+        fields.push(b'H');
+        fields.extend_from_slice(
+            b"The proxy pool was paused by an administrator. Retry after RESUME.",
+        );
+        fields.push(0);
+
+        // Terminator
+        fields.push(0);
+
+        // Length (including self, 4 bytes)
+        let length = (fields.len() + 4) as i32;
+        response.extend_from_slice(&length.to_be_bytes());
+        response.extend_from_slice(&fields);
+
+        response
+    }
+
     /// Handle the connection, forwarding messages until completion
     #[instrument(skip(self), fields(connection_id = self.connection_id, client_addr = %self.client_addr))]
     pub async fn handle(mut self) -> Result<()> {
@@ -500,28 +653,46 @@ impl ConnectionHandler {
                     );
                 }
             },
-            AcquireError::WaitTimeout => match backpressure_mode {
-                BackpressureMode::RejectImmediate => {
-                    debug!(
-                        connection_id = self.connection_id,
-                        "Wait timeout, rejecting connection"
-                    );
+            AcquireError::WaitTimeout => {
+                // P3 §4.5: acquisition hit `pool_timeout_secs`/`wait_timeout_ms`
+                // waiting for a free pool slot. Cheap atomic increment on an
+                // already-slow (rejection) path — no hot-path cost.
+                self.metrics.pool_metrics().record_pool_wait_timeout();
+                match backpressure_mode {
+                    BackpressureMode::RejectImmediate => {
+                        debug!(
+                            connection_id = self.connection_id,
+                            "Wait timeout, rejecting connection"
+                        );
+                    }
+                    BackpressureMode::RetryHint => {
+                        debug!(
+                            connection_id = self.connection_id,
+                            "Wait timeout, sending error with retry hint"
+                        );
+                        let error_msg = Self::build_wait_timeout_error();
+                        let _ = self.client_stream.write_all(&error_msg).await;
+                    }
+                    BackpressureMode::LogAndReject => {
+                        warn!(
+                            connection_id = self.connection_id,
+                            "Connection rejected: timeout waiting for pool connection"
+                        );
+                    }
                 }
-                BackpressureMode::RetryHint => {
-                    debug!(
-                        connection_id = self.connection_id,
-                        "Wait timeout, sending error with retry hint"
-                    );
-                    let error_msg = Self::build_wait_timeout_error();
-                    let _ = self.client_stream.write_all(&error_msg).await;
-                }
-                BackpressureMode::LogAndReject => {
-                    warn!(
-                        connection_id = self.connection_id,
-                        "Connection rejected: timeout waiting for pool connection"
-                    );
-                }
-            },
+            }
+            AcquireError::Paused => {
+                // Administratively paused (admin PAUSE). Always surface a clean
+                // ErrorResponse to the client regardless of backpressure mode —
+                // this is an operator action, not load, so the client deserves
+                // an honest "paused" message rather than a silent close.
+                debug!(
+                    connection_id = self.connection_id,
+                    "Acquire rejected: pool is paused, sending ErrorResponse to client"
+                );
+                let error_msg = Self::build_pool_paused_error();
+                let _ = self.client_stream.write_all(&error_msg).await;
+            }
             AcquireError::PoolError(e) => {
                 // Pool errors are unexpected, always log them
                 error!(
@@ -529,6 +700,22 @@ impl ConnectionHandler {
                     error = %e,
                     "Pool error while acquiring connection"
                 );
+
+                // Distinguish two indistinguishable-by-type causes folded into
+                // this generic `anyhow::Error` by `TcpConnectionPool::get`
+                // (P3 §4.1/§4.5): an open circuit breaker shedding load, and a
+                // backend TCP connect/TLS negotiation that hit
+                // `connection_timeout_ms`. Both are constructed with a stable,
+                // tested message prefix (see `tcp_pool.rs`'s own fault-injection
+                // test asserting on "Circuit breaker"), so a substring match on
+                // this already-slow error path is cheap and reliable without
+                // threading a typed error or `ProxyMetrics` through the pool.
+                // Extracted into `classify_pool_error_for_metrics` (below) so
+                // tests can drive a REAL `tcp_pool.rs` error message through
+                // this exact match — see that function's doc comment and the
+                // `classify_pool_error_for_metrics_*` tests.
+                classify_pool_error_for_metrics(&e.to_string(), &self.metrics);
+
                 return Err(e.context("Failed to acquire connection from pool"));
             }
         }
@@ -872,6 +1059,10 @@ impl ConnectionHandler {
         let pooling_strategy = self.config.performance.connection_pooling.clone();
         let pooling_mode = Self::pooling_mode(&pooling_strategy);
         let mode_enforcer = ModeEnforcer::new(pooling_mode);
+        // Cheap, pre-formatted span attributes (Task 9, P4 §4.6): computed once
+        // per connection rather than per query.
+        let pooling_mode_str = format!("{pooling_mode:?}");
+        let backend_id = format!("{}:{}", self.config.backend.host, self.config.backend.port);
         let mut txn_tracker = TransactionTracker::new();
         let mut conn_state = ConnectionState::new(self.config.protocol.max_prepared_statements);
 
@@ -964,7 +1155,20 @@ impl ConnectionHandler {
                                             query: query.clone(),
                                             param_oids: param_oids.clone(),
                                         });
+                                        // Task 9 review fix (Fix 1): Parse alone doesn't execute
+                                        // a query, so it gets a `Span::none()` placeholder rather
+                                        // than a real `pg_query` span — the real span is created
+                                        // at Bind (or here, if this Parse never Binds and instead
+                                        // errors; see the Bind arm below for why one pending slot
+                                        // holding exactly one span is correct). This avoids the
+                                        // orphaned/double-span bug: previously a real span was
+                                        // created here AND at Bind, but Bind's `set_pending`
+                                        // overwrites this pending entry, discarding the Parse-time
+                                        // span before it ever recorded `duration_ms`/`success` —
+                                        // every prepared-statement query emitted one noise span
+                                        // plus the real one.
                                         stmt_cache.set_pending(String::new(), PendingExecution {
+                                            span: tracing::Span::none(),
                                             query: query.clone(),
                                             params: vec![],
                                             params_incomplete: true,
@@ -991,7 +1195,16 @@ impl ConnectionHandler {
                                             }
                                         };
 
+                                        // Task 9 review fix (Fix 1): the real `pg_query` span is
+                                        // created HERE, at Bind, not at Parse — Bind is the point
+                                        // an extended-protocol query actually becomes executable
+                                        // (it resolves params against the cached statement), so
+                                        // this is the single source of truth for the pending
+                                        // execution's span. This `set_pending` overwrites whatever
+                                        // Parse stored (a `Span::none()` placeholder, so nothing
+                                        // real is discarded).
                                         stmt_cache.set_pending(portal, PendingExecution {
+                                            span: new_query_span(connection_id, &pooling_mode_str, &backend_id, &query),
                                             query,
                                             params,
                                             params_incomplete: incomplete,
@@ -1012,6 +1225,7 @@ impl ConnectionHandler {
 
                                         debug!(query = %crate::observability::loggable(query), "Simple query");
                                         stmt_cache.set_pending(String::new(), PendingExecution {
+                                            span: new_query_span(connection_id, &pooling_mode_str, &backend_id, query),
                                             query: query.clone(),
                                             params: vec![],
                                             params_incomplete: false,
@@ -1124,6 +1338,7 @@ impl ConnectionHandler {
                                 if let Some(pending) = stmt_cache.take_pending("") {
                                     let duration = pending.started_at.elapsed();
                                     warn!(query = %crate::observability::loggable(&pending.query), error = %crate::observability::loggable(&error_msg), duration_ms = duration.as_millis(), "Query failed");
+                                    record_query_span_outcome(&pending.span, duration, false);
 
                                     let error_field = anon_settings.error_field(&extractor, data, error_msg);
                                     if let Some((event, fingerprints)) = anon_settings.build_event(
@@ -1151,6 +1366,7 @@ impl ConnectionHandler {
                                 if let Some(pending) = stmt_cache.take_pending("") {
                                     let duration = pending.started_at.elapsed();
                                     debug!(query = %crate::observability::loggable(&pending.query), duration_ms = duration.as_millis(), "Query completed successfully");
+                                    record_query_span_outcome(&pending.span, duration, true);
 
                                     // WP-9 Task 9 (P2 §4.6): a simple-Query
                                     // `pending.query` may itself be a
@@ -1338,6 +1554,7 @@ impl ConnectionHandler {
                     );
 
                     metrics.record_query(&QueryTimeline::new(), false);
+                    metrics.query_metrics().record_query_timeout();
                     // Mark the connection unusable so it is not returned clean.
                     conn_state.mark_unknown_command();
 
@@ -1401,6 +1618,12 @@ impl ConnectionHandler {
         let anon_settings = AnonymizationSettings::from_config(&self.config);
         let metrics = Arc::clone(&self.metrics);
         let max_stmts = self.config.protocol.max_prepared_statements;
+        // Cheap, pre-formatted span attributes (Task 9, P4 §4.6). This path
+        // bypasses the `PoolManager`/`ModeEnforcer` entirely (a direct,
+        // unpooled backend connection), so `pooling_mode` is a fixed literal
+        // rather than a `PoolingMode` variant.
+        let pooling_mode_str = "direct".to_string();
+        let backend_id = format!("{}:{}", self.config.backend.host, self.config.backend.port);
 
         // Shared prepared statement cache between both async tasks
         let stmt_cache: Arc<Mutex<PreparedStatementCache>> =
@@ -1433,11 +1656,21 @@ impl ConnectionHandler {
                                             name.clone(),
                                             PreparedStatement { query: query.clone(), param_oids },
                                         );
-                                        // Set pending with empty params for Parse errors
-                                        // Will be overwritten by Bind if Parse succeeds
+                                        // Set pending with empty params for Parse errors; will be
+                                        // overwritten by Bind if Parse succeeds. Task 9 review fix
+                                        // (Fix 1): the span here is `Span::none()`, not a real
+                                        // `pg_query` span — Parse alone doesn't execute a query,
+                                        // so the real span is created at Bind (see below). This
+                                        // avoids the orphaned/double-span bug: a real span used to
+                                        // be created here AND at Bind, but Bind's `set_pending`
+                                        // overwrites this pending entry, discarding the Parse-time
+                                        // span before it ever recorded `duration_ms`/`success` —
+                                        // every prepared-statement query emitted one noise span
+                                        // plus the real one.
                                         cache.set_pending(
                                             String::new(),
                                             PendingExecution {
+                                                span: tracing::Span::none(),
                                                 query,
                                                 params: vec![],
                                                 params_incomplete: true,
@@ -1478,9 +1711,19 @@ impl ConnectionHandler {
                                             }
                                         };
 
+                                        // Task 9 review fix (Fix 1): the real `pg_query` span is
+                                        // created HERE, at Bind — the point an extended-protocol
+                                        // query actually becomes executable — not at Parse.
+                                        let span = new_query_span(
+                                            connection_id,
+                                            &pooling_mode_str,
+                                            &backend_id,
+                                            &query,
+                                        );
                                         cache.set_pending(
                                             portal,
                                             PendingExecution {
+                                                span,
                                                 query,
                                                 params,
                                                 params_incomplete: incomplete,
@@ -1490,9 +1733,16 @@ impl ConnectionHandler {
                                     }
                                     Message::Query { query } => {
                                         debug!(query = %crate::observability::loggable(&query), "Simple query");
+                                        let span = new_query_span(
+                                            connection_id,
+                                            &pooling_mode_str,
+                                            &backend_id,
+                                            &query,
+                                        );
                                         cache.set_pending(
                                             String::new(),
                                             PendingExecution {
+                                                span,
                                                 query,
                                                 params: vec![],
                                                 params_incomplete: false,
@@ -1550,6 +1800,7 @@ impl ConnectionHandler {
                                     duration_ms = duration.as_millis(),
                                     "Query failed"
                                 );
+                                record_query_span_outcome(&pending.span, duration, false);
 
                                 let error_field =
                                     anon_settings.error_field(&extractor, data, error_msg);
@@ -1586,6 +1837,7 @@ impl ConnectionHandler {
                                     duration_ms = duration.as_millis(),
                                     "Query completed successfully"
                                 );
+                                record_query_span_outcome(&pending.span, duration, true);
 
                                 if let Some((event, fingerprints)) = anon_settings.build_event(
                                     &pending.query,
@@ -1637,6 +1889,28 @@ impl ConnectionHandler {
 
         info!("Connection handler completed");
         Ok(())
+    }
+}
+
+/// Classify a pool-acquire error message into the corresponding metric and
+/// record it — this is the substring match from `handle_acquire_error`'s
+/// `AcquireError::PoolError` arm (P3 §4.1/§4.5), extracted to a standalone,
+/// `ConnectionHandler`-free function.
+///
+/// `handle_acquire_error` requires a live `ClientTransport` (a real socket),
+/// which makes it impractical to drive end-to-end in a unit test. Extracting
+/// the classification itself lets tests feed it a REAL error message produced
+/// by `TcpConnectionPool::get`'s own fault-injection fixtures (breaker-open
+/// shed, unreachable-backend connect timeout — see `tcp_pool.rs`) instead of
+/// only asserting the `ProxyMetrics` counters directly, which is what left
+/// this match unguarded: a reword of either message in `tcp_pool.rs` (~:155
+/// `"Circuit breaker: {}"`, ~:344 `"Timed out after ..."`) must make one of
+/// the `classify_pool_error_for_metrics_*` tests below fail.
+fn classify_pool_error_for_metrics(msg: &str, metrics: &ProxyMetrics) {
+    if msg.contains("Circuit breaker") {
+        metrics.pool_metrics().record_request_shed();
+    } else if msg.contains("Timed out after") {
+        metrics.pool_metrics().record_backend_connect_timeout();
     }
 }
 
@@ -2429,6 +2703,173 @@ mod tests {
         assert!(
             extractor.contains_ready_for_query(&captured),
             "captured startup response must include ReadyForQuery (backend is ready for a query)"
+        );
+    }
+
+    // --- classify_pool_error_for_metrics: real-event guarding tests (WP-10 Task 8 review fix) ---
+    //
+    // These drive an ACTUAL `AcquireError::PoolError` message produced by
+    // `TcpConnectionPool::get`'s own fault-injection fixtures (the same ones
+    // used by `tcp_pool.rs`'s `test_breaker_opens_and_sheds_when_backend_down`
+    // and `test_connect_timeout_fires_on_unreachable_backend`) through the
+    // real `classify_pool_error_for_metrics` substring match, instead of
+    // calling `ProxyMetrics::record_*` directly. A reword of either message
+    // in `tcp_pool.rs` (~:155 `"Circuit breaker: {}"`, ~:344 `"Timed out
+    // after ..."`) must make one of these fail — verified manually by
+    // temporarily rewording each message and confirming RED, then GREEN
+    // again on revert (see Task 8 fix report).
+
+    use crate::config::CircuitBreakerConfig;
+    use crate::observability::HealthConfig;
+    use crate::protocol::postgres::PostgresProtocol;
+    use crate::protocol::{Protocol, ProtocolConfig};
+    use crate::proxy::TcpConnectionPool;
+    use crate::resilience::CircuitBreaker;
+
+    #[tokio::test]
+    async fn classify_pool_error_for_metrics_records_backend_connect_timeout_on_real_message() {
+        // Same fixture as tcp_pool.rs's test_connect_timeout_fires_on_unreachable_backend:
+        // TEST-NET-3 (RFC 5737) is reserved/unroutable, so the SYN is
+        // dropped and the connect budget is guaranteed to expire.
+        let protocol = Arc::new(PostgresProtocol::new()) as Arc<dyn Protocol>;
+        let config = ProtocolConfig {
+            host: "203.0.113.1".to_string(),
+            port: 5432,
+            database: Some("test".to_string()),
+            user: Some("postgres".to_string()),
+            password: Some("postgres".to_string()),
+        };
+        let tls_config = crate::config::TlsConfig::default();
+        let pool =
+            TcpConnectionPool::new(protocol, config, &tls_config, 2, None, None, None, true, 800)
+                .expect("pool");
+
+        let err = match pool.get().await {
+            Ok(_) => panic!("connect to unreachable backend should fail"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+
+        let metrics = ProxyMetrics::new(100, HealthConfig::default());
+        classify_pool_error_for_metrics(&msg, &metrics);
+
+        assert_eq!(
+            metrics.pool_metrics().get_backend_connect_timeouts_total(),
+            1,
+            "real tcp_pool.rs connect-timeout message {msg:?} must classify as backend_connect_timeout"
+        );
+        assert_eq!(
+            metrics.pool_metrics().get_requests_shed_total(),
+            0,
+            "a connect timeout must not also count as a shed request"
+        );
+    }
+
+    /// Whole-branch-review regression (Fix 1, P4 §4.6): `new_query_span` is
+    /// `info_span!`, and the console/log filter defaults to `warn` when
+    /// `RUST_LOG` is unset — the documented "just enable tracing" path
+    /// (`enable_tracing = true` + `otlp_endpoint` set, no `RUST_LOG`
+    /// override). A single shared `EnvFilter` wrapping the whole layer stack
+    /// (the pre-fix `observability::init` shape) makes every layer's
+    /// `enabled()` check AND together, so a warn-default filter silently
+    /// vetoes info-level spans for every layer beneath it, including the
+    /// OTLP exporter — enabling tracing the documented way exported ZERO
+    /// `pg_query` spans. This drives the REAL `new_query_span` helper under a
+    /// subscriber shaped exactly like `init()`'s OTLP branch now is: a real
+    /// `fmt::layer` carrying a warn-default console filter, PLUS the
+    /// capturing layer standing in for the real `OpenTelemetryLayer`,
+    /// carrying its own `observability::otlp_export_filter()` via per-layer
+    /// filtering (`Layer::with_filter`). If per-layer filtering ever
+    /// regresses back to one shared filter, this span stops being captured
+    /// and the test fails.
+    #[test]
+    fn query_span_exports_under_the_real_otlp_layer_filter() {
+        let (subscriber, captured) =
+            crate::observability::test_support::capturing_subscriber_with_filters(
+                tracing_subscriber::EnvFilter::new("warn"),
+                crate::observability::otlp_export_filter(),
+            );
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        {
+            let _entered = new_query_span(7, "session", "backend-0", "SELECT 1").entered();
+            // Span closes (and is captured) when `_entered` drops here.
+        }
+
+        let captured = captured.lock().unwrap();
+        assert!(
+            captured.span_named("pg_query").is_some(),
+            "pg_query span must be exported under the OTLP layer's own info filter, even \
+             though the console/log filter defaults to warn — captured spans: {:?}",
+            captured.spans.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn classify_pool_error_for_metrics_records_request_shed_on_real_message() {
+        // Same fixture as tcp_pool.rs's test_breaker_opens_and_sheds_when_backend_down:
+        // a dead local port trips the breaker after `failure_threshold` real
+        // connection failures, then the next `get()` is shed by the breaker.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let protocol = Arc::new(PostgresProtocol::new()) as Arc<dyn Protocol>;
+        let config = ProtocolConfig {
+            host: "127.0.0.1".to_string(),
+            port: dead_port,
+            database: Some("test".to_string()),
+            user: Some("postgres".to_string()),
+            password: Some("postgres".to_string()),
+        };
+        let tls_config = crate::config::TlsConfig::default();
+        let breaker = Arc::new(CircuitBreaker::new(
+            CircuitBreakerConfig {
+                enabled: true,
+                failure_threshold: 2,
+                success_threshold: 2,
+                window_secs: 30,
+                open_timeout_secs: 60,
+                use_health_monitor: false,
+            },
+            None,
+        ));
+
+        let pool = TcpConnectionPool::new(
+            protocol,
+            config,
+            &tls_config,
+            4,
+            None,
+            Some(Arc::clone(&breaker)),
+            None,
+            true,
+            500,
+        )
+        .expect("pool");
+
+        for _ in 0..2 {
+            assert!(pool.get().await.is_err(), "connect to dead backend should fail");
+        }
+
+        let err = match pool.get().await {
+            Ok(_) => panic!("breaker should shed the request"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+
+        let metrics = ProxyMetrics::new(100, HealthConfig::default());
+        classify_pool_error_for_metrics(&msg, &metrics);
+
+        assert_eq!(
+            metrics.pool_metrics().get_requests_shed_total(),
+            1,
+            "real tcp_pool.rs breaker-shed message {msg:?} must classify as a shed request"
+        );
+        assert_eq!(
+            metrics.pool_metrics().get_backend_connect_timeouts_total(),
+            0,
+            "a breaker shed must not also count as a backend connect timeout"
         );
     }
 }

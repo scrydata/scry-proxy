@@ -3,10 +3,113 @@
 //! Implements PgBouncer-compatible admin commands.
 
 use super::response::AdminResponse;
+use crate::config::{redacted_opt, AuthType, Config, PoolingStrategy, RedactedSecret, TlsSslMode};
 use crate::observability::ProxyMetrics;
-use crate::proxy::PoolManager;
+use crate::proxy::{AdminHandles, ClientState, PoolManager};
 use anyhow::Result;
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
+
+/// A single logical database as seen from config (the default `"*"` backend
+/// plus every entry in `config.databases`), joined with the key used to look
+/// it up in `AdminHandles::pool_managers` / `ServerRegistry`.
+///
+/// This is the single source of truth `SHOW DATABASES`/`SHOW POOLS`/
+/// `SHOW SERVERS` all build their rows from, so the three commands can never
+/// disagree about what a database's real name/host/port/user is (P4 §4.1).
+struct DatabaseEntry {
+    /// Client-facing name. For the default backend this is the backend's own
+    /// database name (there is no separate alias); for a `config.databases`
+    /// entry it is `DatabaseConfig::name`, exactly as configured.
+    name: String,
+    host: String,
+    port: u16,
+    /// The actual database name on the backend (may differ from `name` for a
+    /// named `config.databases` entry).
+    database: String,
+    user: String,
+    /// Configured pool size, used when no live pool exists to read from
+    /// (pooling disabled).
+    configured_pool_size: usize,
+    /// Key into `pool_managers` / `ServerRegistry::snapshot()` (`"*"` for the
+    /// default backend, `DatabaseConfig::name` otherwise).
+    pool_key: String,
+}
+
+/// Map a [`PoolingStrategy`] to its PgBouncer-style `pool_mode` string.
+/// `hybrid` is a Scry-specific extension beyond PgBouncer's vocabulary
+/// (session/transaction/statement) but is the real configured value, which is
+/// what truthfulness requires here.
+fn pool_mode_str(strategy: &PoolingStrategy) -> &'static str {
+    match strategy {
+        PoolingStrategy::Disabled => "disabled",
+        PoolingStrategy::Session => "session",
+        PoolingStrategy::Transaction => "transaction",
+        PoolingStrategy::Hybrid => "hybrid",
+    }
+}
+
+/// Render a [`TlsSslMode`] the way it's configured/serialized (lowercase,
+/// hyphenated), for `SHOW CONFIG` display.
+fn tls_mode_str(mode: &TlsSslMode) -> &'static str {
+    match mode {
+        TlsSslMode::Disable => "disable",
+        TlsSslMode::Allow => "allow",
+        TlsSslMode::Require => "require",
+        TlsSslMode::VerifyCa => "verify-ca",
+        TlsSslMode::VerifyFull => "verify-full",
+    }
+}
+
+/// Render an [`AuthType`] the way it's configured/serialized, for `SHOW
+/// CONFIG` display.
+fn auth_type_str(auth_type: &AuthType) -> &'static str {
+    match auth_type {
+        AuthType::Trust => "trust",
+        AuthType::Md5 => "md5",
+        AuthType::ScramSha256 => "scram-sha-256",
+        AuthType::Cert => "cert",
+    }
+}
+
+/// Render a `bool` config value the PgBouncer-ish way `SHOW CONFIG` uses.
+fn bool_str(value: bool) -> &'static str {
+    if value {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
+/// Render a non-secret `Option<String>` config value: the real value if set,
+/// or an honest `<unset>` marker (never a bare empty string, which would be
+/// indistinguishable from an intentionally-empty configured value).
+fn opt_str(value: &Option<String>) -> String {
+    value.clone().unwrap_or_else(|| "<unset>".to_string())
+}
+
+/// Split an `"host:port"` (or bracketed IPv6 `"[::1]:port"`) string into its
+/// two parts at the last colon. Falls back to `(addr, "0")` for anything else
+/// (e.g. the literal `"unix"` marker used for UNIX-socket clients).
+fn split_host_port(addr: &str) -> (String, String) {
+    match addr.rsplit_once(':') {
+        Some((host, port)) => (host.to_string(), port.to_string()),
+        None => (addr.to_string(), "0".to_string()),
+    }
+}
+
+/// Coarse [`ClientState`] rendered as a PgBouncer-style state string. Both
+/// variants render "active": a `ClientState::Admin` connection (the
+/// `pgbouncer` virtual console) is genuinely active for as long as it's
+/// connected; we just don't have a finer PgBouncer state machine
+/// (idle/used/waiting) yet (Task 1 limitation, carried forward).
+fn client_state_str(state: ClientState) -> &'static str {
+    match state {
+        ClientState::Active => "active",
+        ClientState::Admin => "active",
+    }
+}
 
 /// Parsed admin command
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,14 +187,70 @@ impl AdminCommand {
 
 /// Admin console for handling administrative commands
 pub struct AdminConsole {
-    pool_manager: Option<Arc<PoolManager>>,
+    /// Shared operational state: pool managers, reload/shutdown triggers,
+    /// config, and the client/server registries (WP-10, P4 §4.1). SHOW
+    /// commands (Task 2) read all report state from here; RELOAD/SHUTDOWN
+    /// (Tasks 4/5) will read the control surfaces.
+    handles: Arc<AdminHandles>,
     metrics: Arc<ProxyMetrics>,
 }
 
 impl AdminConsole {
-    /// Create a new admin console
-    pub fn new(pool_manager: Option<Arc<PoolManager>>, metrics: Arc<ProxyMetrics>) -> Self {
-        Self { pool_manager, metrics }
+    /// Create a new admin console from the shared [`AdminHandles`] and metrics.
+    ///
+    /// This is the interface WP-10 Tasks 2–5 depend on: the console reads all
+    /// report/control state through `handles` (plus `metrics` for SHOW STATS).
+    pub fn new(handles: Arc<AdminHandles>, metrics: Arc<ProxyMetrics>) -> Self {
+        Self { handles, metrics }
+    }
+
+    /// Every configured database (default backend + `config.databases`), in a
+    /// stable order (default first). Shared by `SHOW DATABASES`/`SHOW POOLS`/
+    /// `SHOW SERVERS` so they report a consistent view.
+    fn database_entries(&self) -> Vec<DatabaseEntry> {
+        let cfg = &self.handles.config;
+        let mut entries = vec![DatabaseEntry {
+            name: cfg.backend.database.clone(),
+            host: cfg.backend.host.clone(),
+            port: cfg.backend.port,
+            database: cfg.backend.database.clone(),
+            user: cfg.backend.user.clone(),
+            configured_pool_size: cfg.performance.pool_size,
+            pool_key: "*".to_string(),
+        }];
+        for db in &cfg.databases {
+            entries.push(DatabaseEntry {
+                name: db.name.clone(),
+                host: db.host.clone(),
+                port: db.port,
+                database: db.database.clone(),
+                user: db.user.clone(),
+                configured_pool_size: db.pool_size.unwrap_or(cfg.performance.pool_size),
+                pool_key: db.name.clone(),
+            });
+        }
+        entries
+    }
+
+    /// Count of currently-live (non-admin) clients per pool key, resolved the
+    /// same way the proxy itself resolves a client's startup database to a
+    /// pool (`pool_managers.get(db).or_else(|| pool_managers.get("*"))`, see
+    /// `server.rs`). Admin-console connections are excluded: they don't
+    /// occupy a backend pool slot.
+    fn live_clients_per_pool_key(&self) -> HashMap<String, usize> {
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for entry in self.handles.client_registry.snapshot() {
+            if entry.state == ClientState::Admin {
+                continue;
+            }
+            let key = if self.handles.pool_managers.contains_key(&entry.database) {
+                entry.database
+            } else {
+                "*".to_string()
+            };
+            *counts.entry(key).or_insert(0) += 1;
+        }
+        counts
     }
 
     /// Check if an SQL command is an admin command
@@ -149,24 +308,53 @@ impl AdminConsole {
     }
 
     fn show_pools(&self) -> Result<AdminResponse> {
-        let mut rows = Vec::new();
+        let entries = self.database_entries();
+        let live_clients = self.live_clients_per_pool_key();
+        let pool_mode = pool_mode_str(&self.handles.config.performance.connection_pooling);
 
-        if let Some(ref pm) = self.pool_manager {
-            let status = pm.pool().status();
-            rows.push(vec![
-                "default".to_string(),        // database
-                "scry".to_string(),           // user
-                status.size.to_string(),      // cl_active (approximate)
-                "0".to_string(),              // cl_waiting
-                status.available.to_string(), // sv_active
-                "0".to_string(),              // sv_idle
-                "0".to_string(),              // sv_used
-                "0".to_string(),              // sv_tested
-                "0".to_string(),              // sv_login
-                status.max_size.to_string(),  // maxwait
-                "transaction".to_string(),    // pool_mode
-            ]);
-        }
+        let rows = entries
+            .into_iter()
+            .map(|entry| {
+                let cl_active = live_clients.get(&entry.pool_key).copied().unwrap_or(0);
+                // cl_waiting/sv_active/sv_idle come from the live pool status
+                // and wait queue when pooling is enabled for this database;
+                // when pooling is disabled there is no pool to read (honest
+                // zero, not fabrication — it genuinely doesn't exist).
+                let (cl_waiting, sv_active, sv_idle) =
+                    match self.handles.pool_managers.get(&entry.pool_key) {
+                        Some(pm) => {
+                            let status = pm.pool().status();
+                            (
+                                pm.wait_queue_depth(),
+                                status.size.saturating_sub(status.available),
+                                status.available,
+                            )
+                        }
+                        None => (0, 0, 0),
+                    };
+
+                vec![
+                    entry.name,
+                    entry.user,
+                    cl_active.to_string(),
+                    cl_waiting.to_string(),
+                    sv_active.to_string(),
+                    sv_idle.to_string(),
+                    // sv_used/sv_tested/sv_login: `PoolStatus` doesn't track
+                    // these finer server-connection substates yet (candidate
+                    // follow-up) — honest zero, not fabrication.
+                    "0".to_string(),
+                    "0".to_string(),
+                    "0".to_string(),
+                    // maxwait: wait-time-in-queue isn't measured yet (the
+                    // prior value here reused the pool's `max_size`, a
+                    // different metric under the wrong label — honest zero
+                    // is more truthful than that).
+                    "0".to_string(),
+                    pool_mode.to_string(),
+                ]
+            })
+            .collect();
 
         Ok(AdminResponse::RowSet {
             columns: vec![
@@ -200,22 +388,35 @@ impl AdminConsole {
         // total_query_time in microseconds (use mean * count as approximation)
         let total_time_us = (latency.mean_micros * total_queries as f64) as u64;
 
+        // The real configured backend database name (was hardcoded "default").
+        // `ProxyMetrics` is process-global, not siloed per database, so this
+        // single row represents all traffic, labeled with the primary/default
+        // database rather than fabricating per-db splits we don't measure.
+        let database_name = self.handles.config.backend.database.clone();
+
         let rows = vec![vec![
-            "default".to_string(),                   // database
-            total_queries.to_string(),               // total_xact_count
-            total_queries.to_string(),               // total_query_count
-            "0".to_string(),                         // total_received
-            "0".to_string(),                         // total_sent
-            total_time_us.to_string(),               // total_xact_time
-            total_time_us.to_string(),               // total_query_time
-            "0".to_string(),                         // total_wait_time
-            avg_queries_per_sec.to_string(),         // avg_xact_count
-            avg_queries_per_sec.to_string(),         // avg_query_count
-            "0".to_string(),                         // avg_recv
-            "0".to_string(),                         // avg_sent
+            database_name,
+            total_queries.to_string(), // total_xact_count
+            total_queries.to_string(), // total_query_count
+            // total_received/total_sent: byte counters are not collected
+            // anywhere today (no hot-path byte counting exists) — honest
+            // zero (candidate follow-up; NOT added in this task per scope:
+            // latency budget + no new hot-path counters).
+            "0".to_string(),
+            "0".to_string(),
+            total_time_us.to_string(), // total_xact_time
+            total_time_us.to_string(), // total_query_time
+            // total_wait_time: pool wait-time isn't measured yet — honest zero.
+            "0".to_string(),
+            avg_queries_per_sec.to_string(), // avg_xact_count
+            avg_queries_per_sec.to_string(), // avg_query_count
+            // avg_recv/avg_sent: same as total_received/total_sent above.
+            "0".to_string(),
+            "0".to_string(),
             latency.mean_micros.round().to_string(), // avg_xact_time
             latency.mean_micros.round().to_string(), // avg_query_time
-            "0".to_string(),                         // avg_wait_time
+            // avg_wait_time: same as total_wait_time above.
+            "0".to_string(),
         ]];
 
         Ok(AdminResponse::RowSet {
@@ -241,21 +442,57 @@ impl AdminConsole {
     }
 
     fn show_databases(&self) -> Result<AdminResponse> {
-        // For now, just show the default database
-        let rows = vec![vec![
-            "default".to_string(),     // name
-            "localhost".to_string(),   // host
-            "5432".to_string(),        // port
-            "postgres".to_string(),    // database
-            "".to_string(),            // force_user
-            "10".to_string(),          // pool_size
-            "0".to_string(),           // reserve_pool
-            "transaction".to_string(), // pool_mode
-            "0".to_string(),           // max_connections
-            "0".to_string(),           // current_connections
-            "0".to_string(),           // paused
-            "0".to_string(),           // disabled
-        ]];
+        let entries = self.database_entries();
+        let live_clients = self.live_clients_per_pool_key();
+        let pool_mode = pool_mode_str(&self.handles.config.performance.connection_pooling);
+        // No per-database connection cap is configured; the real constraint
+        // is the proxy-wide `proxy.max_connections`. Reporting that (rather
+        // than a fabricated 0) is the honest value available.
+        let max_connections = self.handles.config.proxy.max_connections;
+
+        let rows = entries
+            .into_iter()
+            .map(|entry| {
+                let pool_size = self
+                    .handles
+                    .pool_managers
+                    .get(&entry.pool_key)
+                    .map(|pm| pm.pool().status().max_size)
+                    .unwrap_or(entry.configured_pool_size);
+                let current_connections = live_clients.get(&entry.pool_key).copied().unwrap_or(0);
+                // paused: live PAUSE/RESUME state (WP-10 Task 4) via the same
+                // `PoolManager` this database's other columns are resolved
+                // from — `paused` is the negation of `is_accepting()`. A
+                // database with no resolvable pool manager reports unpaused
+                // rather than fabricating a paused state.
+                let paused = self
+                    .handles
+                    .pool_managers
+                    .get(&entry.pool_key)
+                    .map(|pm| !pm.is_accepting())
+                    .unwrap_or(false);
+
+                vec![
+                    entry.name,
+                    entry.host,
+                    entry.port.to_string(),
+                    entry.database,
+                    // force_user: no forced-user-override concept exists in
+                    // config today — honestly always empty, not fabricated.
+                    String::new(),
+                    pool_size.to_string(),
+                    // reserve_pool: no reserve-pool feature exists yet.
+                    "0".to_string(),
+                    pool_mode.to_string(),
+                    max_connections.to_string(),
+                    current_connections.to_string(),
+                    if paused { "1".to_string() } else { "0".to_string() },
+                    // disabled: no disable-database concept exists yet —
+                    // honest zero, not fabrication.
+                    "0".to_string(),
+                ]
+            })
+            .collect();
 
         Ok(AdminResponse::RowSet {
             columns: vec![
@@ -277,7 +514,49 @@ impl AdminConsole {
     }
 
     fn show_clients(&self) -> Result<AdminResponse> {
-        // Return empty for now - would need connection tracking
+        // The proxy's own listen address is real and known even though we
+        // don't track a per-connection local socket — real value, not a
+        // fabricated placeholder.
+        let (local_addr, local_port) = split_host_port(&self.handles.config.proxy.listen_address);
+
+        let mut entries = self.handles.client_registry.snapshot();
+        // Deterministic order for callers/tests.
+        entries.sort_by_key(|e| e.conn_id);
+
+        let rows = entries
+            .into_iter()
+            .map(|entry| {
+                let (addr, port) = split_host_port(&entry.addr);
+                vec![
+                    "C".to_string(), // type: PgBouncer client-connection type code
+                    entry.user,
+                    entry.database,
+                    client_state_str(entry.state).to_string(),
+                    addr,
+                    port,
+                    local_addr.clone(),
+                    local_port.clone(),
+                    // connect_time/request_time: `ClientEntry` stores a
+                    // monotonic `Instant`, which has no wall-clock
+                    // representation, so we report the real elapsed time
+                    // since the event rather than fabricate an absolute
+                    // timestamp.
+                    format!("{:.3}s ago", entry.connect_time.elapsed().as_secs_f64()),
+                    format!("{:.3}s ago", entry.last_request_time.elapsed().as_secs_f64()),
+                    // wait/wait_us/close_needed/ptr/link/remote_pid: none of
+                    // these are tracked per-client today — honest zero/empty,
+                    // not fabrication (candidate follow-up).
+                    "0".to_string(),
+                    "0".to_string(),
+                    "0".to_string(),
+                    "0".to_string(),
+                    String::new(),
+                    "0".to_string(),
+                    if entry.tls { "1".to_string() } else { "0".to_string() },
+                ]
+            })
+            .collect();
+
         Ok(AdminResponse::RowSet {
             columns: vec![
                 "type".to_string(),
@@ -298,12 +577,62 @@ impl AdminConsole {
                 "remote_pid".to_string(),
                 "tls".to_string(),
             ],
-            rows: vec![],
+            rows,
         })
     }
 
     fn show_servers(&self) -> Result<AdminResponse> {
-        // Return empty for now - would need backend connection tracking
+        // Join pool-key -> (name, user) so SHOW SERVERS agrees with SHOW
+        // DATABASES/SHOW POOLS about what each pool's database/user is.
+        let name_and_user_by_pool_key: HashMap<String, (String, String)> =
+            self.database_entries().into_iter().map(|e| (e.pool_key, (e.name, e.user))).collect();
+
+        let rows = self
+            .handles
+            .server_registry
+            .snapshot()
+            .into_iter()
+            .map(|snap| {
+                let (addr, port) = split_host_port(&snap.backend_addr);
+                let (database, user) = name_and_user_by_pool_key
+                    .get(&snap.database)
+                    .cloned()
+                    .unwrap_or_else(|| (snap.database.clone(), String::new()));
+
+                vec![
+                    "S".to_string(), // type: PgBouncer server-connection type code
+                    user,
+                    database,
+                    // state: pool-level granularity only (Task 1 limitation:
+                    // deadpool exposes no stable per-socket handle). A pool
+                    // with any available connection is reported "idle",
+                    // otherwise "active" (every connection currently
+                    // checked out) — real, aggregate state, not a fabricated
+                    // per-socket row.
+                    if snap.available > 0 { "idle".to_string() } else { "active".to_string() },
+                    addr,
+                    port,
+                    // local_addr/local_port/connect_time/request_time: not
+                    // tracked at pool granularity today — honest empty.
+                    String::new(),
+                    "0".to_string(),
+                    String::new(),
+                    String::new(),
+                    // wait/wait_us/close_needed/ptr/link/remote_pid: no live
+                    // source at pool granularity — honest zero/empty.
+                    "0".to_string(),
+                    "0".to_string(),
+                    "0".to_string(),
+                    "0".to_string(),
+                    String::new(),
+                    "0".to_string(),
+                    // tls: backend (server-side) TLS is not yet surfaced
+                    // per-pool in `ServerPoolSnapshot` — honest zero.
+                    "0".to_string(),
+                ]
+            })
+            .collect();
+
         Ok(AdminResponse::RowSet {
             columns: vec![
                 "type".to_string(),
@@ -324,7 +653,7 @@ impl AdminConsole {
                 "remote_pid".to_string(),
                 "tls".to_string(),
             ],
-            rows: vec![],
+            rows,
         })
     }
 
@@ -336,8 +665,272 @@ impl AdminConsole {
         })
     }
 
+    /// `SHOW CONFIG` — the REAL running configuration (WP-10, P4 §4.3), not
+    /// the 3 hardcoded rows this used to return.
+    ///
+    /// Security-sensitive (P4 §5.5): `backend.password`, `admin.admin_password`,
+    /// `publisher.http_api_key`, and `publisher.anonymize_salt` must NEVER
+    /// appear in the `value` column. Redaction is by construction rather than
+    /// hand-formatted-and-hoped-remembered: every secret's display string is
+    /// produced by routing it through `redacted_opt`/`RedactedSecret` —
+    /// `config/mod.rs`'s own redacting `Debug` machinery (already covered by
+    /// its own leak-regression test at `config/mod.rs:1161-1186`) — so this
+    /// can't silently drift from that redaction. The closures below only ever
+    /// inspect a secret's `Option`/emptiness; the plaintext value itself is
+    /// never read or formatted.
+    ///
+    /// `config.databases` (per-database backend overrides, each with their
+    /// own `password`) is deliberately NOT dumped here: today those don't have
+    /// a redacting `Debug` of their own (a separate, narrower pre-existing gap
+    /// — see report), so the safest thing this handler can do is not touch
+    /// them at all, exactly like `SHOW DATABASES` already doesn't emit
+    /// per-database passwords.
     fn show_config(&self) -> Result<AdminResponse> {
-        // Return basic config info
+        let cfg = &self.handles.config;
+        let default_cfg = Config::default();
+
+        // The one and only place the redaction placeholder text is produced —
+        // reusing `RedactedSecret`'s Debug impl instead of a second
+        // hand-typed `"<redacted>"` literal.
+        let redacted = format!("{:?}", RedactedSecret);
+        // Presence-only: `redacted_opt` turns `Some(secret)` into
+        // `Some(RedactedSecret)` and `None` stays `None` — the secret's value
+        // is never bound to a variable here.
+        let opt_secret_str = |value: &Option<String>| match redacted_opt(value) {
+            Some(_) => redacted.clone(),
+            None => "<unset>".to_string(),
+        };
+        // `backend.password` is a required `String`, not `Option<String>`;
+        // only its emptiness is inspected, never its contents.
+        let required_secret_str = |value: &str| {
+            if value.is_empty() {
+                "<unset>".to_string()
+            } else {
+                redacted.clone()
+            }
+        };
+
+        let mut rows: Vec<Vec<String>> = Vec::new();
+        let mut push = |key: &str, value: String, default: String, changeable: bool| {
+            rows.push(vec![key.to_string(), value, default, bool_str(changeable).to_string()]);
+        };
+
+        // RELOAD is functional (WP-10 Task 4) but scoped to `auth_file` only;
+        // none of the keys displayed here are RELOAD-mutable, so `changeable`
+        // is honestly `no` across the board
+        // rather than a fabricated `yes` copied from the old canned rows.
+        const CHANGEABLE: bool = false;
+
+        // -- pooling / connection limits (PgBouncer-compatible key names) --
+        push(
+            "pool_mode",
+            pool_mode_str(&cfg.performance.connection_pooling).to_string(),
+            pool_mode_str(&default_cfg.performance.connection_pooling).to_string(),
+            CHANGEABLE,
+        );
+        push(
+            "max_client_conn",
+            cfg.proxy.max_connections.to_string(),
+            default_cfg.proxy.max_connections.to_string(),
+            CHANGEABLE,
+        );
+        push(
+            "default_pool_size",
+            cfg.performance.pool_size.to_string(),
+            default_cfg.performance.pool_size.to_string(),
+            CHANGEABLE,
+        );
+
+        // -- proxy --
+        push(
+            "proxy.listen_address",
+            cfg.proxy.listen_address.clone(),
+            default_cfg.proxy.listen_address.clone(),
+            CHANGEABLE,
+        );
+        push(
+            "proxy.shutdown_timeout_secs",
+            cfg.proxy.shutdown_timeout_secs.to_string(),
+            default_cfg.proxy.shutdown_timeout_secs.to_string(),
+            CHANGEABLE,
+        );
+
+        // -- backend (default database) --
+        push(
+            "backend.host",
+            cfg.backend.host.clone(),
+            default_cfg.backend.host.clone(),
+            CHANGEABLE,
+        );
+        push(
+            "backend.port",
+            cfg.backend.port.to_string(),
+            default_cfg.backend.port.to_string(),
+            CHANGEABLE,
+        );
+        push(
+            "backend.database",
+            cfg.backend.database.clone(),
+            default_cfg.backend.database.clone(),
+            CHANGEABLE,
+        );
+        push(
+            "backend.user",
+            cfg.backend.user.clone(),
+            default_cfg.backend.user.clone(),
+            CHANGEABLE,
+        );
+        // SECRET.
+        push(
+            "backend.password",
+            required_secret_str(&cfg.backend.password),
+            required_secret_str(&default_cfg.backend.password),
+            CHANGEABLE,
+        );
+
+        // -- performance / pool timeouts --
+        push(
+            "performance.pool_min_idle",
+            cfg.performance.pool_min_idle.to_string(),
+            default_cfg.performance.pool_min_idle.to_string(),
+            CHANGEABLE,
+        );
+        push(
+            "performance.pool_timeout_secs",
+            cfg.performance.pool_timeout_secs.to_string(),
+            default_cfg.performance.pool_timeout_secs.to_string(),
+            CHANGEABLE,
+        );
+        push(
+            "performance.query_timeout_secs",
+            cfg.performance.query_timeout_secs.to_string(),
+            default_cfg.performance.query_timeout_secs.to_string(),
+            CHANGEABLE,
+        );
+
+        // -- TLS --
+        push(
+            "tls.client_tls_sslmode",
+            tls_mode_str(&cfg.tls.client_tls_sslmode).to_string(),
+            tls_mode_str(&default_cfg.tls.client_tls_sslmode).to_string(),
+            CHANGEABLE,
+        );
+        push(
+            "tls.server_tls_sslmode",
+            tls_mode_str(&cfg.tls.server_tls_sslmode).to_string(),
+            tls_mode_str(&default_cfg.tls.server_tls_sslmode).to_string(),
+            CHANGEABLE,
+        );
+
+        // -- auth --
+        push(
+            "auth.auth_type",
+            auth_type_str(&cfg.auth.auth_type).to_string(),
+            auth_type_str(&default_cfg.auth.auth_type).to_string(),
+            CHANGEABLE,
+        );
+        push(
+            "auth.allow_trust",
+            bool_str(cfg.auth.allow_trust).to_string(),
+            bool_str(default_cfg.auth.allow_trust).to_string(),
+            CHANGEABLE,
+        );
+
+        // -- admin console --
+        push(
+            "admin.enabled",
+            bool_str(cfg.admin.enabled).to_string(),
+            bool_str(default_cfg.admin.enabled).to_string(),
+            CHANGEABLE,
+        );
+        // SECRET.
+        push(
+            "admin.admin_password",
+            opt_secret_str(&cfg.admin.admin_password),
+            opt_secret_str(&default_cfg.admin.admin_password),
+            CHANGEABLE,
+        );
+
+        // -- observability / metrics --
+        push(
+            "observability.enable_metrics_server",
+            bool_str(cfg.observability.enable_metrics_server).to_string(),
+            bool_str(default_cfg.observability.enable_metrics_server).to_string(),
+            CHANGEABLE,
+        );
+        push(
+            "observability.metrics_server_address",
+            cfg.observability.metrics_server_address.clone(),
+            default_cfg.observability.metrics_server_address.clone(),
+            CHANGEABLE,
+        );
+        push(
+            "observability.metrics_allow_non_loopback",
+            bool_str(cfg.observability.metrics_allow_non_loopback).to_string(),
+            bool_str(default_cfg.observability.metrics_allow_non_loopback).to_string(),
+            CHANGEABLE,
+        );
+        push(
+            "observability.enable_debug_endpoints",
+            bool_str(cfg.observability.enable_debug_endpoints).to_string(),
+            bool_str(default_cfg.observability.enable_debug_endpoints).to_string(),
+            CHANGEABLE,
+        );
+
+        // -- publisher --
+        push(
+            "publisher.enabled",
+            bool_str(cfg.publisher.enabled).to_string(),
+            bool_str(default_cfg.publisher.enabled).to_string(),
+            CHANGEABLE,
+        );
+        push(
+            "publisher.publisher_type",
+            cfg.publisher.publisher_type.clone(),
+            default_cfg.publisher.publisher_type.clone(),
+            CHANGEABLE,
+        );
+        push(
+            "publisher.http_endpoint",
+            opt_str(&cfg.publisher.http_endpoint),
+            opt_str(&default_cfg.publisher.http_endpoint),
+            CHANGEABLE,
+        );
+        // SECRET.
+        push(
+            "publisher.http_api_key",
+            opt_secret_str(&cfg.publisher.http_api_key),
+            opt_secret_str(&default_cfg.publisher.http_api_key),
+            CHANGEABLE,
+        );
+        push(
+            "publisher.anonymize",
+            bool_str(cfg.publisher.anonymize).to_string(),
+            bool_str(default_cfg.publisher.anonymize).to_string(),
+            CHANGEABLE,
+        );
+        // SECRET.
+        push(
+            "publisher.anonymize_salt",
+            opt_secret_str(&cfg.publisher.anonymize_salt),
+            opt_secret_str(&default_cfg.publisher.anonymize_salt),
+            CHANGEABLE,
+        );
+
+        // -- resilience --
+        push(
+            "resilience.circuit_breaker.enabled",
+            bool_str(cfg.resilience.circuit_breaker.enabled).to_string(),
+            bool_str(default_cfg.resilience.circuit_breaker.enabled).to_string(),
+            CHANGEABLE,
+        );
+        push(
+            "resilience.healthcheck.active_enabled",
+            bool_str(cfg.resilience.healthcheck.active_enabled).to_string(),
+            bool_str(default_cfg.resilience.healthcheck.active_enabled).to_string(),
+            CHANGEABLE,
+        );
+
         Ok(AdminResponse::RowSet {
             columns: vec![
                 "key".to_string(),
@@ -345,51 +938,195 @@ impl AdminConsole {
                 "default".to_string(),
                 "changeable".to_string(),
             ],
-            rows: vec![
-                vec![
-                    "pool_mode".to_string(),
-                    "transaction".to_string(),
-                    "transaction".to_string(),
-                    "yes".to_string(),
-                ],
-                vec![
-                    "max_client_conn".to_string(),
-                    "100".to_string(),
-                    "100".to_string(),
-                    "yes".to_string(),
-                ],
-                vec![
-                    "default_pool_size".to_string(),
-                    "10".to_string(),
-                    "10".to_string(),
-                    "yes".to_string(),
-                ],
-            ],
+            rows,
         })
     }
 
-    async fn pause(&self, _database: Option<String>) -> Result<AdminResponse> {
-        // TODO: Implement pause functionality
-        Ok(AdminResponse::CommandComplete { tag: "PAUSE".to_string() })
+    /// Resolve a client-supplied database name to its live [`PoolManager`],
+    /// the same way the proxy resolves a startup database to a pool. A name is
+    /// accepted if it is a direct pool key (a `config.databases` entry, or the
+    /// literal `"*"`) OR the client-facing name of a configured database (e.g.
+    /// the default backend's own database name, whose pool key is `"*"`).
+    /// Returns `None` for a genuinely unknown database — the caller turns that
+    /// into an honest `ErrorResponse` rather than silently falling back to the
+    /// default pool (which would pause something the operator didn't name).
+    fn resolve_pool_manager(&self, db: &str) -> Option<Arc<PoolManager>> {
+        if let Some(pm) = self.handles.pool_managers.get(db) {
+            return Some(Arc::clone(pm));
+        }
+        let pool_key = self
+            .database_entries()
+            .into_iter()
+            .find(|e| e.name.eq_ignore_ascii_case(db))
+            .map(|e| e.pool_key)?;
+        self.handles.pool_managers.get(&pool_key).map(Arc::clone)
     }
 
-    async fn resume(&self, _database: Option<String>) -> Result<AdminResponse> {
-        // TODO: Implement resume functionality
-        Ok(AdminResponse::CommandComplete { tag: "RESUME".to_string() })
+    /// PAUSE [db] — gate NEW backend acquisition (WP-10 Task 4, P4 §4.2).
+    ///
+    /// `PAUSE db` pauses the one named pool (honest error if the database is
+    /// unknown); bare `PAUSE` pauses every configured pool. In-flight
+    /// connections are unaffected — only new acquisition is blocked, surfaced
+    /// to new clients as a clean `ErrorResponse` from the connection handler.
+    async fn pause(&self, database: Option<String>) -> Result<AdminResponse> {
+        match database {
+            Some(db) => match self.resolve_pool_manager(&db) {
+                Some(pm) => {
+                    pm.pause();
+                    Ok(AdminResponse::CommandComplete { tag: "PAUSE".to_string() })
+                }
+                None => Ok(AdminResponse::Error { message: format!("no such database: {db}") }),
+            },
+            None => {
+                for pm in self.handles.pool_managers.values() {
+                    pm.pause();
+                }
+                Ok(AdminResponse::CommandComplete { tag: "PAUSE".to_string() })
+            }
+        }
     }
 
+    /// RESUME [db] — the inverse of [`pause`](Self::pause): re-enable new
+    /// backend acquisition on the named pool, or on every pool for bare
+    /// `RESUME`. Honest error for an unknown named database.
+    async fn resume(&self, database: Option<String>) -> Result<AdminResponse> {
+        match database {
+            Some(db) => match self.resolve_pool_manager(&db) {
+                Some(pm) => {
+                    pm.resume();
+                    Ok(AdminResponse::CommandComplete { tag: "RESUME".to_string() })
+                }
+                None => Ok(AdminResponse::Error { message: format!("no such database: {db}") }),
+            },
+            None => {
+                for pm in self.handles.pool_managers.values() {
+                    pm.resume();
+                }
+                Ok(AdminResponse::CommandComplete { tag: "RESUME".to_string() })
+            }
+        }
+    }
+
+    /// RELOAD — actually attempt the config reload and report the REAL outcome
+    /// (WP-10 Task 4, P4 §5.4). Runs the ONE shared reload closure (the same one
+    /// SIGHUP uses); on success returns `CommandComplete`, on failure returns an
+    /// `ErrorResponse` carrying the real error — never a false `CommandComplete`.
+    /// Reload scope is auth_file only (documented limitation).
     async fn reload(&self) -> Result<AdminResponse> {
-        // TODO: Implement config reload
-        Ok(AdminResponse::CommandComplete { tag: "RELOAD".to_string() })
+        match (self.handles.reload_fn)() {
+            Ok(()) => Ok(AdminResponse::CommandComplete { tag: "RELOAD".to_string() }),
+            Err(e) => Ok(AdminResponse::Error { message: format!("reload failed: {e}") }),
+        }
     }
 
-    async fn shutdown(&self, _wait: bool) -> Result<AdminResponse> {
-        // TODO: Implement shutdown signal
-        Ok(AdminResponse::CommandComplete { tag: "SHUTDOWN".to_string() })
+    /// SHUTDOWN [WAIT] — initiate the REAL graceful drain (WP-10 Task 5, P4
+    /// §4.2/§5.4), the same drain `run()` performs on SIGINT/SIGTERM.
+    ///
+    /// Fires `AdminHandles::shutdown_trigger`, which `run()`'s `tokio::select!`
+    /// observes exactly like an OS signal: it stops accepting new connections
+    /// and drains the active ones (bounded by `shutdown_timeout_secs`, then
+    /// force-abort). Returns an honest `ErrorResponse` if the trigger can no
+    /// longer initiate a drain (shutdown already in progress / `run()` no longer
+    /// listening) — never a false `CommandComplete`.
+    ///
+    /// WAIT semantics: plain `SHUTDOWN` returns `CommandComplete` immediately
+    /// (the drain proceeds; this admin connection is itself torn down as part of
+    /// the drain — PgBouncer-like). `SHUTDOWN WAIT` blocks on the
+    /// drain-completion signal (set by `run()` when `drain_connections`
+    /// returns), bounded by `shutdown_timeout_secs` + slack so it can never hang
+    /// past the drain's own bound.
+    ///
+    /// Deadlock note: when WAIT is issued over a connection that is itself part
+    /// of the drained set (the normal case), that connection's own task is one
+    /// of the `connection_tasks` `drain_connections` is waiting on — so the
+    /// completion signal can't fire until this very task finishes, but this
+    /// task is blocked awaiting that same signal. The only way out is the hard
+    /// `shutdown_timeout_secs` force-abort, which tears the connection down
+    /// abruptly (no `CommandComplete`, no response at all) — still bounded,
+    /// never an infinite hang, but distinctly worse than the honest timeout
+    /// error below (there the connection survives to receive it). WAIT's
+    /// distinct value over plain SHUTDOWN is for out-of-band callers holding
+    /// these handles directly, not for the connection being drained.
+    async fn shutdown(&self, wait: bool) -> Result<AdminResponse> {
+        // Subscribe to the completion signal BEFORE triggering, so a fast drain
+        // can't flip-and-be-missed between trigger and await.
+        let mut drain_rx = self.handles.subscribe_drain_complete();
+
+        if !self.handles.trigger_shutdown() {
+            return Ok(AdminResponse::Error {
+                message: "shutdown already in progress (or the server is no longer accepting the \
+                          shutdown signal)"
+                    .to_string(),
+            });
+        }
+
+        if !wait {
+            return Ok(AdminResponse::CommandComplete { tag: "SHUTDOWN".to_string() });
+        }
+
+        // WAIT: block until the drain completes, bounded so we never hang past
+        // the drain's own timeout (+ slack for the force-abort/flush tail).
+        // The trigger above has already fired regardless of what happens here —
+        // shutdown is proceeding in the background either way. Only a confirmed
+        // drain (Ok(Ok(_))) earns a `CommandComplete`; if the outer bound
+        // elapses first, or the watch sender is dropped without ever observing
+        // `true`, we must not claim completion we haven't confirmed — return a
+        // distinct honest `Error` instead (WP-10: no false success).
+        let bound = Duration::from_secs(self.handles.config.proxy.shutdown_timeout_secs + 2);
+        let result = tokio::time::timeout(bound, drain_rx.wait_for(|done| *done)).await;
+        match result {
+            Ok(Ok(_)) => Ok(AdminResponse::CommandComplete { tag: "SHUTDOWN".to_string() }),
+            Ok(Err(_)) => Ok(AdminResponse::Error {
+                message: format!(
+                    "shutdown initiated but drain completion signal was lost before confirming \
+                     within {}s (drain proceeding in background)",
+                    bound.as_secs()
+                ),
+            }),
+            Err(_) => Ok(AdminResponse::Error {
+                message: format!(
+                    "shutdown initiated but drain did not complete within {}s (drain proceeding \
+                     in background)",
+                    bound.as_secs()
+                ),
+            }),
+        }
     }
 
-    async fn kill(&self, _database: Option<String>) -> Result<AdminResponse> {
-        // TODO: Implement kill functionality
-        Ok(AdminResponse::CommandComplete { tag: "KILL".to_string() })
+    /// KILL [db] — forcibly disconnect all live client connections for a
+    /// database (WP-10 Task 5, P4 §4.2/§5.4).
+    ///
+    /// Requires a database argument (bare `KILL` is an error). Validates `db`
+    /// against the configured databases and returns an honest `ErrorResponse`
+    /// for an unknown one — never a false `CommandComplete`. For a known db it
+    /// aborts every matching client's task (closing its client socket) and
+    /// removes its registry entry, returning the count killed in the tag.
+    ///
+    /// The backend connections those clients held return to the pool and are
+    /// recycled by the existing pool hygiene on next checkout. The admin
+    /// (`pgbouncer`) console is never a configured database, so `KILL` can never
+    /// target the admin connection issuing it.
+    async fn kill(&self, database: Option<String>) -> Result<AdminResponse> {
+        let db = match database {
+            Some(db) => db,
+            None => {
+                return Ok(AdminResponse::Error {
+                    message: "KILL requires a database name (usage: KILL <db>)".to_string(),
+                });
+            }
+        };
+
+        // Honest error for an unknown database (checked against config, so it
+        // works regardless of whether pooling is enabled).
+        let known = self
+            .database_entries()
+            .iter()
+            .any(|e| e.name.eq_ignore_ascii_case(&db) || e.pool_key.eq_ignore_ascii_case(&db));
+        if !known {
+            return Ok(AdminResponse::Error { message: format!("no such database: {db}") });
+        }
+
+        let killed = self.handles.client_registry.kill_by_database(&db);
+        Ok(AdminResponse::CommandComplete { tag: format!("KILL {}", killed.len()) })
     }
 }

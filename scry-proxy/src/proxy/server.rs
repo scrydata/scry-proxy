@@ -1,13 +1,14 @@
 use super::{
-    ConnectionHandler, EventBatcher, PoolManager, PoolManagerConfig, TcpConnectionPool, WaitQueue,
+    AdminHandles, ClientEntry, ClientRegistry, ClientState, ConnectionHandler, EventBatcher,
+    PoolManager, PoolManagerConfig, TcpConnectionPool, WaitQueue,
 };
 use crate::admin::{AdminConsole, AdminResponse, ADMIN_DATABASE};
 use crate::auth::FileAuthenticator;
-use crate::config::{AdminConfig, AuthType, Config, DatabaseConfig, PoolingStrategy, TlsSslMode};
+use crate::config::{AuthType, Config, DatabaseConfig, PoolingStrategy, TlsSslMode};
 use crate::observability::ProxyMetrics;
 use crate::protocol::{
     build_auth_cleartext_password, build_auth_ok, build_error_response, parse_password_message,
-    Protocol, ProtocolConfig, ProtocolRegistry, StartupMessage,
+    read_startup_message, Protocol, ProtocolConfig, ProtocolRegistry, StartupMessage,
 };
 use crate::resilience::{ActiveHealthcheck, CircuitBreaker};
 use crate::routing::DatabaseRouter;
@@ -24,18 +25,27 @@ use tokio::net::TcpListener;
 use tokio::net::UnixListener;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, warn, Instrument};
 
-/// RAII guard to decrement connection counter on drop
+/// RAII guard that brackets a connection's lifetime: decrements the active
+/// connection counter/metric AND removes the connection from the client
+/// registry on drop. Because it drops on *every* exit path (clean close,
+/// error, terminate, task abort), the registry can never hold a stale entry.
 struct ConnectionCountGuard {
     counter: Arc<AtomicUsize>,
     metrics: Arc<ProxyMetrics>,
+    /// Registry to deregister from on drop (WP-10, P4 §4.1).
+    client_registry: Arc<ClientRegistry>,
+    /// Connection id to remove from the registry. Deregistration is a no-op if
+    /// the connection was never registered (identity never became known).
+    conn_id: u64,
 }
 
 impl Drop for ConnectionCountGuard {
     fn drop(&mut self) {
         self.counter.fetch_sub(1, Ordering::Relaxed);
         self.metrics.decrement_active_connections();
+        self.client_registry.deregister(self.conn_id);
     }
 }
 
@@ -53,7 +63,10 @@ pub struct ProxyServer {
     router: DatabaseRouter,
     metrics: Arc<ProxyMetrics>,
     tls_config: Option<Arc<ServerConfig>>,
-    authenticator: std::sync::RwLock<Option<Arc<FileAuthenticator>>>,
+    /// Hot-reloadable authenticator, `Arc`-shared with the reload closure
+    /// (`AdminHandles::reload_fn`) so both the SIGHUP path and admin `RELOAD`
+    /// swap the SAME cell that live connection handlers read (WP-10 Task 4).
+    authenticator: Arc<std::sync::RwLock<Option<Arc<FileAuthenticator>>>>,
     /// Channel to trigger config reload (e.g., on SIGHUP)
     #[allow(dead_code)]
     reload_trigger: watch::Receiver<()>,
@@ -61,6 +74,10 @@ pub struct ProxyServer {
     reload_sender: watch::Sender<()>,
     /// Current active connection count (atomic for lock-free access)
     active_connections: Arc<AtomicUsize>,
+    /// Shared operational state threaded into every admin connection: pool
+    /// managers, reload/shutdown handles, config, and the client/server
+    /// registries (WP-10, P4 §4.1). Constructed once here in `new`.
+    admin_handles: Arc<AdminHandles>,
 }
 
 impl ProxyServer {
@@ -367,8 +384,39 @@ impl ProxyServer {
         // Create reload channel for SIGHUP config reload
         let (reload_sender, reload_trigger) = watch::channel(());
 
+        // Programmatic shutdown channel (WP-10, P4 §4.1). `run()` subscribes to
+        // this and drains alongside the OS signals; a future admin SHUTDOWN
+        // (Task 5) sends `true` on the sender carried by `AdminHandles`.
+        let (shutdown_trigger, _shutdown_seed_rx) = watch::channel(false);
+
+        // Build the shared admin handles once, from the pieces above. `Config`
+        // becomes `Arc`-shared so both the server and the handles point at the
+        // same instance.
+        let config = Arc::new(config);
+
+        // The authenticator cell is `Arc`-shared between the server (whose
+        // connection handlers read it) and the reload closure (which swaps it),
+        // so a hot reload is visible to live connections.
+        let authenticator = Arc::new(std::sync::RwLock::new(authenticator));
+
+        // The ONE reload function. Both the SIGHUP path (via
+        // `apply_config_reload`) and admin `RELOAD` (via
+        // `AdminHandles::reload_fn`) call this exact closure, so the two paths
+        // can never drift. Scope is deliberately auth_file-only (documented
+        // limitation); it returns the real read/parse error instead of
+        // swallowing it, so a failed reload is reported honestly.
+        let reload_fn = Self::build_reload_fn(Arc::clone(&config), Arc::clone(&authenticator));
+
+        let admin_handles = AdminHandles::new(
+            Arc::clone(&config),
+            pool_managers.clone(),
+            reload_sender.clone(),
+            shutdown_trigger,
+            Arc::clone(&reload_fn),
+        );
+
         Ok(Self {
-            config: Arc::new(config),
+            config,
             listener,
             #[cfg(unix)]
             unix_listener,
@@ -377,10 +425,11 @@ impl ProxyServer {
             router,
             metrics,
             tls_config,
-            authenticator: std::sync::RwLock::new(authenticator),
+            authenticator,
             reload_trigger,
             reload_sender,
             active_connections: Arc::new(AtomicUsize::new(0)),
+            admin_handles,
         })
     }
 
@@ -422,20 +471,21 @@ impl ProxyServer {
         self.authenticator.read().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Write-lock the authenticator, recovering from a poisoned lock (see
-    /// [`Self::authenticator_read`]).
-    fn authenticator_write(
-        &self,
-    ) -> std::sync::RwLockWriteGuard<'_, Option<Arc<FileAuthenticator>>> {
-        self.authenticator.write().unwrap_or_else(|e| e.into_inner())
-    }
-
     /// Get the reload sender for use by signal handlers
     ///
     /// Returns a clone of the watch::Sender that can be used to trigger
     /// a config reload from external code (e.g., SIGHUP handler in main.rs).
     pub fn reload_sender(&self) -> watch::Sender<()> {
         self.reload_sender.clone()
+    }
+
+    /// Get the shared admin handles (pool managers, reload/shutdown triggers,
+    /// config, and the client/server registries).
+    ///
+    /// Exposed so callers (and tests) can inspect live registry state or wire a
+    /// programmatic shutdown, without owning the moved-into-`run` server.
+    pub fn admin_handles(&self) -> Arc<AdminHandles> {
+        Arc::clone(&self.admin_handles)
     }
 
     /// Get current active connection count
@@ -480,48 +530,57 @@ impl ProxyServer {
         total_created
     }
 
-    /// Apply a config reload, updating hot-reloadable settings
+    /// Build the single config-reload function shared by the SIGHUP path and
+    /// admin `RELOAD` (WP-10 Task 4, P4 §5.4).
     ///
-    /// Currently supports reloading:
-    /// - auth_file: Re-reads the userlist.txt file to update user credentials
+    /// Currently reloads ONLY `auth_file` (re-reads the userlist and atomically
+    /// swaps the shared authenticator cell). This scope is a documented
+    /// limitation — settings that require re-binding (listen_address,
+    /// unix_socket), pool recreation (pool sizes), or TLS-context recreation
+    /// (certificates) are NOT hot-reloaded.
     ///
-    /// Settings that require restart (not hot-reloaded):
-    /// - listen_address, unix_socket (requires re-binding)
-    /// - pool_size, pool settings (requires pool recreation)
-    /// - TLS certificates (requires TLS context recreation)
-    pub fn apply_config_reload(&self) {
-        info!("Applying config reload");
+    /// Unlike the pre-WP-10 version, it returns the real read/parse error
+    /// instead of swallowing it, so a failed reload is reported honestly to the
+    /// caller (admin `RELOAD` turns an `Err` into an `ErrorResponse`; the
+    /// SIGHUP path logs it and keeps the existing configuration).
+    fn build_reload_fn(
+        config: Arc<Config>,
+        authenticator: Arc<std::sync::RwLock<Option<Arc<FileAuthenticator>>>>,
+    ) -> Arc<dyn Fn() -> Result<()> + Send + Sync> {
+        Arc::new(move || {
+            info!("Applying config reload (scope: auth_file)");
 
-        // Reload auth file if configured
-        let auth_file = self.config.auth.auth_file.as_ref();
-        if let Some(auth_file) = auth_file {
-            match FileAuthenticator::from_file(auth_file) {
-                Ok(new_auth) => {
-                    let mut auth_guard = self.authenticator_write();
-                    let user_count = new_auth.len();
-                    *auth_guard = Some(Arc::new(new_auth));
-                    info!(
-                        auth_file = %auth_file,
-                        users = user_count,
-                        "Auth file reloaded successfully"
-                    );
-                }
-                Err(e) => {
-                    error!(
-                        auth_file = %auth_file,
-                        error = %e,
-                        "Failed to reload auth file, keeping existing configuration"
-                    );
-                }
+            if let Some(auth_file) = config.auth.auth_file.as_ref() {
+                let new_auth = FileAuthenticator::from_file(auth_file)
+                    .with_context(|| format!("Failed to reload auth file: {}", auth_file))?;
+                let user_count = new_auth.len();
+                let mut auth_guard = authenticator.write().unwrap_or_else(|e| e.into_inner());
+                *auth_guard = Some(Arc::new(new_auth));
+                info!(
+                    auth_file = %auth_file,
+                    users = user_count,
+                    "Auth file reloaded successfully"
+                );
             }
-        }
 
-        // Future: reload other hot-reloadable config here
-        // - circuit breaker thresholds
-        // - publisher settings
-        // - observability settings
+            // Future: reload other hot-reloadable config here
+            // - circuit breaker thresholds
+            // - publisher settings
+            // - observability settings
 
-        info!("Config reload complete");
+            info!("Config reload complete");
+            Ok(())
+        })
+    }
+
+    /// Apply a config reload, updating hot-reloadable settings (auth_file only,
+    /// see [`build_reload_fn`](Self::build_reload_fn)).
+    ///
+    /// Delegates to the single shared reload closure carried by
+    /// [`AdminHandles`], so this (the SIGHUP path) and admin `RELOAD` can never
+    /// diverge. Returns the real error on failure instead of swallowing it.
+    pub fn apply_config_reload(&self) -> Result<()> {
+        (self.admin_handles.reload_fn)()
     }
 
     /// Run the proxy server, accepting connections until shutdown signal
@@ -618,10 +677,17 @@ impl ProxyServer {
         let mut connection_count = 0u64;
         let mut connection_tasks = JoinSet::new();
 
+        // Programmatic shutdown trigger (WP-10, P4 §4.1): a future admin
+        // SHUTDOWN (Task 5) sends `true` here and `run()` drains via the same
+        // path as the OS signals. Subscribe before the shutdown future so we
+        // observe the transition even if it races startup.
+        let mut admin_shutdown = self.admin_handles.shutdown_trigger.subscribe();
+
         // Setup shutdown signal handling. Both SIGINT (Ctrl+C) and SIGTERM
         // (the signal orchestrators like Kubernetes/Docker send to stop a
-        // container) trigger the same graceful drain path (P3 §4.4).
-        let shutdown = async {
+        // container) trigger the same graceful drain path (P3 §4.4). The
+        // programmatic admin trigger is a third source of the same drain.
+        let shutdown = async move {
             #[cfg(unix)]
             {
                 use tokio::signal::unix::{signal, SignalKind};
@@ -629,8 +695,11 @@ impl ProxyServer {
                     Ok(s) => s,
                     Err(e) => {
                         error!(error = %e, "Failed to install SIGTERM handler");
-                        // Fall back to SIGINT-only so we still shut down cleanly.
-                        let _ = tokio::signal::ctrl_c().await;
+                        // Fall back to SIGINT/admin-only so we still shut down cleanly.
+                        tokio::select! {
+                            _ = tokio::signal::ctrl_c() => {}
+                            _ = admin_shutdown.changed() => {}
+                        }
                         return;
                     }
                 };
@@ -642,13 +711,21 @@ impl ProxyServer {
                     _ = sigterm.recv() => {
                         info!("Received SIGTERM; starting graceful shutdown");
                     }
+                    _ = admin_shutdown.changed() => {
+                        info!("Received programmatic admin shutdown request; starting graceful shutdown");
+                    }
                 }
             }
             #[cfg(not(unix))]
             {
-                match tokio::signal::ctrl_c().await {
-                    Ok(()) => info!("Received Ctrl+C signal; starting graceful shutdown"),
-                    Err(e) => error!(error = %e, "Failed to listen for Ctrl+C signal"),
+                tokio::select! {
+                    r = tokio::signal::ctrl_c() => match r {
+                        Ok(()) => info!("Received Ctrl+C signal; starting graceful shutdown"),
+                        Err(e) => error!(error = %e, "Failed to listen for Ctrl+C signal"),
+                    },
+                    _ = admin_shutdown.changed() => {
+                        info!("Received programmatic admin shutdown request; starting graceful shutdown");
+                    }
                 }
             }
         };
@@ -666,6 +743,11 @@ impl ProxyServer {
 
         // Graceful shutdown: wait for active connections to drain
         self.drain_connections(connection_tasks).await;
+
+        // Announce drain completion so a blocking admin `SHUTDOWN WAIT`
+        // (WP-10 Task 5) can return once the proxy has actually drained,
+        // rather than reporting a premature success.
+        self.admin_handles.signal_drain_complete();
 
         // EventBatcher will be dropped here, which closes the channel
         // and triggers flush of remaining events + publisher shutdown
@@ -736,7 +818,9 @@ impl ProxyServer {
                 // Handle config reload signal (SIGHUP)
                 _ = self.reload_trigger.changed() => {
                     info!("Received reload signal");
-                    self.apply_config_reload();
+                    if let Err(e) = self.apply_config_reload() {
+                        error!(error = %e, "Config reload failed, keeping existing configuration");
+                    }
                 }
 
                 accept_result = self.listener.accept() => {
@@ -978,35 +1062,63 @@ impl ProxyServer {
         // Read current authenticator from RwLock (allows hot-reload via SIGHUP)
         let authenticator = self.authenticator_read().clone();
         let active_connections = Arc::clone(&self.active_connections);
+        let admin_handles = Arc::clone(&self.admin_handles);
+        // Clone the registry handle out so we can store this task's abort handle
+        // AFTER spawning (the `Arc` inside `admin_handles` is moved into the task).
+        let client_registry = Arc::clone(&admin_handles.client_registry);
 
         // Increment connection counter BEFORE spawning
         active_connections.fetch_add(1, Ordering::Relaxed);
         // Also update ProxyMetrics for observability
         metrics.increment_active_connections();
 
-        connection_tasks.spawn(async move {
-            // Ensure counter is decremented on exit (drop guard pattern)
-            let _guard =
-                ConnectionCountGuard { counter: active_connections, metrics: Arc::clone(&metrics) };
-            // Handle SSL startup handshake
-            let (transport, startup_data) =
+        let abort_handle = connection_tasks.spawn(async move {
+            // Ensure counter is decremented AND the registry entry (if any) is
+            // removed on every exit path (drop guard pattern).
+            let _guard = ConnectionCountGuard {
+                counter: active_connections,
+                metrics: Arc::clone(&metrics),
+                client_registry: Arc::clone(&admin_handles.client_registry),
+                conn_id,
+            };
+            // Handle SSL startup handshake. `tls` captures whether the transport
+            // was upgraded (previously discarded) so the registry can record it.
+            let (transport, startup_data, tls) =
                 match handle_ssl_startup(client_stream, &config.tls.client_tls_sslmode, tls_config)
                     .await
                 {
-                    Ok(SslStartupResult::Upgraded(transport)) => {
+                    Ok(SslStartupResult::Upgraded(mut transport)) => {
                         info!(connection_id = conn_id, "Connection upgraded to TLS");
-                        (transport, Vec::new())
+                        // The client's StartupMessage hasn't been read yet (it
+                        // follows the TLS handshake on the wire). Read it now,
+                        // over the encrypted transport, so the client registry
+                        // (WP-10, P4 §4.1) can record the real user/database
+                        // for TLS connections instead of leaving them blank
+                        // (previously discarded entirely; a `SHOW CLIENTS`
+                        // truthfulness gap for exactly the connections most
+                        // worth reporting accurately).
+                        match read_startup_message(&mut transport).await {
+                            Ok(data) => (transport, data, true),
+                            Err(e) => {
+                                error!(
+                                    connection_id = conn_id,
+                                    error = %e,
+                                    "Failed to read startup message after TLS upgrade"
+                                );
+                                return;
+                            }
+                        }
                     }
                     Ok(SslStartupResult::Declined(stream, startup_data)) => {
                         debug!(connection_id = conn_id, "SSL declined, continuing with plain TCP");
-                        (ClientTransport::Plain(stream), startup_data)
+                        (ClientTransport::Plain(stream), startup_data, false)
                     }
                     Ok(SslStartupResult::NoSslRequest(stream, startup_data)) => {
                         debug!(
                             connection_id = conn_id,
                             "No SSL request, continuing with plain TCP"
                         );
-                        (ClientTransport::Plain(stream), startup_data)
+                        (ClientTransport::Plain(stream), startup_data, false)
                     }
                     Ok(SslStartupResult::Rejected) => {
                         // TLS downgrade attempt under a require/verify-* sslmode.
@@ -1034,9 +1146,14 @@ impl ProxyServer {
                 metrics,
                 startup_data,
                 authenticator,
+                admin_handles,
+                tls,
             )
             .await;
         });
+
+        // Record this task's abort handle so `KILL [db]` can cancel it (Task 5).
+        client_registry.register_abort_handle(conn_id, abort_handle);
     }
 
     /// Spawn a handler for a UNIX socket connection (Unix platforms only)
@@ -1054,21 +1171,30 @@ impl ProxyServer {
         // Read current authenticator from RwLock (allows hot-reload via SIGHUP)
         let authenticator = self.authenticator_read().clone();
         let active_connections = Arc::clone(&self.active_connections);
+        let admin_handles = Arc::clone(&self.admin_handles);
+        // Clone the registry handle out so we can store this task's abort handle
+        // AFTER spawning (the `Arc` inside `admin_handles` is moved into the task).
+        let client_registry = Arc::clone(&admin_handles.client_registry);
 
         // Increment connection counter BEFORE spawning
         active_connections.fetch_add(1, Ordering::Relaxed);
         // Also update ProxyMetrics for observability
         metrics.increment_active_connections();
 
-        connection_tasks.spawn(async move {
-            // Ensure counter is decremented on exit (drop guard pattern)
-            let _guard =
-                ConnectionCountGuard { counter: active_connections, metrics: Arc::clone(&metrics) };
+        let abort_handle = connection_tasks.spawn(async move {
+            // Ensure counter is decremented AND the registry entry (if any) is
+            // removed on every exit path (drop guard pattern).
+            let _guard = ConnectionCountGuard {
+                counter: active_connections,
+                metrics: Arc::clone(&metrics),
+                client_registry: Arc::clone(&admin_handles.client_registry),
+                conn_id,
+            };
             // UNIX sockets don't use SSL, so wrap directly
             let transport = ClientTransport::Unix(client_stream);
 
             // For UNIX sockets, we need to read the startup message directly
-            // since there's no SSL handshake
+            // since there's no SSL handshake. UNIX transports are never TLS.
             Self::handle_client_connection(
                 transport,
                 None, // No socket address for UNIX sockets
@@ -1079,9 +1205,14 @@ impl ProxyServer {
                 metrics,
                 Vec::new(), // Startup data will be read by connection handler
                 authenticator,
+                admin_handles,
+                false, // UNIX sockets are not TLS-upgraded
             )
             .await;
         });
+
+        // Record this task's abort handle so `KILL [db]` can cancel it (Task 5).
+        client_registry.register_abort_handle(conn_id, abort_handle);
     }
 
     /// Common connection handling logic for both TCP and UNIX sockets
@@ -1096,88 +1227,147 @@ impl ProxyServer {
         metrics: Arc<ProxyMetrics>,
         startup_data: Vec<u8>,
         authenticator: Option<Arc<FileAuthenticator>>,
+        admin_handles: Arc<AdminHandles>,
+        tls: bool,
     ) {
         let addr_str = client_addr.map(|a| a.to_string()).unwrap_or_else(|| "unix".to_string());
+        // Connection span (accept → auth), Task 9, P4 §4.6: entered for the
+        // whole body below via `.instrument()` (never a held `Entered` guard
+        // across `.await` points), so every nested span this task creates —
+        // `ConnectionHandler::handle`'s own `#[instrument]`, and the per-query
+        // `pg_query` spans created deep inside it — nests under this as a
+        // child, and every log event on this task (including the existing
+        // client-authenticated/auth-failed events) is attributed to it too.
+        let conn_span = new_connection_span(conn_id, &addr_str, tls);
 
-        // Parse startup message to get database name and check for admin
-        let (database_name, is_admin) = if !startup_data.is_empty() {
-            if let Some(startup) = StartupMessage::parse(&startup_data) {
-                let db = startup.database().map(|s| s.to_string());
-                let is_admin = db.as_ref().is_some_and(|d| d.eq_ignore_ascii_case(ADMIN_DATABASE));
-                (db, is_admin)
+        async move {
+            // Parse startup message to get user/database and check for admin. UNIX
+            // sockets deliver an empty `startup_data` here (their startup is read
+            // later by the connection handler), so their identity fields stay empty
+            // for 1.0 — a documented limitation, not false state.
+            let (database_name, user_name, is_admin) = if !startup_data.is_empty() {
+                if let Some(startup) = StartupMessage::parse(&startup_data) {
+                    let db = startup.database().map(|s| s.to_string());
+                    let user = startup.user().map(|s| s.to_string());
+                    let is_admin =
+                        db.as_ref().is_some_and(|d| d.eq_ignore_ascii_case(ADMIN_DATABASE));
+                    (db, user, is_admin)
+                } else {
+                    (None, None, false)
+                }
             } else {
-                (None, false)
+                (None, None, false)
+            };
+
+            // Fill in the span's `database` field now that it's known. Only the
+            // database (GUC) name is ever recorded here — never the password or
+            // any other startup-message parameter.
+            if let Some(ref db) = database_name {
+                tracing::Span::current().record("database", db.as_str());
             }
-        } else {
-            (None, false)
-        };
 
-        // Select the appropriate pool manager for this database
-        let pool_manager = database_name
-            .as_ref()
-            .and_then(|db| pool_managers.get(db))
-            .or_else(|| pool_managers.get("*"))
-            .cloned();
+            // Register this connection in the client registry now that its identity
+            // is known (WP-10, P4 §4.1). O(1) bookkeeping, off the per-query hot
+            // path. Admin clients are registered too (PgBouncer lists them),
+            // distinguished by `ClientState::Admin`. The `ConnectionCountGuard` in
+            // the spawn closure removes this entry on every exit path.
+            admin_handles.client_registry.register(ClientEntry {
+                conn_id,
+                addr: addr_str.clone(),
+                user: user_name.clone().unwrap_or_default(),
+                database: database_name.clone().unwrap_or_default(),
+                state: if is_admin { ClientState::Admin } else { ClientState::Active },
+                connect_time: std::time::Instant::now(),
+                last_request_time: std::time::Instant::now(),
+                tls,
+            });
 
-        if let Some(ref db) = database_name {
-            debug!(
-                connection_id = conn_id,
-                database = %db,
-                has_specific_pool = pool_managers.contains_key(db),
-                "Routing connection to database"
-            );
-        }
+            // Select the appropriate pool manager for this database
+            let pool_manager = database_name
+                .as_ref()
+                .and_then(|db| pool_managers.get(db))
+                .or_else(|| pool_managers.get("*"))
+                .cloned();
 
-        if is_admin {
+            if let Some(ref db) = database_name {
+                debug!(
+                    connection_id = conn_id,
+                    database = %db,
+                    has_specific_pool = pool_managers.contains_key(db),
+                    "Routing connection to database"
+                );
+            }
+
+            if is_admin {
+                info!(
+                    connection_id = conn_id,
+                    client_addr = %addr_str,
+                    "Routing to admin console"
+                );
+
+                if let Err(e) = handle_admin_connection(transport, admin_handles, metrics).await {
+                    error!(
+                        connection_id = conn_id,
+                        client_addr = %addr_str,
+                        error = %e,
+                        "Admin console connection failed"
+                    );
+                }
+            } else {
+                // Use a placeholder address for UNIX sockets
+                let handler_addr = client_addr
+                    .unwrap_or_else(|| "0.0.0.0:0".parse().expect("valid placeholder addr"));
+
+                let handler = ConnectionHandler::new(
+                    transport,
+                    handler_addr,
+                    conn_id,
+                    config,
+                    batcher,
+                    pool_manager,
+                    metrics,
+                    startup_data,
+                    authenticator,
+                );
+
+                if let Err(e) = handler.handle().await {
+                    error!(
+                        connection_id = conn_id,
+                        client_addr = %addr_str,
+                        error = %e,
+                        "Connection handler failed"
+                    );
+                }
+            }
+
             info!(
                 connection_id = conn_id,
                 client_addr = %addr_str,
-                "Routing to admin console"
+                "Connection closed"
             );
-
-            if let Err(e) =
-                handle_admin_connection(transport, pool_manager, metrics, &config.admin).await
-            {
-                error!(
-                    connection_id = conn_id,
-                    client_addr = %addr_str,
-                    error = %e,
-                    "Admin console connection failed"
-                );
-            }
-        } else {
-            // Use a placeholder address for UNIX sockets
-            let handler_addr =
-                client_addr.unwrap_or_else(|| "0.0.0.0:0".parse().expect("valid placeholder addr"));
-
-            let handler = ConnectionHandler::new(
-                transport,
-                handler_addr,
-                conn_id,
-                config,
-                batcher,
-                pool_manager,
-                metrics,
-                startup_data,
-                authenticator,
-            );
-
-            if let Err(e) = handler.handle().await {
-                error!(
-                    connection_id = conn_id,
-                    client_addr = %addr_str,
-                    error = %e,
-                    "Connection handler failed"
-                );
-            }
         }
-
-        info!(
-            connection_id = conn_id,
-            client_addr = %addr_str,
-            "Connection closed"
-        );
+        .instrument(conn_span)
+        .await
     }
+}
+
+/// Build the per-connection span (accept → auth) for `handle_client_connection`
+/// (Task 9, P4 §4.6), exported through the existing OTLP layer configured by
+/// `observability::init` — near-zero cost when no subscriber is interested
+/// (the default, no OTLP endpoint configured). `database` is unknown at
+/// accept time (only known after parsing the client's startup message a few
+/// lines into the body), so it starts `Empty` and is filled in via
+/// `Span::record` once parsed. Deliberately takes only `conn_id`/`client_addr`
+/// (from the socket, never client-supplied)/`tls` as eager fields — never a
+/// password or any other startup-message parameter.
+fn new_connection_span(conn_id: u64, client_addr: &str, tls: bool) -> tracing::Span {
+    tracing::info_span!(
+        "pg_connection",
+        conn_id = conn_id,
+        client_addr = %client_addr,
+        tls = tls,
+        database = tracing::field::Empty,
+    )
 }
 
 /// Constant-time byte-slice equality, to avoid leaking the admin password
@@ -1200,10 +1390,10 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// which provides administrative commands for monitoring and controlling the proxy.
 async fn handle_admin_connection(
     mut client: ClientTransport,
-    pool_manager: Option<Arc<PoolManager>>,
+    admin_handles: Arc<AdminHandles>,
     metrics: Arc<ProxyMetrics>,
-    admin: &AdminConfig,
 ) -> Result<()> {
+    let admin = &admin_handles.config.admin;
     // Fail closed (P1 §4.6): the admin console is refused unless it has been
     // explicitly enabled AND an admin password is configured. Without this the
     // virtual `pgbouncer` database was an unauthenticated control channel.
@@ -1252,7 +1442,7 @@ async fn handle_admin_connection(
     let ready_for_query = [b'Z', 0, 0, 0, 5, b'I'];
     client.write_all(&ready_for_query).await.context("Failed to send ReadyForQuery")?;
 
-    let admin = AdminConsole::new(pool_manager, metrics);
+    let admin = AdminConsole::new(admin_handles, metrics);
     let mut buffer = vec![0u8; 8192];
 
     loop {
@@ -1302,7 +1492,7 @@ async fn handle_admin_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AuthType, Config};
+    use crate::config::{AdminConfig, AuthType, Config};
     use crate::observability::{HealthConfig, ProxyMetrics};
     use crate::proxy::EventBatcher;
     use crate::publisher::DebugLoggerPublisher;
@@ -1337,10 +1527,16 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let metrics = Arc::new(ProxyMetrics::new(100, HealthConfig::default()));
 
+        // Build minimal AdminHandles whose config carries the test's admin
+        // settings (handle_admin_connection reads config.admin for the gate).
+        let mut cfg = Config::default();
+        cfg.admin = admin;
+        let handles = AdminHandles::for_test_with_config(cfg);
+
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let transport = ClientTransport::Plain(stream);
-            let _ = handle_admin_connection(transport, None, metrics, &admin).await;
+            let _ = handle_admin_connection(transport, handles, metrics).await;
         });
 
         let mut client = TcpStream::connect(addr).await.unwrap();
@@ -1596,7 +1792,7 @@ mod tests {
         drop(file);
 
         // Trigger reload
-        server.apply_config_reload();
+        server.apply_config_reload().expect("reload of valid auth file should succeed");
 
         // Verify updated state
         let auth = server.authenticator().unwrap();
@@ -1675,5 +1871,498 @@ mod tests {
         assert_eq!(server.active_connection_count(), 0);
 
         // Integration test will verify actual increment/decrement behavior
+    }
+
+    // --- Task 9 (P4 §4.6): OTel tracing spans over the connection/query
+    // lifecycle + log safety --------------------------------------------
+
+    /// `new_connection_span` (the exact helper `handle_client_connection`
+    /// calls) must declare `conn_id`/`client_addr`/`tls`/`database` as span
+    /// fields, and recording `database` afterward (the way the real code does
+    /// once the startup message is parsed) must show up under that key —
+    /// never leaking anything beyond the database name itself.
+    #[test]
+    fn connection_span_declares_expected_field_keys_and_records_database() {
+        let (subscriber, captured) = crate::observability::test_support::capturing_subscriber();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        {
+            let span = new_connection_span(42, "127.0.0.1:55555", true);
+            span.record("database", "app_db");
+            // Span closes (and is captured) when it drops at the end of this block.
+        }
+
+        let captured = captured.lock().unwrap();
+        let conn = captured
+            .span_named("pg_connection")
+            .expect("pg_connection span must be captured on close");
+        for key in ["conn_id", "client_addr", "tls", "database"] {
+            assert!(conn.fields.contains_key(key), "pg_connection span missing field `{key}`");
+        }
+        assert_eq!(conn.fields.get("database").unwrap(), "\"app_db\"");
+        // `client_addr` is recorded via `%client_addr` (Display), which
+        // tracing renders without the `str`-Debug quoting `.record()` uses.
+        assert_eq!(conn.fields.get("client_addr").unwrap(), "127.0.0.1:55555");
+    }
+
+    /// Whole-branch-review regression (Fix 1, P4 §4.6): `new_connection_span`
+    /// is `info_span!`, and the console/log filter defaults to `warn` when
+    /// `RUST_LOG` is unset — the documented "just enable tracing" path
+    /// (`enable_tracing = true` + `otlp_endpoint` set, no `RUST_LOG`
+    /// override). The test above uses a filter-LESS subscriber, so it never
+    /// caught that a single shared `EnvFilter` wrapping the whole layer stack
+    /// (the pre-fix `init()` shape) silently vetoes info-level spans for
+    /// every layer beneath it, including the OTLP exporter. This drives the
+    /// REAL `new_connection_span` helper under a subscriber shaped exactly
+    /// like `init()`'s OTLP branch now is: a real `fmt::layer` carrying a
+    /// warn-default console filter, PLUS the capturing layer standing in for
+    /// the real `OpenTelemetryLayer`, carrying its own
+    /// `observability::otlp_export_filter()` via per-layer filtering. If
+    /// per-layer filtering ever regresses back to one shared filter, this
+    /// span stops being captured and the test fails.
+    #[test]
+    fn connection_span_exports_under_the_real_otlp_layer_filter() {
+        let (subscriber, captured) =
+            crate::observability::test_support::capturing_subscriber_with_filters(
+                tracing_subscriber::EnvFilter::new("warn"),
+                crate::observability::otlp_export_filter(),
+            );
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        {
+            let _entered = new_connection_span(7, "127.0.0.1:9", false).entered();
+            // Span closes (and is captured) when `_entered` drops here.
+        }
+
+        let captured = captured.lock().unwrap();
+        assert!(
+            captured.span_named("pg_connection").is_some(),
+            "pg_connection span must be exported under the OTLP layer's own info filter, even \
+             though the console/log filter defaults to warn — captured spans: {:?}",
+            captured.spans.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// End-to-end (RED→GREEN target): drive a real client query through the
+    /// REAL `handle_client_connection` -> `ConnectionHandler::handle()` ->
+    /// direct/owned-backend dispatch path (no mocks of the span machinery)
+    /// against a fake in-process Postgres backend, with
+    /// `unsafe_debug_logging` off (the default). Asserts:
+    /// 1. a `pg_connection` span and a nested `pg_query` span are both
+    ///    captured, with the query span's expected attribute KEYS present
+    ///    (`conn_id`, `pooling_mode`, `backend_id`, `duration_ms`, `success`);
+    /// 2. the distinctive literal in `SELECT 'SECRET_LITERAL_XYZ'` appears in
+    ///    NEITHER a captured span field NOR a captured log event — i.e. no
+    ///    raw-SQL leak anywhere tracing touches, by default.
+    #[tokio::test]
+    async fn end_to_end_query_produces_connection_and_query_spans_without_leaking_secret() {
+        use tokio::net::{TcpListener, TcpStream};
+
+        // Defensive: this global flag is process-shared (P1 §4.4's
+        // `set_unsafe_debug_logging`); pin it to the safe default so this
+        // test's log-safety assertion can't be polluted by another test that
+        // temporarily flips it on.
+        crate::observability::set_unsafe_debug_logging(false);
+
+        const SECRET: &str = "SECRET_LITERAL_XYZ";
+        let query = format!("SELECT '{SECRET}'");
+
+        fn build_simple_query(sql: &str) -> Vec<u8> {
+            let mut body = sql.as_bytes().to_vec();
+            body.push(0);
+            let mut msg = vec![b'Q'];
+            msg.extend_from_slice(&((4 + body.len()) as i32).to_be_bytes());
+            msg.extend_from_slice(&body);
+            msg
+        }
+
+        fn build_command_complete(tag: &str) -> Vec<u8> {
+            let mut body = tag.as_bytes().to_vec();
+            body.push(0);
+            let mut msg = vec![b'C'];
+            msg.extend_from_slice(&((4 + body.len()) as i32).to_be_bytes());
+            msg.extend_from_slice(&body);
+            msg
+        }
+
+        const READY_FOR_QUERY: [u8; 6] = [b'Z', 0, 0, 0, 5, b'I'];
+
+        async fn read_until_ready_for_query(stream: &mut TcpStream) -> Vec<u8> {
+            let mut acc = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut buf).await.expect("read from stream");
+                assert!(n > 0, "stream closed before ReadyForQuery");
+                acc.extend_from_slice(&buf[..n]);
+                if acc.ends_with(&READY_FOR_QUERY) {
+                    return acc;
+                }
+            }
+        }
+
+        // Fake backend: completes a trust startup, then answers one simple query.
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend_listener.local_addr().unwrap();
+        let backend_task = tokio::spawn(async move {
+            let (mut stream, _) = backend_listener.accept().await.unwrap();
+
+            // Consume the proxy's backend-directed StartupMessage.
+            let mut buf = vec![0u8; 8192];
+            let n = stream.read(&mut buf).await.unwrap();
+            assert!(n > 0, "backend never received a StartupMessage");
+
+            // AuthenticationOk + ReadyForQuery completes backend startup.
+            let mut resp = build_auth_ok();
+            resp.extend_from_slice(&READY_FOR_QUERY);
+            stream.write_all(&resp).await.unwrap();
+
+            // The client's simple Query.
+            let n = stream.read(&mut buf).await.unwrap();
+            assert!(n > 0, "backend never received the client's Query message");
+            assert_eq!(buf[0], b'Q', "expected a simple Query message forwarded to the backend");
+
+            let mut resp2 = build_command_complete("SELECT 1");
+            resp2.extend_from_slice(&READY_FOR_QUERY);
+            stream.write_all(&resp2).await.unwrap();
+
+            // Keep the socket open briefly so the proxy's forwarding loop
+            // doesn't race an early EOF against the write above.
+            let _ = stream.read(&mut buf).await;
+        });
+
+        // Fake client: connects, completes startup, sends the query, reads
+        // the response, then disconnects (ending the handler loop).
+        let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client_listen_addr = client_listener.local_addr().unwrap();
+        let query_for_client = query.clone();
+        let client_task = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(client_listen_addr).await.unwrap();
+            let _ = read_until_ready_for_query(&mut stream).await;
+
+            stream.write_all(&build_simple_query(&query_for_client)).await.unwrap();
+            let _ = read_until_ready_for_query(&mut stream).await;
+            // Dropping `stream` here closes the client side, which is what
+            // ends the proxy's `handle_with_owned_backend` forwarding loop.
+        });
+
+        let (proxy_client_stream, _) = client_listener.accept().await.unwrap();
+        let peer_addr = proxy_client_stream.peer_addr().unwrap();
+
+        let mut config = create_test_config();
+        config.backend.host = backend_addr.ip().to_string();
+        config.backend.port = backend_addr.port();
+        config.backend.user = "postgres".to_string();
+        config.backend.password = String::new();
+        config.backend.database = "postgres".to_string();
+        config.auth.auth_type = AuthType::Trust;
+
+        let admin_handles = AdminHandles::for_test_with_config(config.clone());
+        let batcher =
+            Arc::new(EventBatcher::new(Arc::new(DebugLoggerPublisher::new()), 10, 100, 1000));
+        let metrics = Arc::new(ProxyMetrics::new(100, HealthConfig::default()));
+        let startup_bytes = StartupMessage::build("testuser", "testdb", &[]);
+
+        let (subscriber, captured) = crate::observability::test_support::capturing_subscriber();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        ProxyServer::handle_client_connection(
+            ClientTransport::Plain(proxy_client_stream),
+            Some(peer_addr),
+            4242,
+            Arc::new(config),
+            batcher,
+            HashMap::new(), // no pool manager -> direct/owned-backend path
+            metrics,
+            startup_bytes,
+            None,
+            admin_handles,
+            false,
+        )
+        .await;
+
+        client_task.await.expect("client task must not panic");
+        backend_task.await.expect("backend task must not panic");
+
+        let captured = captured.lock().unwrap();
+
+        assert!(
+            captured.span_named("pg_connection").is_some(),
+            "expected a pg_connection span; captured spans: {:?}",
+            captured.spans.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        let query_span = captured.span_named("pg_query").expect("expected a pg_query span");
+        for key in ["conn_id", "pooling_mode", "backend_id", "duration_ms", "success"] {
+            assert!(query_span.fields.contains_key(key), "pg_query span missing field `{key}`");
+        }
+        // `command` is recorded via `%command_tag(query)` (Display), so it
+        // renders without `str`-Debug quoting.
+        assert_eq!(query_span.fields.get("command").map(String::as_str), Some("SELECT"));
+        assert_eq!(query_span.fields.get("success").map(String::as_str), Some("true"));
+
+        // The safety-critical assertion: the distinctive literal must not
+        // leak into ANY captured span field or log event.
+        assert!(
+            !captured.contains_value(SECRET),
+            "raw query literal {SECRET:?} leaked into a span field or log event with \
+             unsafe_debug_logging off (the default)"
+        );
+    }
+
+    // --- Task 9 review fix: extended-protocol (Parse/Bind/Execute) span
+    // correctness + bound-parameter log safety --------------------------
+    //
+    // The end-to-end test above only drives the SIMPLE query protocol
+    // (`Message::Query`). The EXTENDED protocol (Parse/Bind/Execute) is the
+    // dominant path for parameterized client libraries (anything using
+    // prepared statements / bind parameters, e.g. most ORMs and `tokio-postgres`
+    // itself), and it has two distinct span-lifecycle points (Parse, then
+    // Bind) that both used to create a REAL `pg_query` span sharing the same
+    // pending-execution slot — Bind's `set_pending` silently discards
+    // Parse's span, orphaning it (never recorded, but still exported as
+    // noise). These two tests drive the real extended-protocol wire format
+    // through the same owned-backend path as the test above.
+
+    /// Build a Parse message: 'P' + len + name\0 + query\0 + num_param_types(0).
+    fn build_parse(name: &str, query: &str) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(name.as_bytes());
+        body.push(0);
+        body.extend_from_slice(query.as_bytes());
+        body.push(0);
+        body.extend_from_slice(&0i16.to_be_bytes()); // no explicit param OIDs
+        let mut msg = vec![b'P'];
+        msg.extend_from_slice(&((4 + body.len()) as i32).to_be_bytes());
+        msg.extend_from_slice(&body);
+        msg
+    }
+
+    /// Build a Bind message with a single text-format bound parameter.
+    fn build_bind(portal: &str, statement: &str, param_value: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(portal.as_bytes());
+        body.push(0);
+        body.extend_from_slice(statement.as_bytes());
+        body.push(0);
+        body.extend_from_slice(&1i16.to_be_bytes()); // 1 format code
+        body.extend_from_slice(&0i16.to_be_bytes()); // text format
+        body.extend_from_slice(&1i16.to_be_bytes()); // 1 parameter
+        body.extend_from_slice(&(param_value.len() as i32).to_be_bytes());
+        body.extend_from_slice(param_value);
+        body.extend_from_slice(&0i16.to_be_bytes()); // 0 result format codes (all text)
+        let mut msg = vec![b'B'];
+        msg.extend_from_slice(&((4 + body.len()) as i32).to_be_bytes());
+        msg.extend_from_slice(&body);
+        msg
+    }
+
+    /// Build an Execute message: 'E' + len + portal\0 + max_rows(0).
+    fn build_execute(portal: &str) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(portal.as_bytes());
+        body.push(0);
+        body.extend_from_slice(&0i32.to_be_bytes()); // no row limit
+        let mut msg = vec![b'E'];
+        msg.extend_from_slice(&((4 + body.len()) as i32).to_be_bytes());
+        msg.extend_from_slice(&body);
+        msg
+    }
+
+    /// Build a Sync message: 'S' + len(4), no body.
+    fn build_sync() -> Vec<u8> {
+        vec![b'S', 0, 0, 0, 4]
+    }
+
+    /// Build ParseComplete ('1') / BindComplete ('2'), both header-only.
+    fn build_parse_complete() -> Vec<u8> {
+        vec![b'1', 0, 0, 0, 4]
+    }
+    fn build_bind_complete() -> Vec<u8> {
+        vec![b'2', 0, 0, 0, 4]
+    }
+
+    /// Drive one Parse/Bind/Execute/Sync round trip (unnamed statement +
+    /// unnamed portal — the common case for parameterized-query client
+    /// libraries) through the real owned-backend connection path, with a
+    /// captured tracing subscriber installed, and return the `Captured`
+    /// result for the caller's assertions. `query` is the SQL text sent at
+    /// Parse time; `param_value` is the single bound parameter's raw bytes
+    /// sent at Bind time — kept as two separate inputs so a test can put a
+    /// secret in ONE without it appearing in the other.
+    async fn run_extended_protocol_round_trip(
+        query: &str,
+        param_value: &[u8],
+    ) -> Arc<std::sync::Mutex<crate::observability::test_support::Captured>> {
+        use tokio::net::{TcpListener, TcpStream};
+
+        crate::observability::set_unsafe_debug_logging(false);
+
+        fn build_command_complete(tag: &str) -> Vec<u8> {
+            let mut body = tag.as_bytes().to_vec();
+            body.push(0);
+            let mut msg = vec![b'C'];
+            msg.extend_from_slice(&((4 + body.len()) as i32).to_be_bytes());
+            msg.extend_from_slice(&body);
+            msg
+        }
+
+        const READY_FOR_QUERY: [u8; 6] = [b'Z', 0, 0, 0, 5, b'I'];
+
+        async fn read_until_ready_for_query(stream: &mut TcpStream) -> Vec<u8> {
+            let mut acc = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut buf).await.expect("read from stream");
+                assert!(n > 0, "stream closed before ReadyForQuery");
+                acc.extend_from_slice(&buf[..n]);
+                if acc.ends_with(&READY_FOR_QUERY) {
+                    return acc;
+                }
+            }
+        }
+
+        // Fake backend: completes a trust startup, then answers one
+        // Parse/Bind/Execute/Sync round trip.
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend_listener.local_addr().unwrap();
+        let backend_task = tokio::spawn(async move {
+            let (mut stream, _) = backend_listener.accept().await.unwrap();
+
+            let mut buf = vec![0u8; 8192];
+            let n = stream.read(&mut buf).await.unwrap();
+            assert!(n > 0, "backend never received a StartupMessage");
+
+            let mut resp = build_auth_ok();
+            resp.extend_from_slice(&READY_FOR_QUERY);
+            stream.write_all(&resp).await.unwrap();
+
+            // The client's Parse+Bind+Execute+Sync, all forwarded verbatim
+            // in one read (they were sent in one client-side write).
+            let n = stream.read(&mut buf).await.unwrap();
+            assert!(n > 0, "backend never received the client's extended-protocol messages");
+            assert_eq!(buf[0], b'P', "expected a Parse message forwarded first");
+
+            let mut resp2 = build_parse_complete();
+            resp2.extend_from_slice(&build_bind_complete());
+            resp2.extend_from_slice(&build_command_complete("SELECT 1"));
+            resp2.extend_from_slice(&READY_FOR_QUERY);
+            stream.write_all(&resp2).await.unwrap();
+
+            let _ = stream.read(&mut buf).await;
+        });
+
+        let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client_listen_addr = client_listener.local_addr().unwrap();
+        let query_for_client = query.to_string();
+        let param_for_client = param_value.to_vec();
+        let client_task = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(client_listen_addr).await.unwrap();
+            let _ = read_until_ready_for_query(&mut stream).await;
+
+            let mut out = build_parse("", &query_for_client);
+            out.extend_from_slice(&build_bind("", "", &param_for_client));
+            out.extend_from_slice(&build_execute(""));
+            out.extend_from_slice(&build_sync());
+            stream.write_all(&out).await.unwrap();
+
+            let _ = read_until_ready_for_query(&mut stream).await;
+        });
+
+        let (proxy_client_stream, _) = client_listener.accept().await.unwrap();
+        let peer_addr = proxy_client_stream.peer_addr().unwrap();
+
+        let mut config = create_test_config();
+        config.backend.host = backend_addr.ip().to_string();
+        config.backend.port = backend_addr.port();
+        config.backend.user = "postgres".to_string();
+        config.backend.password = String::new();
+        config.backend.database = "postgres".to_string();
+        config.auth.auth_type = AuthType::Trust;
+
+        let admin_handles = AdminHandles::for_test_with_config(config.clone());
+        let batcher =
+            Arc::new(EventBatcher::new(Arc::new(DebugLoggerPublisher::new()), 10, 100, 1000));
+        let metrics = Arc::new(ProxyMetrics::new(100, HealthConfig::default()));
+        let startup_bytes = StartupMessage::build("testuser", "testdb", &[]);
+
+        let (subscriber, captured) = crate::observability::test_support::capturing_subscriber();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        ProxyServer::handle_client_connection(
+            ClientTransport::Plain(proxy_client_stream),
+            Some(peer_addr),
+            4242,
+            Arc::new(config),
+            batcher,
+            HashMap::new(), // no pool manager -> direct/owned-backend path
+            metrics,
+            startup_bytes,
+            None,
+            admin_handles,
+            false,
+        )
+        .await;
+
+        client_task.await.expect("client task must not panic");
+        backend_task.await.expect("backend task must not panic");
+
+        captured
+    }
+
+    /// RED (pre-fix) / GREEN (post-fix) target: a single prepared/bound query
+    /// driven through the real extended protocol (Parse -> Bind -> Execute ->
+    /// Sync) must produce EXACTLY ONE `pg_query` span, and that span must
+    /// carry the recorded outcome (`success = true`). Before the fix, Parse
+    /// created a real span that Bind's `set_pending` silently discarded
+    /// (orphaned, never recorded) while ALSO creating a second real span —
+    /// i.e. two closed `pg_query` spans, one of them permanently `Empty`.
+    #[tokio::test]
+    async fn extended_protocol_produces_exactly_one_recorded_pg_query_span() {
+        let captured = run_extended_protocol_round_trip("SELECT $1::text", b"hello").await;
+        let captured = captured.lock().unwrap();
+
+        let query_spans: Vec<_> = captured.spans.iter().filter(|s| s.name == "pg_query").collect();
+        assert_eq!(
+            query_spans.len(),
+            1,
+            "expected exactly one pg_query span for one Parse/Bind/Execute round trip, got {}: {:?}",
+            query_spans.len(),
+            query_spans
+        );
+
+        let query_span = query_spans[0];
+        for key in ["conn_id", "pooling_mode", "backend_id", "duration_ms", "success"] {
+            assert!(query_span.fields.contains_key(key), "pg_query span missing field `{key}`");
+        }
+        assert_eq!(
+            query_span.fields.get("success").map(String::as_str),
+            Some("true"),
+            "the single pg_query span must record the completed outcome, not be left Empty"
+        );
+    }
+
+    /// The security-priority assertion: a secret sent as a BOUND PARAMETER
+    /// value (never appearing in the SQL text itself) must be exactly as
+    /// safe as a secret in query text — absent from every captured span
+    /// field and log event when `unsafe_debug_logging` is off (the default).
+    /// This closes the previously-untested gap: the existing log-safety test
+    /// only covers a literal embedded in simple-query SQL text, never a
+    /// value carried solely in a Bind message's parameter bytes.
+    #[tokio::test]
+    async fn bound_parameter_secret_does_not_leak_into_spans_or_logs() {
+        const SECRET: &str = "SECRET_LITERAL_XYZ";
+        // The query text itself never contains the secret — only the bound
+        // parameter value does, exercising the Bind-specific path.
+        let captured = run_extended_protocol_round_trip("SELECT $1::text", SECRET.as_bytes()).await;
+        let captured = captured.lock().unwrap();
+
+        assert!(
+            captured.span_named("pg_query").is_some(),
+            "expected a pg_query span for the bound-parameter round trip"
+        );
+        assert!(
+            !captured.contains_value(SECRET),
+            "bound-parameter secret {SECRET:?} leaked into a span field or log event with \
+             unsafe_debug_logging off (the default)"
+        );
     }
 }

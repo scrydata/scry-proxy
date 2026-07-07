@@ -69,6 +69,7 @@ fn create_test_config(backend_host: String, backend_port: u16) -> Config {
             database: "postgres".to_string(),
             user: "postgres".to_string(),
             password: "postgres".to_string(),
+            password_file: None,
             pool_size: 5,
             connection_timeout_ms: 5000,
         },
@@ -79,6 +80,8 @@ fn create_test_config(backend_host: String, backend_port: u16) -> Config {
             enable_metrics_server: false,
             metrics_server_address: "127.0.0.1:9090".to_string(),
             unsafe_debug_logging: false,
+            enable_debug_endpoints: false,
+            metrics_allow_non_loopback: false,
         },
         protocol: ProtocolConfig { max_prepared_statements: 1000 },
         publisher: PublisherConfig {

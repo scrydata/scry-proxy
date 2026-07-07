@@ -91,6 +91,7 @@ pub fn create_test_config(host: String, port: u16, pooling: PoolingStrategy) -> 
             database: "postgres".to_string(),
             user: "postgres".to_string(),
             password: "postgres".to_string(),
+            password_file: None,
             pool_size: 5,
             connection_timeout_ms: 5000,
         },
@@ -101,6 +102,8 @@ pub fn create_test_config(host: String, port: u16, pooling: PoolingStrategy) -> 
             enable_metrics_server: false,
             metrics_server_address: "127.0.0.1:0".to_string(),
             unsafe_debug_logging: false,
+            enable_debug_endpoints: false,
+            metrics_allow_non_loopback: false,
         },
         protocol: ProtocolConfig { max_prepared_statements: 100 },
         publisher: PublisherConfig {
@@ -215,6 +218,59 @@ pub async fn start_test_proxy_with_metrics(
     });
 
     Ok((port, metrics))
+}
+
+/// Variant that also returns the shared [`AdminHandles`] so a test can inspect
+/// live registry state (client/server registries) or drive a programmatic
+/// shutdown. Grabs the handles before the server is moved into `run()`.
+pub async fn start_test_proxy_with_handles(
+    config: Config,
+    publisher: Arc<dyn EventPublisher>,
+) -> anyhow::Result<(u16, Arc<AdminHandles>)> {
+    let batcher = EventBatcher::new(
+        publisher,
+        config.publisher.batch_size,
+        config.publisher.flush_interval_ms,
+        config.publisher.max_queue_size,
+    );
+
+    let metrics = Arc::new(ProxyMetrics::new(100, HealthConfig::default()));
+    let server = ProxyServer::new(config.clone(), batcher, metrics).await?;
+    let port = server.local_addr()?.port();
+    let handles = server.admin_handles();
+
+    tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    Ok((port, handles))
+}
+
+/// Like [`start_test_proxy_with_handles`] but ALSO returns the `JoinHandle` of
+/// the spawned `run()` task, so a test can observe the proxy actually shutting
+/// down (the task completing) — used by the `SHUTDOWN` command-effect test to
+/// prove a real drain rather than a false `CommandComplete`.
+pub async fn start_test_proxy_capturing_task(
+    config: Config,
+    publisher: Arc<dyn EventPublisher>,
+) -> anyhow::Result<(u16, Arc<AdminHandles>, tokio::task::JoinHandle<()>)> {
+    let batcher = EventBatcher::new(
+        publisher,
+        config.publisher.batch_size,
+        config.publisher.flush_interval_ms,
+        config.publisher.max_queue_size,
+    );
+
+    let metrics = Arc::new(ProxyMetrics::new(100, HealthConfig::default()));
+    let server = ProxyServer::new(config.clone(), batcher, metrics).await?;
+    let port = server.local_addr()?.port();
+    let handles = server.admin_handles();
+
+    let task = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    Ok((port, handles, task))
 }
 
 /// All four pooling modes, for matrix loops.
