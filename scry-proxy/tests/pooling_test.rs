@@ -86,6 +86,7 @@ fn create_pooled_config(backend_host: String, backend_port: u16, pool_size: usiz
         },
         performance: PerformanceConfig {
             latency_budget: scry::config::LatencyBudget::default(),
+            query_timeout_secs: 0,
             connection_pooling: PoolingStrategy::Session, // Enable pooling!
             pool_size,
             pool_min_idle: 2,

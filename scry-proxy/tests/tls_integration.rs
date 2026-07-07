@@ -113,6 +113,7 @@ fn create_minimal_config() -> Config {
         },
         performance: PerformanceConfig {
             latency_budget: scry::config::LatencyBudget::default(),
+            query_timeout_secs: 0,
             connection_pooling: PoolingStrategy::Disabled,
             pool_size: 5,
             pool_min_idle: 1,

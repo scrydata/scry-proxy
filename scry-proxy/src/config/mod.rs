@@ -441,6 +441,11 @@ pub struct PerformanceConfig {
     /// Budget for the proxy's own added latency, per percentile (P5 §4.2).
     #[serde(default)]
     pub latency_budget: LatencyBudget,
+    /// Maximum time a single client query may run on the backend before the
+    /// proxy cancels it by closing the connection (seconds; 0 = disabled).
+    /// A timed-out connection is never returned clean to the pool (P3 §4.3).
+    #[serde(default)]
+    pub query_timeout_secs: u64,
     pub connection_pooling: PoolingStrategy,
     pub pool_size: usize,
     pub pool_min_idle: usize,
@@ -603,6 +608,7 @@ impl Default for Config {
             },
             performance: PerformanceConfig {
                 latency_budget: LatencyBudget::default(),
+                query_timeout_secs: 0,
                 connection_pooling: PoolingStrategy::Hybrid,
                 pool_size: 50,    // Sensible default; 10:1 with max_connections=500
                 pool_min_idle: 5, // Keep low for dev/test, increase for production

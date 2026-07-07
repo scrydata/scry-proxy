@@ -96,6 +96,7 @@ fn create_test_config(host: String, port: u16, pooling: PoolingStrategy) -> Conf
         },
         performance: PerformanceConfig {
             latency_budget: scry::config::LatencyBudget::default(),
+            query_timeout_secs: 0,
             connection_pooling: pooling,
             pool_size: 5,
             pool_min_idle: 1,

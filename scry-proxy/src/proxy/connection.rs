@@ -5,7 +5,9 @@ use super::{
 use crate::auth::{Authenticator, FileAuthenticator};
 use crate::config::{BackpressureMode, Config, ParseFailureMode, PoolingStrategy};
 use crate::observability::{ProxyMetrics, QueryTimeline};
-use crate::protocol::{decode_params, Message, MessageExtractor, QueryAnonymizer};
+use crate::protocol::{
+    build_error_response, decode_params, Message, MessageExtractor, QueryAnonymizer,
+};
 use crate::publisher::{QueryEvent, QueryEventBuilder};
 use crate::tls::ClientTransport;
 use anyhow::{Context, Result};
@@ -611,12 +613,23 @@ impl ConnectionHandler {
         let mut client_buffer = vec![0u8; self.config.performance.buffer_size];
         let mut backend_buffer = vec![0u8; self.config.performance.buffer_size];
 
+        // Query execution deadline (P3 §4.3). When a query is dispatched, arm a
+        // deadline; if the backend has not completed the response by then, the
+        // query is cancelled by closing the (now unknown-state) connection.
+        let query_timeout_secs = self.config.performance.query_timeout_secs;
+        let query_timeout_enabled = query_timeout_secs > 0;
+        let query_timeout_dur = Duration::from_secs(query_timeout_secs);
+        let mut query_deadline: Option<tokio::time::Instant> = None;
+
         // Perform authentication and startup handshake
         self.perform_startup_handshake(managed_conn.stream_mut())
             .await
             .context("Startup handshake failed")?;
 
         loop {
+            // Copy the deadline for this iteration so the timeout branch owns it
+            // and the other arms remain free to mutate `query_deadline`.
+            let iter_deadline = query_deadline;
             tokio::select! {
                 // Client -> Backend
                 result = self.client_stream.read(&mut client_buffer) => {
@@ -728,6 +741,11 @@ impl ConnectionHandler {
                             if should_forward {
                                 managed_conn.stream_mut().write_all(data).await.context("Failed to write to backend")?;
                             }
+
+                            // Arm the query deadline once a query is in flight.
+                            if query_timeout_enabled && query_deadline.is_none() && stmt_cache.has_pending("") {
+                                query_deadline = Some(tokio::time::Instant::now() + query_timeout_dur);
+                            }
                         }
                         Err(e) => {
                             error!(error = %e, "Failed to read from client");
@@ -798,6 +816,11 @@ impl ConnectionHandler {
                                     }
                                     metrics.record_query(&QueryTimeline::for_completed(pending.started_at), true);
                                 }
+                            }
+
+                            // Disarm the query deadline once no query is in flight.
+                            if query_timeout_enabled && !stmt_cache.has_pending("") {
+                                query_deadline = None;
                             }
 
                             // Track transaction state from ReadyForQuery messages
@@ -911,6 +934,38 @@ impl ConnectionHandler {
                             break;
                         }
                     }
+                }
+
+                // Query execution deadline expired (P3 §4.3). The backend has
+                // not answered within query_timeout; cancel by closing the
+                // (now unknown-state) connection so it is never reused.
+                _ = async move {
+                    match iter_deadline {
+                        Some(d) => tokio::time::sleep_until(d).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                }, if query_timeout_enabled && iter_deadline.is_some() => {
+                    warn!(
+                        connection_id = connection_id,
+                        timeout_secs = query_timeout_secs,
+                        "Query exceeded query_timeout; cancelling and closing backend connection"
+                    );
+
+                    metrics.record_query(&QueryTimeline::new(), false);
+                    // Mark the connection unusable so it is not returned clean.
+                    conn_state.mark_unknown_command();
+
+                    // Tell the client the statement was cancelled (SQLSTATE 57014).
+                    let err = build_error_response(
+                        "ERROR",
+                        "57014",
+                        "canceling statement due to query timeout",
+                    );
+                    let _ = self.client_stream.write_all(&err).await;
+                    let ready = Self::build_ready_for_query(txn_tracker.state());
+                    let _ = self.client_stream.write_all(&ready).await;
+
+                    break;
                 }
             }
         }

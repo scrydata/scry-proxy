@@ -273,6 +273,7 @@ Performance tuning settings.
 | `latency_budget.overhead_p95_micros` | u64 | `750` | p95 added-latency budget (µs) |
 | `latency_budget.overhead_p99_micros` | u64 | `1000` | p99 added-latency budget (µs) |
 | `latency_budget.reference_workload` | String | `oltp-point-select` | Reference workload the budget is measured against |
+| `query_timeout_secs` | u64 | `0` | Max seconds a query may run on the backend before the proxy cancels it by closing the connection (0 = disabled) |
 | `buffer_size` | usize | `8192` | TCP buffer size in bytes |
 | `pool_size` | usize | `50` | Backend connection pool size |
 | `pool_min_idle` | usize | `5` | Minimum idle connections to maintain |

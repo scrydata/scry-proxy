@@ -93,6 +93,7 @@ fn create_test_config(backend_host: String, backend_port: u16) -> Config {
         },
         performance: PerformanceConfig {
             latency_budget: scry::config::LatencyBudget::default(),
+            query_timeout_secs: 0,
             connection_pooling: PoolingStrategy::Transaction,
             pool_size: 5,
             pool_min_idle: 0,

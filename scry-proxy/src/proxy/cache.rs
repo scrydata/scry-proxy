@@ -92,6 +92,11 @@ impl PreparedStatementCache {
         self.pending.remove(portal)
     }
 
+    /// Whether a query is currently pending (in flight) for a portal.
+    pub fn has_pending(&self, portal: &str) -> bool {
+        self.pending.contains_key(portal)
+    }
+
     /// Clear pending execution for a portal.
     pub fn clear_pending(&mut self, portal: &str) {
         self.pending.remove(portal);
