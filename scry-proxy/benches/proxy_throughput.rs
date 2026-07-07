@@ -80,6 +80,8 @@ fn create_test_config(backend_host: String, backend_port: u16) -> Config {
             metrics_server_address: "127.0.0.1:0".to_string(),
             enable_metrics_server: false,
             unsafe_debug_logging: false,
+            enable_debug_endpoints: false,
+            metrics_allow_non_loopback: false,
         },
         protocol: ProtocolConfig { max_prepared_statements: 1000 },
         publisher: PublisherConfig {

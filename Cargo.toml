@@ -65,7 +65,7 @@ parking_lot = "0.12"
 axum = "0.7"
 http-body-util = "0.1"
 tower = "0.4"
-tower-http = { version = "0.5", features = ["trace", "cors"] }
+tower-http = { version = "0.5", features = ["trace"] }
 ahash = "0.8"
 
 # Integration testing

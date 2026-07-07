@@ -93,6 +93,8 @@ fn create_minimal_config() -> Config {
             enable_metrics_server: false,
             metrics_server_address: "127.0.0.1:9090".to_string(),
             unsafe_debug_logging: false,
+            enable_debug_endpoints: false,
+            metrics_allow_non_loopback: false,
         },
         protocol: ProtocolConfig { max_prepared_statements: 100 },
         publisher: PublisherConfig {

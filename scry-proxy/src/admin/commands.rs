@@ -852,6 +852,18 @@ impl AdminConsole {
             default_cfg.observability.metrics_server_address.clone(),
             CHANGEABLE,
         );
+        push(
+            "observability.metrics_allow_non_loopback",
+            bool_str(cfg.observability.metrics_allow_non_loopback).to_string(),
+            bool_str(default_cfg.observability.metrics_allow_non_loopback).to_string(),
+            CHANGEABLE,
+        );
+        push(
+            "observability.enable_debug_endpoints",
+            bool_str(cfg.observability.enable_debug_endpoints).to_string(),
+            bool_str(default_cfg.observability.enable_debug_endpoints).to_string(),
+            CHANGEABLE,
+        );
 
         // -- publisher --
         push(

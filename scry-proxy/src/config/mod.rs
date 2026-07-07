@@ -136,6 +136,21 @@ pub struct ObservabilityConfig {
     /// or credentials. Must be explicitly opted into (P1 §4.7).
     #[serde(default)]
     pub unsafe_debug_logging: bool,
+    /// Mount the `/debug/*` endpoints (pool internals, query timeline, and —
+    /// most sensitively — blake3 hot-data value fingerprints). Off by
+    /// default (P4 §4.5/§5.5). Even when `true`, `/debug/*` is only ever
+    /// mounted if `metrics_server_address` resolves to a loopback address;
+    /// see `MetricsServer::serve`. `/metrics` and `/health` are unaffected by
+    /// this flag — they carry no secrets and are always mounted.
+    #[serde(default)]
+    pub enable_debug_endpoints: bool,
+    /// Explicitly acknowledge binding the metrics/health HTTP server
+    /// (`metrics_server_address`) to a non-loopback address. Mirrors
+    /// `auth.allow_trust`: `validate()` refuses to start otherwise. Does NOT
+    /// unlock `/debug/*` on a non-loopback bind — that stays loopback-only
+    /// regardless (P4 §4.5/§5.5).
+    #[serde(default)]
+    pub metrics_allow_non_loopback: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -603,6 +618,8 @@ impl Default for Config {
                 metrics_server_address: "127.0.0.1:9090".to_string(),
                 enable_metrics_server: true,
                 unsafe_debug_logging: false,
+                enable_debug_endpoints: false,
+                metrics_allow_non_loopback: false,
             },
             protocol: ProtocolConfig { max_prepared_statements: 1000 },
             publisher: PublisherConfig {
@@ -893,6 +910,47 @@ impl Config {
                  pool_size or performance.connection_pooling = disabled.",
                 self.performance.connection_pooling
             );
+        }
+
+        // --- Fail-closed operability checks (P4 §4.5/§5.5) ---
+
+        // 10. The metrics/health HTTP server binding to a non-loopback address
+        // must be explicitly acknowledged, mirroring `auth.allow_trust`: a
+        // config mistake should not silently expose it to the network.
+        // `/debug/*` (which can leak blake3 value fingerprints, the most
+        // sensitive of the bunch) stays loopback-only regardless of this ack
+        // — if that combination is a no-op, warn rather than erroring, since
+        // `/metrics`/`/health` themselves are safe to expose.
+        if self.observability.enable_metrics_server {
+            let addr =
+                self.observability.metrics_server_address.parse::<std::net::SocketAddr>().map_err(
+                    |e| {
+                        anyhow::anyhow!(
+                            "observability.metrics_server_address ({}) is not a valid socket \
+                         address: {e}",
+                            self.observability.metrics_server_address
+                        )
+                    },
+                )?;
+
+            if !addr.ip().is_loopback() {
+                if !self.observability.metrics_allow_non_loopback {
+                    anyhow::bail!(
+                        "observability.metrics_server_address ({addr}) is not a loopback \
+                         address; the metrics/health HTTP server would be reachable from \
+                         the network. Set observability.metrics_allow_non_loopback = true \
+                         to acknowledge this and start anyway."
+                    );
+                }
+                if self.observability.enable_debug_endpoints {
+                    warnings.push(format!(
+                        "observability.enable_debug_endpoints = true but \
+                         observability.metrics_server_address ({addr}) is not loopback; \
+                         /debug/* endpoints are loopback-only by design (P4 §4.5) and will \
+                         NOT be mounted."
+                    ));
+                }
+            }
         }
 
         // --- Non-fatal warnings ---

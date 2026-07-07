@@ -140,9 +140,12 @@ services:
       SCRY_PUBLISHER__HTTP_API_KEY: "${ANALYTICS_API_KEY}"
       SCRY_PUBLISHER__ANONYMIZE: "true"
 
-      # Metrics
+      # Metrics — binding to 0.0.0.0 (rather than the loopback default) must be
+      # explicitly acknowledged, and does NOT unlock /debug/*: see "Metrics
+      # and Debug Endpoint Access Control" below.
       SCRY_OBSERVABILITY__METRICS_SERVER_ADDRESS: "0.0.0.0:9090"
       SCRY_OBSERVABILITY__ENABLE_METRICS_SERVER: "true"
+      SCRY_OBSERVABILITY__METRICS_ALLOW_NON_LOOPBACK: "true"
 
     secrets:
       - db_password
@@ -268,9 +271,13 @@ spec:
         - name: SCRY_PUBLISHER__ANONYMIZE
           value: "true"
 
-        # Metrics
+        # Metrics — binding to 0.0.0.0 must be explicitly acknowledged (see
+        # "Metrics and Debug Endpoint Access Control" below); /debug/* stays
+        # loopback-only regardless.
         - name: SCRY_OBSERVABILITY__METRICS_SERVER_ADDRESS
           value: "0.0.0.0:9090"
+        - name: SCRY_OBSERVABILITY__METRICS_ALLOW_NON_LOOPBACK
+          value: "true"
 
         resources:
           requests:
@@ -662,6 +669,45 @@ Behavior:
 **TLS**:
 - Enable TLS for Postgres connections
 - Use TLS for HTTP publisher endpoint
+
+### Metrics and Debug Endpoint Access Control
+
+The metrics HTTP server (`observability.metrics_server_address`, default
+`127.0.0.1:9090`) always mounts two unauthenticated endpoints — `/metrics`
+(Prometheus text format) and `/health` (JSON health status). Neither carries
+secrets, so they're safe to expose to a scraper.
+
+It can *also* mount three `/debug/*` endpoints — `/debug/pool`,
+`/debug/timeline`, and `/debug/hotdata` (which returns blake3 fingerprints of
+hot query values — the most sensitive endpoint in the proxy). These are
+**off by default** and controlled by two config knobs:
+
+- `observability.enable_debug_endpoints` (`SCRY_OBSERVABILITY__ENABLE_DEBUG_ENDPOINTS`,
+  default `false`): opts into mounting `/debug/*` at all.
+- **`/debug/*` is loopback-only, unconditionally.** Even with
+  `enable_debug_endpoints = true`, the proxy only mounts `/debug/*` if the
+  metrics server is actually bound to a loopback address (`127.0.0.0/8` or
+  `::1`). On any other bind, `/debug/*` returns 404 — there is no
+  configuration that makes it reachable off-box. If you need `/debug/*`,
+  keep the metrics bind on loopback and reach it via SSH tunnel, `kubectl
+  port-forward`, or a sidecar on the same network namespace/pod.
+
+Separately, binding the metrics server itself to a non-loopback address (e.g.
+`0.0.0.0` for a scraper in another pod/container) must be explicitly
+acknowledged:
+
+- `observability.metrics_allow_non_loopback`
+  (`SCRY_OBSERVABILITY__METRICS_ALLOW_NON_LOOPBACK`, default `false`): if
+  `enable_metrics_server = true` and `metrics_server_address` resolves to a
+  non-loopback address, `Config::validate()` refuses to start unless this is
+  `true` (mirrors `auth.allow_trust`'s "explicit ack" pattern). The default
+  `127.0.0.1:9090` bind needs no ack.
+
+Setting `metrics_allow_non_loopback = true` only unlocks `/metrics` and
+`/health` on that bind — it does **not** unlock `/debug/*`; that stays gated
+by the loopback check above regardless. If both `enable_debug_endpoints =
+true` and a non-loopback bind are configured together, startup still
+succeeds (a warning is logged) but `/debug/*` will not actually be reachable.
 
 ### Run as Non-Root
 
