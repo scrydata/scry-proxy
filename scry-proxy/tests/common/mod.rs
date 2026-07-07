@@ -304,6 +304,48 @@ pub async fn paired_clients(
     Ok(PairedClients { proxy_port, proxy, direct })
 }
 
+/// Starts a proxy in front of `backend_host:backend_port` with the given
+/// pooling mode, capping the pool to exactly `pool_size` physical backend
+/// connections — the CRIT-1 recycle pattern from `connection_multiplexing.rs`
+/// (`test_sequential_connection_reuse` et al.). Returns only the proxy's
+/// listen port (no direct/ground-truth client): callers of this are probing
+/// pooled-connection hygiene (WP-9 Task 8, P2 §5.3), not direct-vs-proxy
+/// transparency, so they connect their own clients via [`connect_client`].
+///
+/// With `pool_size` connections capped, a second client's connect is FORCED
+/// to wait for and reuse the exact physical connection(s) a prior client
+/// released — genuine reuse, not merely likely reuse on a shared Docker
+/// container. Callers should confirm this landed on the intended physical
+/// connection via `SELECT pg_backend_pid()` (recycle resets session state
+/// with `DISCARD ALL` but never changes the backend PID), rather than
+/// trusting pool sizing alone.
+///
+/// Only `performance.pool_size` is actually wired into deadpool's
+/// `Pool::max_size` (`server.rs` routes the default database's pool size from
+/// `config.performance.pool_size` via `DatabaseRouter`, never from
+/// `config.backend.pool_size`). Both are set here for clarity/parity with
+/// `connection_multiplexing.rs`'s pattern, but `performance.pool_size` is the
+/// one that's load-bearing. `pool_min_idle` is forced to 0 so pre-warming
+/// can't race the single slot at proxy startup.
+pub async fn start_pool_capped_proxy(
+    backend_host: &str,
+    backend_port: u16,
+    pooling: PoolingStrategy,
+    pool_size: usize,
+) -> anyhow::Result<u16> {
+    let mut config = create_test_config(backend_host.to_string(), backend_port, pooling);
+    config.backend.pool_size = pool_size;
+    config.performance.pool_size = pool_size;
+    config.performance.pool_min_idle = 0;
+    let publisher: Arc<dyn EventPublisher> = Arc::new(TestPublisher::new());
+    let proxy_port = start_test_proxy(config, publisher).await?;
+
+    // Give the proxy listener a moment to come up before connecting.
+    sleep(Duration::from_millis(300)).await;
+
+    Ok(proxy_port)
+}
+
 // ---------------------------------------------------------------------------
 // Result comparator
 // ---------------------------------------------------------------------------

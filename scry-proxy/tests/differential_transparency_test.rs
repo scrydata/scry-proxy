@@ -393,3 +393,423 @@ async fn transaction_mode_prepared_statement_honesty() {
     let value: i64 = rows[0].get(0);
     assert_eq!(value, 7, "prepared statement returned the wrong value after the txn boundary");
 }
+
+/// §5.3 dirty-connection invariant auditor (WP-9 Task 8, P2 §5.3) — Hybrid mode.
+///
+/// Proves BOTH halves of the named invariant on a connection that is
+/// GENUINELY recycled between clients, not merely assumed to be:
+///
+/// (a) **Cleanliness**: once client A's logical session ends (disconnects),
+///     NONE of the state it left on the backend connection is observable to
+///     a fresh client B that gets handed the exact same physical connection.
+/// (b) **No silent drop**: state a client is still actively using (mid-
+///     session, well past the point an unpinned connection would have been
+///     recycled out from under it) MUST survive — the fail-closed guarantee
+///     Task 4/6 established, asserted here explicitly as the §5.3 invariant.
+///
+/// # Forcing genuine reuse (not a vacuous pass)
+/// Uses [`start_pool_capped_proxy`] with `pool_size = 1` (the CRIT-1 pattern
+/// from `connection_multiplexing.rs`): with exactly one physical backend
+/// connection possible, client B's `connect()` cannot proceed until client
+/// A's connection is returned to the pool, and there is no other connection
+/// it could possibly receive. This is confirmed, not just argued, by reading
+/// `SELECT pg_backend_pid()` from each client and asserting they match:
+/// `DISCARD ALL` resets session state but never changes the backend process,
+/// so identical PIDs are direct proof of physical-connection reuse. Client C
+/// (invariant (b)) reuses the same single connection again after client B
+/// disconnects, so its pid is checked too.
+///
+/// # RED, by design, not by test bug — see task report
+/// This anti-vacuity guardrail (comparing `pg_backend_pid()`) currently FAILS:
+/// client B lands on a genuinely NEW backend pid, not client A's. Root cause,
+/// confirmed via `RUST_LOG=debug` (`scry::proxy::tcp_pool` recycle logs +
+/// `scry::protocol::postgres` health-check logs): when client A disconnects,
+/// `tokio_postgres`'s own connection driver sends a real `Terminate` ('X')
+/// message before closing its socket (standard, spec-compliant client
+/// behavior — see `tokio-postgres-0.7.18/src/connection.rs`, the
+/// `"at eof, terminating"` branch). `ConnectionHandler`'s client-read loop
+/// (`connection.rs`, the `match msg { Message::Parse { .. } => .., ...,
+/// _ => {} }` block around line 701) has NO arm for `Message::Terminate`, so
+/// it falls into the catch-all `_ => {}` and `should_forward` stays `true` —
+/// the client's Terminate is forwarded verbatim to the REAL backend, which
+/// immediately closes the session. The now-dead socket is then released to
+/// the pool; deadpool's next `recycle()` health-check finds it already EOF
+/// (`Connection closed while waiting for ReadyForQuery`) and discards it,
+/// silently creating a fresh backend connection for the very next client.
+/// This is not specific to Hybrid mode or to this test's probes — it is a
+/// pooling-strategy-independent gap in the shared connection-teardown path,
+/// so it defeats genuine cross-client backend-connection reuse for the most
+/// common real-world disconnect pattern (any well-behaved client). See the
+/// task report for the full diagnosis; this test is left RED per the task
+/// brief rather than weakened to accept a fresh connection as "reused."
+#[tokio::test]
+async fn dirty_connection_invariant_hybrid_mode() {
+    let docker = Cli::default();
+    let postgres_image = RunnableImage::from(Postgres::default()).with_tag("16-alpine");
+    let postgres = docker.run(postgres_image);
+    let postgres_port = postgres.get_host_port_ipv4(5432);
+    let postgres_host = "127.0.0.1";
+
+    sleep(Duration::from_secs(2)).await;
+
+    let proxy_port = start_pool_capped_proxy(
+        postgres_host,
+        postgres_port,
+        scry::config::PoolingStrategy::Hybrid,
+        1,
+    )
+    .await
+    .expect("failed to start pool-capped Hybrid proxy");
+
+    // --- Client A: dirty the connection via BOTH protocol variants, then disconnect. ---
+    let client_a = connect_client("127.0.0.1", proxy_port, "postgres", "postgres", "postgres")
+        .await
+        .expect("client A failed to connect");
+
+    let pid_a: i32 = client_a
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .expect("client A pid query")
+        .get(0);
+
+    client_a
+        .simple_query("SET application_name = 'wp9_dirty_probe_simple'")
+        .await
+        .expect("simple-protocol SET should succeed in Hybrid mode");
+    client_a
+        .execute("SET statement_timeout = '424242'", &[])
+        .await
+        .expect("extended-protocol SET should succeed in Hybrid mode");
+    client_a
+        .simple_query("CREATE TEMP TABLE wp9_dirty_temp (x int)")
+        .await
+        .expect("CREATE TEMP TABLE should succeed in Hybrid mode");
+    client_a
+        .execute("SELECT pg_advisory_lock(918273)", &[])
+        .await
+        .expect("advisory lock should succeed in Hybrid mode");
+    client_a
+        .simple_query("PREPARE wp9_dirty_stmt AS SELECT 1")
+        .await
+        .expect("PREPARE should succeed");
+
+    // Client A's logical session ends. Disconnect entirely — the connection
+    // handler's final `pool_manager.release(managed_conn)` runs on this path
+    // unconditionally (regardless of any pin), returning the physical
+    // connection to deadpool, whose `recycle()` hook runs `DISCARD ALL`
+    // before it is handed to anyone else.
+    drop(client_a);
+    sleep(Duration::from_millis(300)).await;
+
+    // --- Client B: a fresh logical session on the same pooled proxy port. ---
+    let client_b = connect_client("127.0.0.1", proxy_port, "postgres", "postgres", "postgres")
+        .await
+        .expect("client B failed to connect");
+
+    let pid_b: i32 = client_b
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .expect("client B pid query")
+        .get(0);
+    assert_eq!(
+        pid_a, pid_b,
+        "test did not exercise genuine connection reuse (different backend pids) — \
+         cleanliness would be proven vacuously on a fresh connection, not a recycled one. \
+         KNOWN GAP (WP-9 Task 8, P2 §5.3): the client's graceful-disconnect Terminate ('X') \
+         message is forwarded verbatim to the real backend by connection.rs's client-read \
+         loop (no Message::Terminate arm; falls into `_ => {{}}` with should_forward still \
+         true), which closes the actual Postgres session before the pool can return it warm — \
+         see task report for full diagnosis"
+    );
+
+    // Invariant (a) probe 1: simple-protocol SET must not leak.
+    let app_name: String = client_b
+        .query_one("SHOW application_name", &[])
+        .await
+        .expect("SHOW application_name")
+        .get(0);
+    assert_ne!(
+        app_name, "wp9_dirty_probe_simple",
+        "simple-protocol SET leaked across a genuinely recycled pooled connection"
+    );
+
+    // Invariant (a) probe 2: extended-protocol SET must not leak.
+    let stmt_timeout: String = client_b
+        .query_one("SHOW statement_timeout", &[])
+        .await
+        .expect("SHOW statement_timeout")
+        .get(0);
+    assert_eq!(
+        stmt_timeout, "0",
+        "extended-protocol SET leaked across a genuinely recycled pooled connection \
+         (expected default '0', got '{stmt_timeout}')"
+    );
+
+    // Invariant (a) probe 3: temp table must not leak.
+    let visible: Option<String> = client_b
+        .query_one("SELECT to_regclass('pg_temp.wp9_dirty_temp')::text", &[])
+        .await
+        .expect("to_regclass query")
+        .get(0);
+    assert!(
+        visible.is_none(),
+        "temp table leaked across a genuinely recycled pooled connection (to_regclass returned {visible:?})"
+    );
+
+    // Invariant (a) probe 4: advisory lock must not leak (a fresh try-lock on
+    // the same key must succeed, proving nothing on this backend still holds it).
+    let acquired: bool = client_b
+        .query_one("SELECT pg_try_advisory_lock(918273)", &[])
+        .await
+        .expect("pg_try_advisory_lock query")
+        .get(0);
+    assert!(
+        acquired,
+        "advisory lock leaked across a genuinely recycled pooled connection \
+         (pg_try_advisory_lock returned false — still held)"
+    );
+    let _ = client_b.execute("SELECT pg_advisory_unlock(918273)", &[]).await;
+
+    // Invariant (a) probe 5: prepared statement must not leak — EXECUTE by
+    // name on the fresh client must fail as unprepared, not succeed.
+    match client_b.simple_query("EXECUTE wp9_dirty_stmt").await {
+        Err(e) => {
+            assert_eq!(
+                e.code().map(|c| c.code()),
+                Some("26000"),
+                "expected undefined_pstmt (26000) executing a leaked-name prepared statement, got {:?}",
+                e.code()
+            );
+        }
+        Ok(_) => panic!(
+            "prepared statement wp9_dirty_stmt LEAKED to a fresh, genuinely-recycled pooled client"
+        ),
+    }
+
+    drop(client_b);
+    sleep(Duration::from_millis(300)).await;
+
+    // --- Client C: invariant (b) — state this client still needs must survive. ---
+    let client_c = connect_client("127.0.0.1", proxy_port, "postgres", "postgres", "postgres")
+        .await
+        .expect("client C failed to connect");
+
+    let pid_c: i32 = client_c
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .expect("client C pid query")
+        .get(0);
+    assert_eq!(pid_a, pid_c, "client C did not land on the same genuinely-recycled connection");
+
+    // Simple-protocol GUC + temp table, wrapped in an explicit transaction:
+    // `connection.rs` only evaluates its Hybrid release decision when a
+    // transaction completes (never for autocommit statements), so this is
+    // what exercises the release-vs-pin decision at all.
+    client_c.simple_query("BEGIN").await.expect("BEGIN");
+    client_c
+        .simple_query("SET application_name = 'wp9_survive_probe'")
+        .await
+        .expect("SET inside txn");
+    client_c
+        .simple_query("CREATE TEMP TABLE wp9_survive_temp (y int)")
+        .await
+        .expect("CREATE TEMP TABLE inside txn");
+    client_c.simple_query("COMMIT").await.expect("COMMIT");
+
+    // Enough further activity that an un-pinned connection would already
+    // have been released back to the pool (and DISCARD-ALL reset) by now.
+    for _ in 0..5 {
+        client_c.simple_query("SELECT 1").await.expect("keepalive SELECT 1");
+    }
+
+    let app_name: String = client_c
+        .query_one("SHOW application_name", &[])
+        .await
+        .expect("SHOW application_name")
+        .get(0);
+    assert_eq!(
+        app_name, "wp9_survive_probe",
+        "GUC set via SIMPLE protocol was silently dropped — Hybrid mode recycled the \
+         connection instead of pinning it (§5.3 fail-closed violation)"
+    );
+
+    let visible: Option<String> = client_c
+        .query_one("SELECT to_regclass('pg_temp.wp9_survive_temp')::text", &[])
+        .await
+        .expect("to_regclass query")
+        .get(0);
+    assert!(
+        visible.is_some(),
+        "temp table created via SIMPLE protocol was silently dropped — Hybrid mode recycled \
+         the connection instead of pinning it (§5.3 fail-closed violation)"
+    );
+
+    // Same invariant, extended protocol — Task 4/6's own guardrail, asserted
+    // again here explicitly as the named §5.3 fail-closed invariant.
+    assert_extended_state_survives_hybrid_recycle(
+        &client_c,
+        proxy_port,
+        "postgres",
+        "postgres",
+        "postgres",
+        "wp9_survive_ext_guc",
+        "wp9_survive_ext_value",
+    )
+    .await
+    .expect("extended-protocol state must survive the Hybrid recycle boundary (§5.3)");
+}
+
+/// §5.3 dirty-connection invariant auditor (WP-9 Task 8, P2 §5.3) — Transaction mode.
+///
+/// Same two invariants as [`dirty_connection_invariant_hybrid_mode`], scoped to
+/// what strict Transaction pooling actually allows: `SET`/temp-table/cursor/
+/// advisory-lock ops are rejected outside a transaction (0A000) and CREATE TEMP
+/// TABLE/cursors/advisory locks are rejected unconditionally (`mode_enforcer.rs`),
+/// so they cannot establish leakable state in this mode at all — asserting their
+/// rejection is already covered elsewhere. What CAN carry state here: a `SET`
+/// executed *inside* an explicit transaction (allowed even in Transaction mode),
+/// and a prepared statement (`PREPARE`, allowed unconditionally). Both are probed
+/// for non-leakage; the prepared statement is also probed for fail-closed
+/// persistence (invariant (b)), mirroring `transaction_mode_prepared_statement_honesty`
+/// but framed explicitly as the §5.3 invariant and run on a connection whose
+/// physical reuse is confirmed via matching `pg_backend_pid()`, exactly as in the
+/// Hybrid-mode test above.
+///
+/// # RED, by design, not by test bug
+/// Same anti-vacuity guardrail as [`dirty_connection_invariant_hybrid_mode`], and
+/// it fails for the identical, pooling-strategy-independent reason: the client's
+/// graceful-disconnect `Terminate` is forwarded to the real backend instead of
+/// being intercepted, killing the physical connection before the pool can return
+/// it warm. See that test's doc comment for the full diagnosis and the task
+/// report for further detail.
+#[tokio::test]
+async fn dirty_connection_invariant_transaction_mode() {
+    use tokio_postgres::types::Type;
+
+    let docker = Cli::default();
+    let postgres_image = RunnableImage::from(Postgres::default()).with_tag("16-alpine");
+    let postgres = docker.run(postgres_image);
+    let postgres_port = postgres.get_host_port_ipv4(5432);
+    let postgres_host = "127.0.0.1";
+
+    sleep(Duration::from_secs(2)).await;
+
+    let proxy_port = start_pool_capped_proxy(
+        postgres_host,
+        postgres_port,
+        scry::config::PoolingStrategy::Transaction,
+        1,
+    )
+    .await
+    .expect("failed to start pool-capped Transaction-mode proxy");
+
+    // --- Client A: establish state, then disconnect. ---
+    let client_a = connect_client("127.0.0.1", proxy_port, "postgres", "postgres", "postgres")
+        .await
+        .expect("client A failed to connect");
+
+    let pid_a: i32 = client_a
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .expect("client A pid query")
+        .get(0);
+
+    // SET is rejected outside a transaction in strict Transaction mode, but
+    // allowed inside one (scoped to the transaction) — this is the only
+    // GUC-leak vector available in this mode.
+    client_a.simple_query("BEGIN").await.expect("BEGIN");
+    client_a
+        .simple_query("SET application_name = 'wp9_txn_dirty_probe'")
+        .await
+        .expect("SET inside txn should be allowed even in Transaction mode");
+    client_a.simple_query("COMMIT").await.expect("COMMIT");
+
+    client_a
+        .simple_query("PREPARE wp9_txn_dirty_stmt AS SELECT 1")
+        .await
+        .expect("PREPARE should be allowed in Transaction mode");
+
+    drop(client_a);
+    sleep(Duration::from_millis(300)).await;
+
+    // --- Client B: fresh session, must observe none of A's state. ---
+    let client_b = connect_client("127.0.0.1", proxy_port, "postgres", "postgres", "postgres")
+        .await
+        .expect("client B failed to connect");
+
+    let pid_b: i32 = client_b
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .expect("client B pid query")
+        .get(0);
+    assert_eq!(
+        pid_a, pid_b,
+        "test did not exercise genuine connection reuse (different backend pids) — \
+         cleanliness would be proven vacuously on a fresh connection, not a recycled one. \
+         KNOWN GAP (WP-9 Task 8, P2 §5.3): the client's graceful-disconnect Terminate ('X') \
+         message is forwarded verbatim to the real backend by connection.rs's client-read \
+         loop (no Message::Terminate arm; falls into `_ => {{}}` with should_forward still \
+         true), which closes the actual Postgres session before the pool can return it warm — \
+         see task report for full diagnosis"
+    );
+
+    let app_name: String = client_b
+        .query_one("SHOW application_name", &[])
+        .await
+        .expect("SHOW application_name")
+        .get(0);
+    assert_eq!(
+        app_name, "",
+        "GUC set inside a transaction leaked across a genuinely recycled Transaction-mode \
+         connection (expected default '', got '{app_name}')"
+    );
+
+    match client_b.simple_query("EXECUTE wp9_txn_dirty_stmt").await {
+        Err(e) => {
+            assert_eq!(
+                e.code().map(|c| c.code()),
+                Some("26000"),
+                "expected undefined_pstmt (26000) executing a leaked-name prepared statement, got {:?}",
+                e.code()
+            );
+        }
+        Ok(_) => panic!(
+            "prepared statement wp9_txn_dirty_stmt LEAKED to a fresh, genuinely-recycled \
+             Transaction-mode client"
+        ),
+    }
+
+    drop(client_b);
+    sleep(Duration::from_millis(300)).await;
+
+    // --- Client C: invariant (b) — a prepared statement client C still needs
+    // must survive a completed transaction boundary (restrict-by-pinning),
+    // not be silently destroyed by an unpinned release + DISCARD ALL.
+    let client_c = connect_client("127.0.0.1", proxy_port, "postgres", "postgres", "postgres")
+        .await
+        .expect("client C failed to connect");
+
+    let pid_c: i32 = client_c
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .expect("client C pid query")
+        .get(0);
+    assert_eq!(pid_a, pid_c, "client C did not land on the same genuinely-recycled connection");
+
+    let stmt = client_c
+        .prepare_typed("SELECT $1", &[Type::INT8])
+        .await
+        .expect("prepare_typed should succeed through the proxy in Transaction mode");
+
+    client_c.batch_execute("BEGIN").await.expect("BEGIN");
+    client_c.batch_execute("SELECT 1").await.expect("SELECT 1 within transaction");
+    client_c.batch_execute("COMMIT").await.expect("COMMIT");
+
+    let rows = client_c.query(&stmt, &[&7i64]).await.expect(
+        "cached prepared statement must survive a Transaction-mode release boundary \
+         (restrict-by-pinning, §5.3 fail-closed invariant) — a failure here is the silent \
+         prepared-statement destruction this test guards against",
+    );
+    let value: i64 = rows[0].get(0);
+    assert_eq!(value, 7, "prepared statement returned the wrong value after the txn boundary");
+}
