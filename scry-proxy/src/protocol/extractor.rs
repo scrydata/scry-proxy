@@ -15,14 +15,30 @@ struct ErrorFields {
     message: Option<String>,
 }
 
+/// Practical upper bound on a single frontend (client->backend) message's
+/// framed length field. `extract_messages` buffers incomplete trailing bytes
+/// across calls so a message split across TCP reads can be reassembled; this
+/// bound keeps that buffer from growing without limit when the length field is
+/// garbled or adversarial. Legitimate `Parse`/`Bind` payloads (large SQL text,
+/// bulk parameter data) are expected to stay well under this; anything beyond
+/// it is treated as a framing error rather than buffered indefinitely.
+const MAX_FRONTEND_MESSAGE_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
+
 /// Extracts query information from Postgres wire protocol messages
 pub struct MessageExtractor {
     buffer: Mutex<Vec<u8>>,
+    /// Reassembly buffer for `extract_messages`, used ONLY on the client->backend
+    /// (frontend) direction. Deliberately kept separate from `buffer` (used only
+    /// by the legacy `extract_query`) so the two accumulation paths can never
+    /// interfere with each other, even if a future caller invoked both on the
+    /// same `MessageExtractor` instance. See extractor.rs module docs / WP-9
+    /// Task 3 report for the verification that today nothing does.
+    frontend_buffer: Mutex<Vec<u8>>,
 }
 
 impl MessageExtractor {
     pub fn new() -> Self {
-        Self { buffer: Mutex::new(Vec::new()) }
+        Self { buffer: Mutex::new(Vec::new()), frontend_buffer: Mutex::new(Vec::new()) }
     }
 
     /// Try to extract a query from the given data
@@ -327,28 +343,71 @@ impl MessageExtractor {
 
     /// Extract ALL messages from raw protocol data
     ///
-    /// Returns a Vec of all parsed Message enums from the buffer.
+    /// Returns a Vec of all parsed Message enums seen so far, INCLUDING any
+    /// left over from a previous call whose trailing bytes were incomplete.
     /// Extended query protocol bundles multiple messages (Parse+Bind+Execute+Sync)
     /// in a single TCP packet, so we need to extract them all.
+    ///
+    /// This method is observational only — it never mutates or drops bytes from
+    /// the forwarded stream; callers pass the original `data` slice through to
+    /// the backend unchanged regardless of what this returns. It reassembles
+    /// frontend messages that are split across multiple `read()` calls (or that
+    /// exceed a single read buffer) by retaining any incomplete trailing bytes
+    /// in an internal buffer and prepending them on the next call. This buffer
+    /// is used ONLY for the client->backend direction (see `frontend_buffer`
+    /// docs); it must never be shared with a backend->client scan.
+    ///
+    /// Malformed input (a framing length that is invalid or implausibly large)
+    /// is treated as a framing error: any messages successfully parsed so far
+    /// this call are still returned, but the retained buffer is discarded
+    /// rather than grown without bound. Because downstream state-tracking is
+    /// fail-closed (unknown state -> pinned connection), a dropped/garbled
+    /// parse degrades to reduced pooling, never to stream corruption or a panic.
     pub fn extract_messages(&self, data: &[u8]) -> Vec<Message> {
         let mut messages = Vec::new();
+
+        let Ok(mut buffer) = self.frontend_buffer.lock() else {
+            // Poisoned lock: fail closed for this call rather than panic.
+            // Observational path only — forwarding is unaffected.
+            warn!("frontend reassembly buffer lock poisoned; dropping this chunk");
+            return messages;
+        };
+
+        buffer.extend_from_slice(data);
+
         let mut offset = 0;
+        let mut framing_error = false;
 
-        while offset + 5 <= data.len() {
-            let msg_type = data[offset];
-            let length = i32::from_be_bytes([
-                data[offset + 1],
-                data[offset + 2],
-                data[offset + 3],
-                data[offset + 4],
-            ]) as usize;
+        while offset + 5 <= buffer.len() {
+            let msg_type = buffer[offset];
+            let length_i32 = i32::from_be_bytes([
+                buffer[offset + 1],
+                buffer[offset + 2],
+                buffer[offset + 3],
+                buffer[offset + 4],
+            ]);
 
-            // Check if we have the complete message
-            if offset + 1 + length > data.len() {
-                break; // Incomplete message
+            // The length field includes itself (4 bytes) but not the type byte,
+            // so a valid length is always >= 4. Reject negative/implausible
+            // values before doing any arithmetic on them.
+            if length_i32 < 4 || length_i32 as usize > MAX_FRONTEND_MESSAGE_SIZE {
+                warn!(
+                    msg_type = msg_type,
+                    length = length_i32,
+                    max = MAX_FRONTEND_MESSAGE_SIZE,
+                    "Invalid or oversized frontend message length; discarding buffered frontend bytes"
+                );
+                framing_error = true;
+                break;
+            }
+            let length = length_i32 as usize;
+
+            // Check if we have the complete message.
+            if offset + 1 + length > buffer.len() {
+                break; // Incomplete message: retain from `offset` for next call.
             }
 
-            let payload = &data[offset + 5..offset + 1 + length];
+            let payload = &buffer[offset + 5..offset + 1 + length];
 
             let msg = match msg_type {
                 MSG_QUERY => self.parse_query_message(payload),
@@ -366,6 +425,16 @@ impl MessageExtractor {
             }
 
             offset += 1 + length;
+        }
+
+        if framing_error {
+            // Fail-closed: drop everything currently buffered (including bytes
+            // after the bad frame, which can no longer be reliably
+            // resynchronized) rather than let the buffer grow unbounded or wedge.
+            buffer.clear();
+        } else if offset > 0 {
+            // Retain only the unconsumed tail for the next call.
+            buffer.drain(0..offset);
         }
 
         messages
@@ -1006,6 +1075,158 @@ mod tests {
         let extractor = MessageExtractor::new();
         let msg = vec![MSG_READY_FOR_QUERY, 0, 0, 0, 5, b'I'];
         assert!(extractor.is_query_complete(&msg));
+    }
+
+    /// CRIT (WP-9 Task 3): a `Parse` message carrying a `SET` statement, split
+    /// across two `extract_messages` calls (simulating two TCP reads), must be
+    /// reassembled into a single `Message::Parse` — not silently discarded.
+    #[test]
+    fn test_extract_messages_reassembles_split_parse() {
+        let extractor = MessageExtractor::new();
+
+        // Build a Parse message: 'P' + length + name\0 + query\0 + num_params(0)
+        let mut msg = vec![MSG_PARSE];
+        let len_pos = msg.len();
+        msg.extend_from_slice(&[0, 0, 0, 0]);
+        msg.extend_from_slice(b"stmt1");
+        msg.push(0);
+        msg.extend_from_slice(b"SET search_path TO public");
+        msg.push(0);
+        msg.extend_from_slice(&0i16.to_be_bytes()); // 0 param types
+        let len = (msg.len() - 1) as i32;
+        msg[len_pos..len_pos + 4].copy_from_slice(&len.to_be_bytes());
+
+        // Split the message roughly in half, across the header/payload boundary.
+        let split = msg.len() / 2;
+        let (first, second) = msg.split_at(split);
+
+        let msgs_first = extractor.extract_messages(first);
+        assert!(msgs_first.is_empty(), "incomplete message must not be emitted yet");
+
+        let msgs_second = extractor.extract_messages(second);
+        assert_eq!(msgs_second.len(), 1, "split Parse must be reassembled on the next call");
+        match &msgs_second[0] {
+            Message::Parse { name, query, param_oids } => {
+                assert_eq!(name, "stmt1");
+                assert_eq!(query, "SET search_path TO public");
+                assert!(param_oids.is_empty());
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    /// A simple `Query` message split across two `extract_messages` calls must
+    /// also be reassembled correctly.
+    #[test]
+    fn test_extract_messages_reassembles_split_query() {
+        let extractor = MessageExtractor::new();
+
+        let query = b"SELECT 1";
+        let length = (query.len() + 1 + 4) as i32;
+        let mut msg = vec![MSG_QUERY];
+        msg.extend_from_slice(&length.to_be_bytes());
+        msg.extend_from_slice(query);
+        msg.push(0);
+
+        let split = 3; // cut inside the 5-byte header
+        let (first, second) = msg.split_at(split);
+
+        let msgs_first = extractor.extract_messages(first);
+        assert!(msgs_first.is_empty());
+
+        let msgs_second = extractor.extract_messages(second);
+        assert_eq!(msgs_second.len(), 1);
+        match &msgs_second[0] {
+            Message::Query { query } => assert_eq!(query, "SELECT 1"),
+            other => panic!("expected Query, got {other:?}"),
+        }
+    }
+
+    /// A message larger than a typical read buffer, split across MANY calls,
+    /// must still be reassembled — reassembly must accumulate across more than
+    /// just two reads.
+    #[test]
+    fn test_extract_messages_reassembles_across_many_small_reads() {
+        let extractor = MessageExtractor::new();
+
+        let long_query = "x".repeat(20_000);
+        let query_bytes = long_query.as_bytes();
+        let length = (query_bytes.len() + 1 + 4) as i32;
+        let mut msg = vec![MSG_QUERY];
+        msg.extend_from_slice(&length.to_be_bytes());
+        msg.extend_from_slice(query_bytes);
+        msg.push(0);
+
+        let mut all = Vec::new();
+        for chunk in msg.chunks(37) {
+            all.extend(extractor.extract_messages(chunk));
+        }
+
+        assert_eq!(all.len(), 1);
+        match &all[0] {
+            Message::Query { query } => assert_eq!(query, &long_query),
+            other => panic!("expected Query, got {other:?}"),
+        }
+    }
+
+    /// Two complete messages in one call are both extracted, and any following
+    /// incomplete tail is retained for the next call (regression for the
+    /// existing multi-message-per-read path).
+    #[test]
+    fn test_extract_messages_multiple_complete_plus_trailing_partial() {
+        let extractor = MessageExtractor::new();
+
+        let mut msg = vec![];
+        // First: Sync (1 + 4 = 5 bytes, length=4)
+        msg.extend_from_slice(&[MSG_SYNC, 0, 0, 0, 4]);
+        // Second: Sync again
+        msg.extend_from_slice(&[MSG_SYNC, 0, 0, 0, 4]);
+        // Trailing partial: start of a third Sync, header only half written
+        msg.extend_from_slice(&[MSG_SYNC, 0, 0]);
+
+        let result = extractor.extract_messages(&msg);
+        assert_eq!(result, vec![Message::Sync, Message::Sync]);
+
+        // Complete the trailing partial in a second call.
+        let rest = extractor.extract_messages(&[0, 4]);
+        assert_eq!(rest, vec![Message::Sync]);
+    }
+
+    /// A malformed length field (< 4) must not panic and must not wedge the
+    /// buffer — it is treated as a framing error and the buffered bytes are
+    /// dropped (fail-closed: less pooling, never corruption of forwarded bytes).
+    #[test]
+    fn test_extract_messages_malformed_length_does_not_panic_or_wedge() {
+        let extractor = MessageExtractor::new();
+
+        // Type byte + a length field of 0 (invalid: must be >= 4).
+        let bad = vec![MSG_SYNC, 0, 0, 0, 0];
+        let result = extractor.extract_messages(&bad);
+        assert!(result.is_empty());
+
+        // A subsequent, well-formed message must parse normally — proving the
+        // buffer didn't wedge on garbage.
+        let good = extractor.extract_messages(&[MSG_SYNC, 0, 0, 0, 4]);
+        assert_eq!(good, vec![Message::Sync]);
+    }
+
+    /// An implausibly large framed length must be rejected rather than causing
+    /// the reassembly buffer to grow without bound.
+    #[test]
+    fn test_extract_messages_oversized_length_is_rejected() {
+        let extractor = MessageExtractor::new();
+
+        let mut msg = vec![MSG_QUERY];
+        // Length far beyond any sane message size.
+        msg.extend_from_slice(&(i32::MAX).to_be_bytes());
+        msg.extend_from_slice(b"not actually this long");
+
+        let result = extractor.extract_messages(&msg);
+        assert!(result.is_empty());
+
+        // Buffer must not have wedged: a subsequent well-formed message parses.
+        let good = extractor.extract_messages(&[MSG_SYNC, 0, 0, 0, 4]);
+        assert_eq!(good, vec![Message::Sync]);
     }
 
     #[test]
