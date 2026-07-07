@@ -5,7 +5,7 @@
 # Build:
 #   docker build -t scry-proxy .
 
-FROM rust:1.85-bookworm AS builder
+FROM rust:1.85-bookworm@sha256:e51d0265072d2d9d5d320f6a44dde6b9ef13653b035098febd68cce8fa7c0bc4 AS builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
@@ -28,7 +28,7 @@ RUN sed -i 's|members = \["scry-proxy", "benchmarks"\]|members = ["scry-proxy"]|
 RUN cargo build --release --package scry
 
 # Runtime stage
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
