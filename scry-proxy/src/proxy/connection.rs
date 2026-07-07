@@ -271,6 +271,31 @@ impl ConnectionHandler {
         }
     }
 
+    /// WP-9 Task 8 review fix (Fix 1) — decide whether a `Terminate` found at
+    /// `message_index` within THIS read buffer's parsed message list
+    /// (`extractor.extract_messages(data)`, zero-based) is safe to intercept
+    /// (kept off the wire so the backend survives for warm reuse), or must
+    /// instead be forwarded to the backend like any other message.
+    ///
+    /// # The sole-leading-Terminate predicate
+    ///
+    /// Only `message_index == 0` — i.e. Terminate is the FIRST parsed message
+    /// for this buffer, so no other message from the same client `read()`
+    /// precedes it — is intercepted. If a client pipelines another message
+    /// (e.g. `Sync`, `Query`) immediately before `Terminate` in one read, the
+    /// prior whole-buffer `should_forward = false` unconditionally dropped
+    /// that preceding message before it ever reached the backend — a
+    /// transparency violation strictly worse than losing the reuse
+    /// optimization. Returning `false` here forwards the entire buffer
+    /// (including the trailing Terminate bytes) verbatim instead, exactly
+    /// matching pre-Task-8 behavior for this rare pipelined case: the backend
+    /// receives the Terminate at the end of the stream and closes, so this
+    /// one connection simply isn't warm-reused. Correctness over the
+    /// optimization, always.
+    fn should_intercept_terminate(message_index: usize) -> bool {
+        message_index == 0
+    }
+
     /// Classifies the SQL carried by a `Parse` message and applies the
     /// resulting session-state pin to `conn_state`, then records the
     /// prepared statement for the pin tracker (WP-9 Task 4, P2 §4.2).
@@ -865,7 +890,7 @@ impl ConnectionHandler {
                             let mut client_terminated = false;
 
                             // Process ALL protocol messages in buffer
-                            for msg in extractor.extract_messages(data) {
+                            for (msg_index, msg) in extractor.extract_messages(data).into_iter().enumerate() {
                                 match msg {
                                     Message::Parse { ref name, ref query, ref param_oids } => {
                                         // Validate command against pooling mode
@@ -965,14 +990,37 @@ impl ConnectionHandler {
                                     // ONLY message we deliberately do not forward — a
                                     // connection-lifecycle signal the pool owns, not a data-stream
                                     // rewrite. (The owned/non-pooled path still forwards it 1:1.)
+                                    //
+                                    // WP-9 Task 8 review fix (Fix 1): a whole-buffer
+                                    // `should_forward = false` is only safe when Terminate is
+                                    // the SOLE / leading message this read produced
+                                    // (`should_intercept_terminate`, i.e. no preceding message
+                                    // in the same buffer). If the client pipelined another
+                                    // message (e.g. `Sync`, `Query`) immediately before
+                                    // Terminate in one `read()`, intercepting here would
+                                    // silently drop that preceding message before it ever
+                                    // reached the backend — a transparency violation strictly
+                                    // worse than losing the reuse optimization. In that case we
+                                    // fall through and forward the whole buffer verbatim
+                                    // (matching pre-Task-8 behavior): the backend receives the
+                                    // Terminate at the end and closes, so only THIS connection
+                                    // loses the warm-reuse optimization — correctness is never
+                                    // sacrificed.
                                     Message::Terminate => {
+                                        if ConnectionHandler::should_intercept_terminate(msg_index) {
+                                            debug!(
+                                                connection_id = connection_id,
+                                                "Client sent Terminate; intercepting (not forwarding) so backend returns to pool for warm reuse"
+                                            );
+                                            should_forward = false;
+                                            client_terminated = true;
+                                            break;
+                                        }
                                         debug!(
                                             connection_id = connection_id,
-                                            "Client sent Terminate; intercepting (not forwarding) so backend returns to pool for warm reuse"
+                                            msg_index = msg_index,
+                                            "Client Terminate preceded by other message(s) in the same read buffer; forwarding buffer verbatim (no warm reuse for this connection)"
                                         );
-                                        should_forward = false;
-                                        client_terminated = true;
-                                        break;
                                     }
                                     _ => {}
                                 }
@@ -1868,6 +1916,61 @@ mod tests {
             &PoolingStrategy::Hybrid,
             &conn_state
         ));
+    }
+
+    // Tests for should_intercept_terminate() — WP-9 Task 8 review Fix 1.
+    // These exercise the exact predicate used by the `Message::Terminate` arm
+    // in `handle_with_managed_connection`, fed with message indices produced
+    // by the SAME `MessageExtractor::extract_messages` the production
+    // forwarding loop uses — no re-invented framing.
+
+    #[test]
+    fn test_should_intercept_terminate_when_sole_message_in_buffer() {
+        use crate::protocol::MSG_TERMINATE;
+
+        let extractor = MessageExtractor::new();
+        // A read buffer containing ONLY a Terminate message.
+        let data = [MSG_TERMINATE, 0, 0, 0, 4];
+        let messages = extractor.extract_messages(&data);
+
+        let terminate_index = messages
+            .iter()
+            .position(|m| matches!(m, Message::Terminate))
+            .expect("Terminate must be parsed from the buffer");
+        assert_eq!(terminate_index, 0);
+        assert!(
+            ConnectionHandler::should_intercept_terminate(terminate_index),
+            "a sole Terminate must still be intercepted so the backend is warm-released"
+        );
+    }
+
+    #[test]
+    fn test_should_not_intercept_terminate_preceded_by_other_message() {
+        use crate::protocol::{MSG_SYNC, MSG_TERMINATE};
+
+        let extractor = MessageExtractor::new();
+        // A single client read() that pipelines Sync immediately followed by
+        // Terminate — the exact scenario the pre-fix code silently dropped
+        // (whole-buffer should_forward = false discarded the Sync).
+        let mut data = vec![MSG_SYNC, 0, 0, 0, 4];
+        data.extend_from_slice(&[MSG_TERMINATE, 0, 0, 0, 4]);
+        let messages = extractor.extract_messages(&data);
+
+        assert_eq!(messages.len(), 2, "both pipelined messages must be parsed");
+        assert!(matches!(messages[0], Message::Sync));
+        assert!(matches!(messages[1], Message::Terminate));
+
+        let terminate_index = messages
+            .iter()
+            .position(|m| matches!(m, Message::Terminate))
+            .expect("Terminate must be parsed from the buffer");
+        assert_eq!(terminate_index, 1);
+        assert!(
+            !ConnectionHandler::should_intercept_terminate(terminate_index),
+            "Terminate preceded by another message in the same buffer must NOT be \
+             intercepted — the whole buffer (including the preceding Sync) must be \
+             forwarded verbatim so the Sync is never silently dropped"
+        );
     }
 
     // Tests for apply_parse_state() — extended-protocol (Parse-arm) session

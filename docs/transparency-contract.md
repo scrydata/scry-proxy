@@ -13,6 +13,7 @@ so the guarantee is testable: the differential transparency test suite (see
 - [2. The passthrough invariant](#2-the-passthrough-invariant)
 - [3. The fail-closed rule](#3-the-fail-closed-rule)
 - [4. Pooling-mode scope](#4-pooling-mode-scope)
+- [Known limitations](#known-limitations)
 - [How this is enforced](#how-this-is-enforced)
 
 ## Scope
@@ -109,6 +110,20 @@ client MUST NOT be able to distinguish which mode is configured by observing pro
   mode for this guarantee: its transparency is only as good as the completeness of state
   detection described in [§3](#3-the-fail-closed-rule). Where detection is incomplete, Hybrid
   MUST fall back to pinning rather than risk leaking state.
+
+## Known limitations
+
+- **Warm-reused backend does not adopt the reusing client's own startup-packet parameters.** When
+  a client lands on a physical backend that a *different* prior client already initialized (warm
+  reuse across the Terminate-intercept path, P2 §5.3), the startup response replayed to it —
+  `ParameterStatus`, `BackendKeyData`, `ReadyForQuery` — reflects that prior client's
+  initialization, not the reusing client's own startup packet. So a startup-packet parameter such
+  as `application_name` or an `options=-c ...` GUC, set by the reusing client at connect time, is
+  not applied to the reused backend. This is an observable divergence from a direct connection for
+  clients that depend on startup-packet parameter values. It does not affect session GUCs set via
+  `SET` after connecting — those are tracked and pinned correctly per [§4](#4-pooling-mode-scope).
+  A full fix (reconciling `GUC_REPORT` parameters across pooled clients) is the general
+  connection-pooler problem and is a post-GA follow-up, not covered by this contract today.
 
 ## How this is enforced
 

@@ -419,29 +419,21 @@ async fn transaction_mode_prepared_statement_honesty() {
 /// (invariant (b)) reuses the same single connection again after client B
 /// disconnects, so its pid is checked too.
 ///
-/// # RED, by design, not by test bug — see task report
-/// This anti-vacuity guardrail (comparing `pg_backend_pid()`) currently FAILS:
-/// client B lands on a genuinely NEW backend pid, not client A's. Root cause,
-/// confirmed via `RUST_LOG=debug` (`scry::proxy::tcp_pool` recycle logs +
-/// `scry::protocol::postgres` health-check logs): when client A disconnects,
-/// `tokio_postgres`'s own connection driver sends a real `Terminate` ('X')
-/// message before closing its socket (standard, spec-compliant client
-/// behavior — see `tokio-postgres-0.7.18/src/connection.rs`, the
-/// `"at eof, terminating"` branch). `ConnectionHandler`'s client-read loop
-/// (`connection.rs`, the `match msg { Message::Parse { .. } => .., ...,
-/// _ => {} }` block around line 701) has NO arm for `Message::Terminate`, so
-/// it falls into the catch-all `_ => {}` and `should_forward` stays `true` —
-/// the client's Terminate is forwarded verbatim to the REAL backend, which
-/// immediately closes the session. The now-dead socket is then released to
-/// the pool; deadpool's next `recycle()` health-check finds it already EOF
-/// (`Connection closed while waiting for ReadyForQuery`) and discards it,
-/// silently creating a fresh backend connection for the very next client.
-/// This is not specific to Hybrid mode or to this test's probes — it is a
-/// pooling-strategy-independent gap in the shared connection-teardown path,
-/// so it defeats genuine cross-client backend-connection reuse for the most
-/// common real-world disconnect pattern (any well-behaved client). See the
-/// task report for the full diagnosis; this test is left RED per the task
-/// brief rather than weakened to accept a fresh connection as "reused."
+/// # Proves genuine warm cross-client reuse (GREEN, WP-9 Task 8, P2 §5.3)
+/// This anti-vacuity guardrail (comparing `pg_backend_pid()`) confirms client
+/// B lands on client A's exact backend pid, not a fresh one. `connection.rs`'s
+/// client-read loop intercepts the client's graceful-disconnect `Terminate`
+/// ('X') — sent by `tokio_postgres`'s own connection driver on disconnect,
+/// standard spec-compliant client behavior (see
+/// `tokio-postgres-0.7.18/src/connection.rs`, the `"at eof, terminating"`
+/// branch) — instead of forwarding it to the real backend. The physical
+/// Postgres session therefore stays alive and is released to the pool warm;
+/// deadpool's `recycle()` health-check finds it healthy and `DISCARD ALL`-
+/// resets it before handing it to the next client, so reuse is both warm AND
+/// clean. This holds for any well-behaved client's normal disconnect, across
+/// pooling strategies — a regression here (e.g. a future edit that goes back
+/// to forwarding Terminate) would silently defeat cross-client backend reuse
+/// for the most common real-world disconnect pattern.
 #[tokio::test]
 async fn dirty_connection_invariant_hybrid_mode() {
     let docker = Cli::default();
@@ -515,11 +507,11 @@ async fn dirty_connection_invariant_hybrid_mode() {
         pid_a, pid_b,
         "test did not exercise genuine connection reuse (different backend pids) — \
          cleanliness would be proven vacuously on a fresh connection, not a recycled one. \
-         KNOWN GAP (WP-9 Task 8, P2 §5.3): the client's graceful-disconnect Terminate ('X') \
-         message is forwarded verbatim to the real backend by connection.rs's client-read \
-         loop (no Message::Terminate arm; falls into `_ => {{}}` with should_forward still \
-         true), which closes the actual Postgres session before the pool can return it warm — \
-         see task report for full diagnosis"
+         This would mean a regression in the WP-9 Task 8 (P2 §5.3) warm-reuse fix: the \
+         client's graceful-disconnect Terminate ('X') is no longer being intercepted by \
+         connection.rs's client-read loop and is instead being forwarded verbatim to the \
+         real backend (or should_forward incorrectly stayed true), closing the actual \
+         Postgres session before the pool can return it warm"
     );
 
     // Invariant (a) probe 1: simple-protocol SET must not leak.
@@ -704,13 +696,12 @@ async fn dirty_connection_invariant_hybrid_mode() {
 /// physical reuse is confirmed via matching `pg_backend_pid()`, exactly as in the
 /// Hybrid-mode test above.
 ///
-/// # RED, by design, not by test bug
+/// # Proves genuine warm cross-client reuse (GREEN)
 /// Same anti-vacuity guardrail as [`dirty_connection_invariant_hybrid_mode`], and
-/// it fails for the identical, pooling-strategy-independent reason: the client's
-/// graceful-disconnect `Terminate` is forwarded to the real backend instead of
-/// being intercepted, killing the physical connection before the pool can return
-/// it warm. See that test's doc comment for the full diagnosis and the task
-/// report for further detail.
+/// it passes for the identical, pooling-strategy-independent reason: the client's
+/// graceful-disconnect `Terminate` is intercepted rather than forwarded to the
+/// real backend, so the physical connection survives and is returned to the pool
+/// warm. See that test's doc comment for the full mechanism.
 #[tokio::test]
 async fn dirty_connection_invariant_transaction_mode() {
     use tokio_postgres::types::Type;
@@ -775,11 +766,11 @@ async fn dirty_connection_invariant_transaction_mode() {
         pid_a, pid_b,
         "test did not exercise genuine connection reuse (different backend pids) — \
          cleanliness would be proven vacuously on a fresh connection, not a recycled one. \
-         KNOWN GAP (WP-9 Task 8, P2 §5.3): the client's graceful-disconnect Terminate ('X') \
-         message is forwarded verbatim to the real backend by connection.rs's client-read \
-         loop (no Message::Terminate arm; falls into `_ => {{}}` with should_forward still \
-         true), which closes the actual Postgres session before the pool can return it warm — \
-         see task report for full diagnosis"
+         This would mean a regression in the WP-9 Task 8 (P2 §5.3) warm-reuse fix: the \
+         client's graceful-disconnect Terminate ('X') is no longer being intercepted by \
+         connection.rs's client-read loop and is instead being forwarded verbatim to the \
+         real backend (or should_forward incorrectly stayed true), closing the actual \
+         Postgres session before the pool can return it warm"
     );
 
     let app_name: String = client_b

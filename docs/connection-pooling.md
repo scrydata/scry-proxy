@@ -313,6 +313,17 @@ first initialization (stored on the pooled connection) and **replays** it to any
 reuses the same physical backend, while authenticating that client normally — so the client's
 startup sequence stays faithful without ever re-handshaking the backend.
 
+> **Known limitation — startup-packet parameters on warm reuse:** the replayed startup response
+> reflects whichever client first initialized that physical backend, not the reusing client's own
+> startup packet. So a reusing client's own `application_name`, `options=-c ...` GUCs, or other
+> startup-packet parameters are **not** applied to the reused backend — the client instead observes
+> the originating client's values. This is a real, observable divergence from a direct connection
+> for clients that rely on startup-packet parameters and land on a warm-reused backend. For
+> guaranteed values, set session GUCs via `SET` after connecting instead — those ARE tracked and
+> pinned correctly (see the restrict-by-pinning note above). Reconciling `GUC_REPORT` parameters
+> across pooled clients is the general connection-pooler problem and is out of scope for now;
+> tracked as a post-GA follow-up.
+
 ### 4. Health Checks (Passive)
 
 Every connection is health-checked **before** being returned from the pool:
