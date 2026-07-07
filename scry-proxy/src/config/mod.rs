@@ -50,6 +50,8 @@ pub struct Config {
     pub resilience: ResilienceConfig,
     pub tls: TlsConfig,
     pub auth: AuthConfig,
+    #[serde(default)]
+    pub admin: AdminConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,6 +86,10 @@ pub struct ObservabilityConfig {
     pub service_name: String,
     pub metrics_server_address: String,
     pub enable_metrics_server: bool,
+    /// Allow verbose/debug logging paths that may log unredacted query text
+    /// or credentials. Must be explicitly opted into (P1 §4.7).
+    #[serde(default)]
+    pub unsafe_debug_logging: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,6 +125,35 @@ pub struct PublisherConfig {
     /// Can be set via SCRY_PUBLISHER__SHADOW_ID or read from SHADOW_ID_FILE env var.
     #[serde(default)]
     pub shadow_id: Option<String>,
+
+    /// Explicitly acknowledge sending events to a non-HTTPS endpoint.
+    /// Required when `http_endpoint` does not use the `https://` scheme (P1 §4.5).
+    #[serde(default)]
+    pub allow_insecure: bool,
+
+    /// Salt used when anonymizing query data before publishing.
+    /// Required when `anonymize = true` (P1 §4.1).
+    #[serde(default)]
+    pub anonymize_salt: Option<String>,
+
+    /// Behavior when query parsing/anonymization fails for an observed query.
+    #[serde(default)]
+    pub parse_failure_mode: ParseFailureMode,
+}
+
+/// Behavior when query parsing (or anonymization) fails for an observed query.
+///
+/// Defaults to `Redact` (P1 §9.2): never emit a potentially-unsafe raw query
+/// on parse failure; either replace it with a redaction placeholder or drop
+/// the event entirely.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ParseFailureMode {
+    /// Replace the query text with a redaction placeholder and still emit the event.
+    #[default]
+    Redact,
+    /// Drop the event entirely rather than emit anything for it.
+    Drop,
 }
 
 /// Connection pooling strategy
@@ -199,11 +234,40 @@ pub struct AuthConfig {
     /// Query to execute against backend to validate credentials
     /// Example: SELECT usename, passwd FROM pg_shadow WHERE usename=$1
     pub auth_query: Option<String>,
+
+    /// Explicit acknowledgement that `auth_type = trust` disables authentication.
+    /// Trust mode is refused by `Config::validate()` unless this is `true` (P1 §9.1).
+    #[serde(default)]
+    pub allow_trust: bool,
 }
 
 impl Default for AuthConfig {
     fn default() -> Self {
-        Self { auth_type: AuthType::Trust, auth_file: None, auth_query: None }
+        Self { auth_type: AuthType::Trust, auth_file: None, auth_query: None, allow_trust: false }
+    }
+}
+
+/// Admin console configuration (PgBouncer-style `pgbouncer` virtual database).
+///
+/// Disabled by default; enabling it exposes SHOW/PAUSE/RESUME/RELOAD style
+/// commands, so it must be explicitly turned on and (when enabled) should be
+/// paired with a userlist or inline credential.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminConfig {
+    /// Enable the admin console (disabled by default).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Path to a PgBouncer-style userlist.txt, or an inline user, for admin auth.
+    #[serde(default)]
+    pub admin_users: Option<String>,
+    /// Admin password (when not using a userlist file).
+    #[serde(default)]
+    pub admin_password: Option<String>,
+}
+
+impl Default for AdminConfig {
+    fn default() -> Self {
+        Self { enabled: false, admin_users: None, admin_password: None }
     }
 }
 
@@ -395,7 +459,9 @@ impl Default for Config {
                 port: 5432,
                 database: "postgres".to_string(),
                 user: "postgres".to_string(),
-                password: "password".to_string(),
+                // No default backend password: an unset password is caught by
+                // `validate()` (fail closed rather than shipping a guessable default).
+                password: String::new(),
                 pool_size: 10,
                 connection_timeout_ms: 5000,
             },
@@ -406,6 +472,7 @@ impl Default for Config {
                 service_name: "scry-proxy".to_string(),
                 metrics_server_address: "127.0.0.1:9090".to_string(),
                 enable_metrics_server: true,
+                unsafe_debug_logging: false,
             },
             protocol: ProtocolConfig { max_prepared_statements: 1000 },
             publisher: PublisherConfig {
@@ -421,6 +488,9 @@ impl Default for Config {
                 http_api_key: None,
                 http_compression: true,
                 shadow_id: None,
+                allow_insecure: false,
+                anonymize_salt: None,
+                parse_failure_mode: ParseFailureMode::Redact,
             },
             performance: PerformanceConfig {
                 target_latency_ms: 1,
@@ -466,6 +536,7 @@ impl Default for Config {
             },
             tls: TlsConfig::default(),
             auth: AuthConfig::default(),
+            admin: AdminConfig::default(),
         }
     }
 }
@@ -520,10 +591,98 @@ impl Config {
 
     /// Validate configuration and return warnings
     ///
-    /// Returns Ok(warnings) on success, Err on fatal errors.
-    /// Warnings are logged but don't prevent startup.
+    /// Returns Ok(warnings) on success, Err on fatal (fail-closed) misconfigurations.
+    /// Warnings are logged but don't prevent startup; Err MUST prevent startup —
+    /// callers must treat a returned Err as fatal and abort before binding any
+    /// listener (see `main.rs`). Never fall back to a permissive default (e.g.
+    /// trust auth) when a case below is triggered.
     pub fn validate(&self) -> anyhow::Result<Vec<String>> {
         let mut warnings = Vec::new();
+
+        // --- Fail-closed security checks (P1 §4.1, §5.1) ---
+
+        // 1. SCRAM-SHA-256 client auth is not implemented. Refuse rather than
+        // silently downgrading to trust.
+        if self.auth.auth_type == AuthType::ScramSha256 {
+            anyhow::bail!(
+                "auth.auth_type = scram-sha-256 is not implemented; refusing to start \
+                 rather than falling back to trust. Use auth.auth_type = md5 (with \
+                 auth.auth_file set) or auth.auth_type = cert instead."
+            );
+        }
+
+        // 2. Cert auth requires a client TLS mode that actually verifies the
+        // presented certificate.
+        if self.auth.auth_type == AuthType::Cert
+            && !matches!(self.tls.client_tls_sslmode, TlsSslMode::VerifyCa | TlsSslMode::VerifyFull)
+        {
+            anyhow::bail!(
+                "auth.auth_type = cert requires tls.client_tls_sslmode = verify-ca or \
+                 verify-full (got {:?}); certificate identity cannot be trusted otherwise.",
+                self.tls.client_tls_sslmode
+            );
+        }
+
+        // 3. MD5 auth requires a backing auth_file; otherwise there is nothing
+        // to verify passwords against.
+        if self.auth.auth_type == AuthType::Md5 && self.auth.auth_file.is_none() {
+            anyhow::bail!(
+                "auth.auth_type = md5 requires auth.auth_file to be set (path to a \
+                 PgBouncer-style userlist.txt)."
+            );
+        }
+
+        // 4. Trust mode disables authentication entirely and must be explicitly
+        // acknowledged by the operator.
+        if self.auth.auth_type == AuthType::Trust && !self.auth.allow_trust {
+            anyhow::bail!(
+                "auth.auth_type = trust disables authentication for all clients. \
+                 Set auth.allow_trust = true to acknowledge this and start anyway."
+            );
+        }
+
+        // 5. There is no safe default backend password; an unset password must
+        // be explicitly configured.
+        if self.backend.password.is_empty() {
+            anyhow::bail!(
+                "backend.password is not set. Configure a backend password (there is \
+                 no default) via config file or SCRY_BACKEND__PASSWORD."
+            );
+        }
+
+        // 6. Anonymization requires a salt; otherwise "anonymized" output can be
+        // trivially reversed/correlated.
+        if self.publisher.enabled && self.publisher.anonymize && self.publisher.anonymize_salt.is_none()
+        {
+            anyhow::bail!(
+                "publisher.anonymize = true requires publisher.anonymize_salt to be set."
+            );
+        }
+
+        // 7. A non-HTTPS publisher endpoint must be explicitly acknowledged as
+        // insecure; a missing endpoint for an http publisher is always an error.
+        if self.publisher.enabled && self.publisher.publisher_type == "http" {
+            match &self.publisher.http_endpoint {
+                None => {
+                    anyhow::bail!(
+                        "publisher.publisher_type = \"http\" requires publisher.http_endpoint \
+                         to be set."
+                    );
+                }
+                Some(endpoint) => {
+                    if !endpoint.starts_with("https://") && !self.publisher.allow_insecure {
+                        anyhow::bail!(
+                            "publisher.http_endpoint ({}) is not https://. Set \
+                             publisher.allow_insecure = true to acknowledge sending \
+                             (possibly anonymized) query events over a non-HTTPS endpoint.",
+                            endpoint
+                        );
+                    }
+                }
+            }
+        }
+
+        // --- Non-fatal warnings ---
 
         // Check pool ratio (only if threshold is non-zero)
         if self.performance.pool_ratio_warning_threshold > 0 && self.performance.pool_size > 0 {
@@ -658,9 +817,19 @@ mod tests {
 mod validation_tests {
     use super::*;
 
+    /// A config that satisfies every fail-closed check in `validate()` so that
+    /// pool-ratio-focused tests only exercise the (non-fatal) warnings logic.
+    fn valid_base_config() -> Config {
+        let mut config = Config::default();
+        config.auth.allow_trust = true; // acknowledge trust mode
+        config.backend.password = "test-password".to_string();
+        config.publisher.anonymize_salt = Some("test-salt".to_string());
+        config
+    }
+
     #[test]
     fn test_validate_warns_on_high_ratio() {
-        let mut config = Config::default();
+        let mut config = valid_base_config();
         config.proxy.max_connections = 1000;
         config.performance.pool_size = 10; // 100:1 ratio, exceeds 20:1 threshold
 
@@ -671,7 +840,7 @@ mod validation_tests {
 
     #[test]
     fn test_validate_warns_on_small_queue() {
-        let mut config = Config::default();
+        let mut config = valid_base_config();
         config.proxy.max_connections = 500;
         config.performance.pool_size = 50;
         config.performance.pool_queue_depth = 50; // Too small for 450 potential waiters
@@ -687,7 +856,7 @@ mod validation_tests {
 
     #[test]
     fn test_validate_warns_on_wasteful_pool() {
-        let mut config = Config::default();
+        let mut config = valid_base_config();
         config.proxy.max_connections = 50;
         config.performance.pool_size = 100; // Wasteful: more pool than clients
 
@@ -701,7 +870,7 @@ mod validation_tests {
 
     #[test]
     fn test_validate_no_warnings_for_good_config() {
-        let mut config = Config::default();
+        let mut config = valid_base_config();
         config.proxy.max_connections = 500;
         config.performance.pool_size = 50; // 10:1 ratio, within 20:1 threshold
         config.performance.pool_queue_depth = 500; // Adequate for 450 potential waiters
@@ -713,7 +882,7 @@ mod validation_tests {
 
     #[test]
     fn test_validate_disabled_when_threshold_zero() {
-        let mut config = Config::default();
+        let mut config = valid_base_config();
         config.proxy.max_connections = 1000;
         config.performance.pool_size = 10; // 100:1 ratio
         config.performance.pool_ratio_warning_threshold = 0; // Disable warning
@@ -725,6 +894,146 @@ mod validation_tests {
             "Should not warn when threshold is 0: {:?}",
             warnings
         );
+    }
+}
+
+#[cfg(test)]
+mod fail_closed_tests {
+    use super::*;
+
+    /// A config that satisfies every fail-closed check in `validate()`, so each
+    /// negative test only needs to un-set the one condition it's exercising.
+    fn fully_valid_config() -> Config {
+        let mut config = Config::default();
+        config.auth.auth_type = AuthType::Trust;
+        config.auth.allow_trust = true;
+        config.backend.password = "secret-password".to_string();
+        config.publisher.enabled = true;
+        config.publisher.anonymize = true;
+        config.publisher.anonymize_salt = Some("some-salt".to_string());
+        config.publisher.publisher_type = "debug".to_string();
+        config
+    }
+
+    #[test]
+    fn test_validate_ok_for_fully_valid_config() {
+        let config = fully_valid_config();
+        let result = config.validate();
+        assert!(result.is_ok(), "Expected Ok, got: {:?}", result.err());
+    }
+
+    // Case 1: ScramSha256 is not implemented; must be refused, not silently
+    // downgraded to trust.
+    #[test]
+    fn test_validate_rejects_scram_sha256_auth() {
+        let mut config = fully_valid_config();
+        config.auth.auth_type = AuthType::ScramSha256;
+        assert!(
+            config.validate().is_err(),
+            "SCRAM-SHA-256 auth must be rejected (not implemented)"
+        );
+    }
+
+    // Case 2: Cert auth requires a verifying client TLS mode.
+    #[test]
+    fn test_validate_rejects_cert_auth_without_verifying_tls() {
+        let mut config = fully_valid_config();
+        config.auth.auth_type = AuthType::Cert;
+
+        config.tls.client_tls_sslmode = TlsSslMode::Disable;
+        assert!(config.validate().is_err(), "Cert auth requires a verifying TLS mode (Disable)");
+
+        config.tls.client_tls_sslmode = TlsSslMode::Allow;
+        assert!(config.validate().is_err(), "Cert auth requires a verifying TLS mode (Allow)");
+
+        config.tls.client_tls_sslmode = TlsSslMode::Require;
+        assert!(config.validate().is_err(), "Cert auth requires a verifying TLS mode (Require)");
+
+        config.tls.client_tls_sslmode = TlsSslMode::VerifyCa;
+        assert!(config.validate().is_ok(), "VerifyCa should satisfy cert auth");
+
+        config.tls.client_tls_sslmode = TlsSslMode::VerifyFull;
+        assert!(config.validate().is_ok(), "VerifyFull should satisfy cert auth");
+    }
+
+    // Case 3: MD5 auth requires an auth_file. Closes the trust-fallback-on-missing-backing
+    // runtime path in server.rs by making it unreachable at startup.
+    #[test]
+    fn test_validate_rejects_md5_auth_without_auth_file() {
+        let mut config = fully_valid_config();
+        config.auth.auth_type = AuthType::Md5;
+        config.auth.auth_file = None;
+        assert!(config.validate().is_err(), "MD5 auth without auth_file must be rejected");
+    }
+
+    // Case 4: Trust mode disables authentication and must be explicitly acknowledged.
+    #[test]
+    fn test_validate_rejects_trust_without_allow_trust_ack() {
+        let mut config = fully_valid_config();
+        config.auth.auth_type = AuthType::Trust;
+        config.auth.allow_trust = false;
+        assert!(config.validate().is_err(), "Trust auth without allow_trust ack must be rejected");
+    }
+
+    // Case 5: There is no safe default backend password.
+    #[test]
+    fn test_validate_rejects_empty_backend_password() {
+        let mut config = fully_valid_config();
+        config.backend.password = String::new();
+        assert!(config.validate().is_err(), "Empty backend password must be rejected");
+    }
+
+    // Case 6: Anonymization requires an explicit salt.
+    #[test]
+    fn test_validate_rejects_anonymize_without_salt() {
+        let mut config = fully_valid_config();
+        config.publisher.enabled = true;
+        config.publisher.anonymize = true;
+        config.publisher.anonymize_salt = None;
+        assert!(config.validate().is_err(), "Anonymize without a salt must be rejected");
+    }
+
+    // Case 7: Non-HTTPS publisher endpoints require an explicit insecure acknowledgement,
+    // and an http publisher_type still needs an endpoint configured at all.
+    #[test]
+    fn test_validate_rejects_insecure_http_publisher_endpoint() {
+        let mut config = fully_valid_config();
+        config.publisher.publisher_type = "http".to_string();
+        config.publisher.http_endpoint = Some("http://example.com/events".to_string());
+        config.publisher.allow_insecure = false;
+        assert!(
+            config.validate().is_err(),
+            "Non-HTTPS publisher endpoint without allow_insecure must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_http_publisher_missing_endpoint() {
+        let mut config = fully_valid_config();
+        config.publisher.publisher_type = "http".to_string();
+        config.publisher.http_endpoint = None;
+        assert!(
+            config.validate().is_err(),
+            "http publisher_type without http_endpoint must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_validate_accepts_https_publisher_endpoint() {
+        let mut config = fully_valid_config();
+        config.publisher.publisher_type = "http".to_string();
+        config.publisher.http_endpoint = Some("https://example.com/events".to_string());
+        config.publisher.allow_insecure = false;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_accepts_insecure_http_when_acknowledged() {
+        let mut config = fully_valid_config();
+        config.publisher.publisher_type = "http".to_string();
+        config.publisher.http_endpoint = Some("http://example.com/events".to_string());
+        config.publisher.allow_insecure = true;
+        assert!(config.validate().is_ok());
     }
 }
 

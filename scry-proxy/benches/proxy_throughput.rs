@@ -78,6 +78,7 @@ fn create_test_config(backend_host: String, backend_port: u16) -> Config {
             service_name: "scry-bench".to_string(),
             metrics_server_address: "127.0.0.1:0".to_string(),
             enable_metrics_server: false,
+            unsafe_debug_logging: false,
         },
         protocol: ProtocolConfig { max_prepared_statements: 1000 },
         publisher: PublisherConfig {
@@ -93,6 +94,9 @@ fn create_test_config(backend_host: String, backend_port: u16) -> Config {
             http_api_key: None,
             http_compression: true,
             shadow_id: None,
+            allow_insecure: false,
+            anonymize_salt: None,
+            parse_failure_mode: ParseFailureMode::Redact,
         },
         performance: PerformanceConfig {
             target_latency_ms: 1,
@@ -133,6 +137,7 @@ fn create_test_config(backend_host: String, backend_port: u16) -> Config {
         },
         tls: TlsConfig::default(),
         auth: AuthConfig::default(),
+        admin: AdminConfig::default(),
         databases: vec![],
     }
 }
