@@ -91,10 +91,19 @@ client MUST NOT be able to distinguish which mode is configured by observing pro
 - **Session** — a backend connection is dedicated to a client for the life of its session, reset
   and returned to the pool on disconnect. Transparent by construction: no backend switch occurs
   mid-session.
-- **Transaction** — a backend connection may be returned to the pool between transactions.
-  Transparency depends on `DISCARD ALL` (or equivalent) fully resetting session state on recycle,
-  and on the mode enforcer rejecting session-state-establishing statements outside a pooling-safe
-  window (see `src/proxy/mode_enforcer.rs`).
+- **Transaction** — a *positively-clean* backend connection may be returned to the pool between
+  transactions. Transparency depends on `DISCARD ALL` (or equivalent) fully resetting session state
+  on recycle, and on the mode enforcer rejecting session-state-establishing statements outside a
+  pooling-safe window (see `src/proxy/mode_enforcer.rs`). The enforcer rejects `SET` / temp tables /
+  cursors / advisory locks (SQLSTATE `0A000`), so the only replay-fragile state that can survive
+  into this mode is a **cached prepared statement** or a **`LISTEN`** registration — and Scry
+  handles those by **restrict-by-pinning** (P2 §4.5): a connection carrying either is PINNED (kept
+  1:1 with its client) rather than released. This replaces an earlier, fragile SQL-`PREPARE` state
+  replay that could silently drop a client's prepared statements on a new backend. The accepted
+  cost: a driver that keeps named prepared statements cached (or holds a `LISTEN`) sees **reduced
+  pooling in Transaction mode**, since such connections stay pinned instead of returning to the
+  pool. Stateless clients are unaffected. (A protocol-level replay that would restore pooling for
+  prepared-heavy workloads is a possible post-GA revisit — P2 §9.1.)
 - **Hybrid** — connections pin to a client dynamically when session state is detected, and pool
   otherwise. This mode carries the most detection surface and is honestly **the least mature**
   mode for this guarantee: its transparency is only as good as the completeness of state

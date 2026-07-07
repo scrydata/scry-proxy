@@ -315,3 +315,81 @@ fn comparator_discriminates_different_results() {
         "self-proof: identical results must be equal",
     );
 }
+
+/// Prepared-statement honesty under strict Transaction pooling (WP-9 Task 6,
+/// P2 §4.5). This is the guardrail for the restrict-by-pinning resolution: a
+/// connection carrying a client-cached prepared statement must be PINNED (not
+/// released) in Transaction mode, so the statement keeps working across a
+/// transaction boundary. There must be no silent "prepared statement does not
+/// exist" failure.
+///
+/// # Why this is RED before the fix and GREEN after (load-bearing on the
+/// release-predicate change)
+///
+/// Before restrict-by-pinning, `should_release_connection` returned `true`
+/// unconditionally in Transaction mode, so at the `COMMIT` below the proxy
+/// released the connection and re-acquired one from the pool. deadpool's
+/// `recycle` runs `DISCARD ALL` on checkout, which wipes the backend's
+/// prepared statement; the proxy then attempted to restore it via a
+/// SQL-level `PREPARE "<name>" AS <query>` replay that **drops the
+/// client-supplied parameter OIDs**. This test deliberately prepares
+/// `SELECT $1` with the parameter type supplied by the client (`int8`): it
+/// round-trips fine over the extended protocol (the client sends the OID),
+/// but the OID-less `PREPARE ... AS SELECT $1` replay re-resolves `$1` to a
+/// different type, so the client's cached binary parameter no longer matches
+/// the re-prepared statement. The reuse below therefore fails with a
+/// client-visible error (observed: `22021` invalid byte sequence — the binary
+/// `int8` bytes reinterpreted as text — but the general failure is "the
+/// statement the client cached no longer behaves as prepared") that the client
+/// gets NO proxy explanation for. That silent corruption is the bug.
+///
+/// After restrict-by-pinning (`Transaction => !conn_state.is_pinned()`), the
+/// prepared statement keeps the connection pinned, it is never released at the
+/// `COMMIT`, the same backend keeps the statement, and the reuse succeeds.
+/// Reverting the predicate change re-breaks this assertion.
+#[tokio::test]
+async fn transaction_mode_prepared_statement_honesty() {
+    use tokio_postgres::types::Type;
+
+    let docker = Cli::default();
+    let postgres_image = RunnableImage::from(Postgres::default()).with_tag("16-alpine");
+    let postgres = docker.run(postgres_image);
+    let postgres_port = postgres.get_host_port_ipv4(5432);
+    let postgres_host = "127.0.0.1";
+
+    sleep(Duration::from_secs(2)).await;
+
+    let PairedClients { proxy, .. } =
+        paired_clients(postgres_host, postgres_port, scry::config::PoolingStrategy::Transaction)
+            .await
+            .expect("failed to start Transaction-mode paired clients");
+
+    // Prepare a statement whose parameter type CANNOT be inferred from the
+    // query text — the client supplies the OID (int8). This round-trips fine
+    // through the proxy (autocommit; pinned by the prepared statement), but
+    // defeats the old OID-less SQL-PREPARE replay path on purpose.
+    let stmt = proxy
+        .prepare_typed("SELECT $1", &[Type::INT8])
+        .await
+        .expect("prepare_typed should succeed through the proxy");
+
+    // Cross an explicit transaction boundary — the ONLY thing that makes
+    // connection.rs evaluate its release decision (autocommit statements never
+    // trigger a release check). Sent via the simple protocol (batch_execute) as
+    // separate round trips so the transaction tracker observes ReadyForQuery(T)
+    // after BEGIN and ReadyForQuery(I) after COMMIT — the exact transition the
+    // old code released on.
+    proxy.batch_execute("BEGIN").await.expect("BEGIN");
+    proxy.batch_execute("SELECT 1").await.expect("SELECT 1 within transaction");
+    proxy.batch_execute("COMMIT").await.expect("COMMIT");
+
+    // Reuse the cached prepared statement AFTER the release boundary. Under
+    // restrict-by-pinning the connection was never released, so this works.
+    let rows = proxy.query(&stmt, &[&7i64]).await.expect(
+        "cached prepared statement must still work across a Transaction-mode release \
+         boundary (restrict-by-pinning); a failure here is the silent prepared-statement \
+         destruction this test guards against",
+    );
+    let value: i64 = rows[0].get(0);
+    assert_eq!(value, 7, "prepared statement returned the wrong value after the txn boundary");
+}

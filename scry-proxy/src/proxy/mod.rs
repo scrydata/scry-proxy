@@ -5,7 +5,6 @@ mod event_batcher;
 mod mode_enforcer;
 mod pool_manager;
 mod server;
-mod state_replayer;
 mod tcp_pool;
 mod transaction;
 mod wait_queue;
@@ -19,7 +18,6 @@ pub use pool_manager::{
     AcquireError, ManagedConnection, PoolManager, PoolManagerConfig, StickyConnectionInfo,
 };
 pub use server::ProxyServer;
-pub use state_replayer::{ReplayError, ReplayResult, StateReplayer};
 pub use tcp_pool::{PoolStatus, TcpConnectionPool};
 pub use transaction::{TransactionState, TransactionTracker};
 pub use wait_queue::{QueueFullError, WaitQueue, Waiter};

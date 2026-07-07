@@ -1,6 +1,6 @@
 use super::{
     AcquireError, ConnectionState, EventBatcher, ModeEnforcer, PendingExecution, PoolManager,
-    PoolingMode, PreparedStatement, PreparedStatementCache, StateReplayer, TransactionTracker,
+    PoolingMode, PreparedStatement, PreparedStatementCache, TransactionTracker,
 };
 use crate::auth::{Authenticator, FileAuthenticator};
 use crate::config::{BackpressureMode, Config, ParseFailureMode, PoolingStrategy};
@@ -235,16 +235,39 @@ impl ConnectionHandler {
     ///
     /// Returns true if the connection should be released back to the pool,
     /// allowing other clients to use it. The decision depends on:
-    /// - Pooling strategy (transaction mode always releases, session mode never does)
-    /// - Connection state (pinned connections with unsafe state are not released)
+    /// - Pooling strategy (session mode never releases)
+    /// - Connection state (pinned connections are not released)
+    ///
+    /// # Restrict-by-pinning (WP-9 Task 6, P2 §4.5)
+    ///
+    /// Transaction mode releases only *positively-clean* (unpinned) connections;
+    /// a connection carrying replay-fragile session state is PINNED (kept) rather
+    /// than released. `ModeEnforcer` already rejects `SET` / temp tables /
+    /// cursors / advisory locks in Transaction mode (SQLSTATE `0A000`), so the
+    /// only things that can pin a Transaction connection are **prepared
+    /// statements** and **`LISTEN`**. Pinning them is correct-by-construction:
+    /// it makes the old fragile SQL-`PREPARE` state-replay path unreachable (a
+    /// connection that reaches the release block is never pinned, so there is
+    /// nothing to replay), eliminating the silent state destruction that path
+    /// could cause.
+    ///
+    /// ## Pooling-cost tradeoff (accepted)
+    ///
+    /// A driver that keeps named prepared statements cached on the connection
+    /// (or holds a `LISTEN`) will see **reduced pooling in Transaction mode** —
+    /// such connections stay pinned to their client instead of being returned to
+    /// the pool. This is the spec's accepted cost ("costs some pooling for
+    /// prepared-heavy workloads"); a protocol-level replay is a possible
+    /// post-GA revisit (P2 §9.1). Stateless clients are unaffected: a clean
+    /// Transaction connection is still released and pooled as before.
     fn should_release_connection(strategy: &PoolingStrategy, conn_state: &ConnectionState) -> bool {
         match strategy {
             // Disabled or Session mode: never release until client disconnects
             PoolingStrategy::Disabled | PoolingStrategy::Session => false,
-            // Transaction mode: always release after transaction (strict mode)
-            PoolingStrategy::Transaction => true,
-            // Hybrid mode: release only if connection is not pinned
-            PoolingStrategy::Hybrid => !conn_state.is_pinned(),
+            // Transaction and Hybrid modes: release only positively-clean
+            // (unpinned) connections. Prepared statements / LISTEN pin the
+            // connection so their state is never silently dropped.
+            PoolingStrategy::Transaction | PoolingStrategy::Hybrid => !conn_state.is_pinned(),
         }
     }
 
@@ -898,48 +921,18 @@ impl ConnectionHandler {
                                         "Re-acquired connection from pool"
                                     );
 
-                                    // State replay: if client has state but got a fresh connection,
-                                    // replay the state to the new connection
-                                    if conn_state.is_pinned() && !managed_conn.is_pinned() && !conn_state.has_unsafe_state() {
-                                        let replay_state = conn_state.get_replayable_state();
-                                        if !replay_state.prepared_statements.is_empty() || !replay_state.session_variables.is_empty() {
-                                            debug!(
-                                                connection_id = connection_id,
-                                                prepared_statements = replay_state.prepared_statements.len(),
-                                                session_variables = replay_state.session_variables.len(),
-                                                "Replaying state to new connection"
-                                            );
-
-                                            let replayer = StateReplayer::new();
-                                            match replayer.replay(&replay_state, managed_conn.stream_mut()).await {
-                                                Ok(result) => {
-                                                    if result.is_success() {
-                                                        debug!(
-                                                            connection_id = connection_id,
-                                                            prepared_statements_replayed = result.prepared_statements_replayed,
-                                                            session_variables_replayed = result.session_variables_replayed,
-                                                            "State replay completed successfully"
-                                                        );
-                                                    } else {
-                                                        warn!(
-                                                            connection_id = connection_id,
-                                                            errors = ?result.errors,
-                                                            "State replay had errors"
-                                                        );
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    warn!(
-                                                        connection_id = connection_id,
-                                                        error = %e,
-                                                        "State replay failed"
-                                                    );
-                                                    // Clear client state since replay failed
-                                                    conn_state.clear_all();
-                                                }
-                                            }
-                                        }
-                                    }
+                                    // No state replay: under restrict-by-pinning
+                                    // (WP-9 Task 6, P2 §4.5) this block is reached
+                                    // only for positively-clean, UNPINNED
+                                    // connections — `should_release_connection`
+                                    // keeps any connection carrying prepared
+                                    // statements or a LISTEN pinned to its client,
+                                    // so `conn_state` has no replayable state here.
+                                    // The old fragile SQL-`PREPARE` replay (which
+                                    // could silently `clear_all()` the proxy's
+                                    // state view on I/O failure, dangling the
+                                    // client's cached statement names) is therefore
+                                    // gone by construction.
 
                                     // Continue to next iteration (data already sent to client)
                                     continue;
@@ -1592,9 +1585,11 @@ mod tests {
     }
 
     #[test]
-    fn test_should_release_connection_transaction_mode() {
+    fn test_should_release_connection_transaction_mode_clean_still_pools() {
         let conn_state = ConnectionState::new(100);
-        // Transaction mode should always release
+        // A positively-clean (unpinned) Transaction connection MUST still be
+        // released so stateless clients keep the benefit of transaction pooling
+        // (restrict-by-pinning does not disable Transaction pooling wholesale).
         assert!(ConnectionHandler::should_release_connection(
             &PoolingStrategy::Transaction,
             &conn_state
@@ -1602,11 +1597,28 @@ mod tests {
     }
 
     #[test]
-    fn test_should_release_connection_transaction_mode_with_pinned_state() {
+    fn test_should_release_connection_transaction_mode_with_prepared_statement_pins() {
         let mut conn_state = ConnectionState::new(100);
         conn_state.add_prepared_statement("stmt1".to_string(), "SELECT 1".to_string(), vec![]);
-        // Transaction mode should still release even with pinned state (strict mode)
-        assert!(ConnectionHandler::should_release_connection(
+        // Restrict-by-pinning (WP-9 Task 6, P2 §4.5): a Transaction connection
+        // carrying a client-cached prepared statement must NOT be released — it
+        // is pinned to the client. This is what makes the fragile SQL-PREPARE
+        // replay path unreachable and eliminates the silent state destruction.
+        assert!(!ConnectionHandler::should_release_connection(
+            &PoolingStrategy::Transaction,
+            &conn_state
+        ));
+    }
+
+    #[test]
+    fn test_should_release_connection_transaction_mode_with_listen_pins() {
+        let mut conn_state = ConnectionState::new(100);
+        conn_state.add_listen_channel("events".to_string());
+        // A LISTEN registration also pins the connection in Transaction mode.
+        // Before restrict-by-pinning this connection was released and its
+        // registration silently lost (LISTEN has unsafe state, so it was never
+        // even replayed); pinning fixes that latent bug.
+        assert!(!ConnectionHandler::should_release_connection(
             &PoolingStrategy::Transaction,
             &conn_state
         ));

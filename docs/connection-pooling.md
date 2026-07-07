@@ -276,6 +276,14 @@ The `DISCARD ALL` command resets all session state:
 
 This ensures connections are "clean" for the next query, preventing state leakage between different clients.
 
+> **Note (Transaction mode, restrict-by-pinning — P2 §4.5):** because `DISCARD ALL` on recycle
+> destroys any cached **prepared statements** (and a `LISTEN` registration is inherently
+> session-local), Scry does **not** release a Transaction-mode connection that still carries them.
+> Such a connection is pinned 1:1 to its client (`should_release_connection` in
+> `src/proxy/connection.rs`) so the state is never silently dropped. The tradeoff: prepared-heavy
+> or `LISTEN`-using clients get **less pooling** in Transaction mode. Stateless clients pool as
+> before. See [transparency-contract.md §4](transparency-contract.md#4-pooling-mode-scope).
+
 ### 4. Health Checks (Passive)
 
 Every connection is health-checked **before** being returned from the pool:
