@@ -68,6 +68,7 @@ fn create_multiplexing_config(backend_host: String, backend_port: u16, pool_size
             database: "postgres".to_string(),
             user: "postgres".to_string(),
             password: "postgres".to_string(),
+            password_file: None,
             pool_size,
             connection_timeout_ms: 10000,
         },

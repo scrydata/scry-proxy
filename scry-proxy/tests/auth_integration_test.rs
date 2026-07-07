@@ -30,6 +30,7 @@ fn create_test_config(backend_host: String, backend_port: u16) -> Config {
             database: "postgres".to_string(),
             user: "postgres".to_string(),
             password: "postgres".to_string(),
+            password_file: None,
             pool_size: 5,
             connection_timeout_ms: 5000,
         },

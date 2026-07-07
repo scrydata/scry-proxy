@@ -117,8 +117,8 @@ services:
       SCRY_BACKEND__PORT: 5432
       SCRY_BACKEND__DATABASE: production_db
       SCRY_BACKEND__USER: scry_proxy
-      # Provide the backend password value directly. (Loading secrets from a
-      # file path is planned but not yet implemented.)
+      # Provide the backend password value directly, OR load it from a file
+      # via SCRY_BACKEND__PASSWORD_FILE (see below) — not both.
       SCRY_BACKEND__PASSWORD: "${DB_PASSWORD}"
       SCRY_BACKEND__POOL_SIZE: 50
 
@@ -625,6 +625,32 @@ env:
       name: vault-generated-secret
       key: db-password
 ```
+
+### Loading the Backend Password from a File
+
+`SCRY_BACKEND__PASSWORD_FILE` (config key `backend.password_file`) lets you
+point Scry at a file whose contents are the backend password, instead of
+putting the password value directly into an environment variable. This is
+useful for secrets-injection sidecars/CSI drivers (e.g. Vault Agent, the
+Secrets Store CSI driver) that mount a secret as a file rather than exporting
+it as an env var:
+
+```yaml
+env:
+- name: SCRY_BACKEND__PASSWORD_FILE
+  value: /var/run/secrets/db/password
+```
+
+Behavior:
+- The file's contents are read and trailing whitespace/newline trimmed; the
+  result becomes the effective `backend.password`.
+- `SCRY_BACKEND__PASSWORD` and `SCRY_BACKEND__PASSWORD_FILE` are **mutually
+  exclusive**. Setting both is a hard configuration error — the proxy refuses
+  to start rather than guess which one wins.
+- Fail-closed on any misconfiguration: if `password_file` is set but the file
+  is missing, unreadable, or empty (or contains only whitespace), `Config::load()`
+  returns an error and the proxy refuses to start. It never silently falls
+  back to an empty or default backend password.
 
 ### Network Security
 
