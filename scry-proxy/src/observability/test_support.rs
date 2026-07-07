@@ -20,7 +20,7 @@ use tracing::span::{Attributes, Id, Record};
 use tracing::{Event, Subscriber};
 use tracing_subscriber::layer::{Context, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
-use tracing_subscriber::Layer;
+use tracing_subscriber::{EnvFilter, Layer};
 
 /// A single closed span: its name and every field key it declared, mapped to
 /// that field's last recorded value (debug-formatted). A field declared
@@ -141,4 +141,36 @@ where
 pub(crate) fn capturing_subscriber() -> (impl Subscriber, Arc<Mutex<Captured>>) {
     let (layer, captured) = CapturingLayer::new();
     (tracing_subscriber::registry().with(layer), captured)
+}
+
+/// Build a subscriber shaped exactly like `observability::init`'s OTLP branch
+/// (Task 9 review fix, whole-branch-review Fix 1): a real `fmt::layer`
+/// carrying `console_filter` (the console/log filter — pass
+/// `observability::console_filter()`'s warn-default to simulate the
+/// documented "just enable tracing" path with no `RUST_LOG` override), PLUS
+/// the capturing layer standing in for the real `tracing-opentelemetry`
+/// `OpenTelemetryLayer`, carrying its OWN `export_filter` via
+/// `Layer::with_filter` — exactly how `init()` attaches
+/// `observability::otlp_export_filter()` to the real OTLP layer.
+///
+/// This is the seam the whole-branch review caught: the PRE-FIX `init()`
+/// wrapped a single shared `EnvFilter` around the whole `Registry`
+/// (`registry.with(env_filter)`) before adding the fmt/OTLP layers, which
+/// makes `tracing_subscriber::Layered`'s `enabled()` AND every layer's
+/// filter together — so a warn-default filter silently vetoed the info-level
+/// lifecycle spans for every layer beneath it, including the exporter, no
+/// matter what filter the exporter layer itself carried. Per-layer filtering
+/// (each concrete layer wrapped in its own `Filtered<_, _, _>` via
+/// `with_filter`, rather than one filter around the `Registry`) makes each
+/// layer's `enabled()` decision independent of the others, which is what lets
+/// `export_filter` admit spans the `console_filter` would otherwise veto.
+pub(crate) fn capturing_subscriber_with_filters(
+    console_filter: EnvFilter,
+    export_filter: EnvFilter,
+) -> (impl Subscriber, Arc<Mutex<Captured>>) {
+    let (layer, captured) = CapturingLayer::new();
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_target(true).with_filter(console_filter))
+        .with(layer.with_filter(export_filter));
+    (subscriber, captured)
 }

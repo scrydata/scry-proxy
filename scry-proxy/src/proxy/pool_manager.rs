@@ -180,9 +180,9 @@ pub struct PoolManager {
     next_binding_id: AtomicU64,
     /// Whether this pool accepts NEW backend acquisitions. `true` by default;
     /// admin `PAUSE` flips it to `false` and `RESUME` back to `true` (WP-10
-    /// Task 4). Checked with a single relaxed atomic load at the top of
-    /// [`acquire`](Self::acquire) — no per-query locking, so the hot path is
-    /// unaffected. Gating only blocks new acquisition; already-checked-out
+    /// Task 4). Checked with a single acquire/release atomic load at the top
+    /// of [`acquire`](Self::acquire) — no per-query locking, so the hot path
+    /// is unaffected. Gating only blocks new acquisition; already-checked-out
     /// `ManagedConnection`s keep working via `release`/`pin`.
     accepting: AtomicBool,
 }

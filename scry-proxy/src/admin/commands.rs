@@ -460,6 +460,17 @@ impl AdminConsole {
                     .map(|pm| pm.pool().status().max_size)
                     .unwrap_or(entry.configured_pool_size);
                 let current_connections = live_clients.get(&entry.pool_key).copied().unwrap_or(0);
+                // paused: live PAUSE/RESUME state (WP-10 Task 4) via the same
+                // `PoolManager` this database's other columns are resolved
+                // from — `paused` is the negation of `is_accepting()`. A
+                // database with no resolvable pool manager reports unpaused
+                // rather than fabricating a paused state.
+                let paused = self
+                    .handles
+                    .pool_managers
+                    .get(&entry.pool_key)
+                    .map(|pm| !pm.is_accepting())
+                    .unwrap_or(false);
 
                 vec![
                     entry.name,
@@ -475,9 +486,9 @@ impl AdminConsole {
                     pool_mode.to_string(),
                     max_connections.to_string(),
                     current_connections.to_string(),
-                    // paused/disabled: PAUSE/RESUME state isn't tracked yet
-                    // (WP-10 Task 5) — honest zero.
-                    "0".to_string(),
+                    if paused { "1".to_string() } else { "0".to_string() },
+                    // disabled: no disable-database concept exists yet —
+                    // honest zero, not fabrication.
                     "0".to_string(),
                 ]
             })
@@ -704,8 +715,9 @@ impl AdminConsole {
             rows.push(vec![key.to_string(), value, default, bool_str(changeable).to_string()]);
         };
 
-        // Nothing is actually live-reloadable yet (RELOAD is still a stub —
-        // WP-10 Task 4), so `changeable` is honestly `no` across the board
+        // RELOAD is functional (WP-10 Task 4) but scoped to `auth_file` only;
+        // none of the keys displayed here are RELOAD-mutable, so `changeable`
+        // is honestly `no` across the board
         // rather than a fabricated `yes` copied from the old canned rows.
         const CHANGEABLE: bool = false;
 

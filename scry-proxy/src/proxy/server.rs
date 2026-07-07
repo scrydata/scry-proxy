@@ -1905,6 +1905,44 @@ mod tests {
         assert_eq!(conn.fields.get("client_addr").unwrap(), "127.0.0.1:55555");
     }
 
+    /// Whole-branch-review regression (Fix 1, P4 §4.6): `new_connection_span`
+    /// is `info_span!`, and the console/log filter defaults to `warn` when
+    /// `RUST_LOG` is unset — the documented "just enable tracing" path
+    /// (`enable_tracing = true` + `otlp_endpoint` set, no `RUST_LOG`
+    /// override). The test above uses a filter-LESS subscriber, so it never
+    /// caught that a single shared `EnvFilter` wrapping the whole layer stack
+    /// (the pre-fix `init()` shape) silently vetoes info-level spans for
+    /// every layer beneath it, including the OTLP exporter. This drives the
+    /// REAL `new_connection_span` helper under a subscriber shaped exactly
+    /// like `init()`'s OTLP branch now is: a real `fmt::layer` carrying a
+    /// warn-default console filter, PLUS the capturing layer standing in for
+    /// the real `OpenTelemetryLayer`, carrying its own
+    /// `observability::otlp_export_filter()` via per-layer filtering. If
+    /// per-layer filtering ever regresses back to one shared filter, this
+    /// span stops being captured and the test fails.
+    #[test]
+    fn connection_span_exports_under_the_real_otlp_layer_filter() {
+        let (subscriber, captured) =
+            crate::observability::test_support::capturing_subscriber_with_filters(
+                tracing_subscriber::EnvFilter::new("warn"),
+                crate::observability::otlp_export_filter(),
+            );
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        {
+            let _entered = new_connection_span(7, "127.0.0.1:9", false).entered();
+            // Span closes (and is captured) when `_entered` drops here.
+        }
+
+        let captured = captured.lock().unwrap();
+        assert!(
+            captured.span_named("pg_connection").is_some(),
+            "pg_connection span must be exported under the OTLP layer's own info filter, even \
+             though the console/log filter defaults to warn — captured spans: {:?}",
+            captured.spans.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
     /// End-to-end (RED→GREEN target): drive a real client query through the
     /// REAL `handle_client_connection` -> `ConnectionHandler::handle()` ->
     /// direct/owned-backend dispatch path (no mocks of the span machinery)

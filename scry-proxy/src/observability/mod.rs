@@ -19,7 +19,7 @@ pub use timeline::{QueryTimeline, TimelinePhases};
 
 use anyhow::Result;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
 use crate::config::ObservabilityConfig;
 
@@ -56,15 +56,46 @@ pub fn loggable(text: &str) -> &str {
     }
 }
 
+/// Filter for the human-facing console/log layer (`tracing_subscriber::fmt`):
+/// honors `RUST_LOG`, defaulting to `warn` when unset or invalid. This is
+/// deliberately NOT reused for the OTLP export layer — see
+/// [`otlp_export_filter`].
+pub(crate) fn console_filter() -> EnvFilter {
+    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"))
+}
+
+/// Filter for the OTLP export layer (`tracing-opentelemetry`'s
+/// `OpenTelemetryLayer`), attached as its OWN per-layer filter via
+/// `Layer::with_filter` rather than sharing [`console_filter`].
+///
+/// Whole-branch review finding this fixes: the lifecycle spans added for
+/// P4 §4.6 (`pg_connection`/`pg_query`, see `proxy::server::new_connection_span`
+/// / `proxy::connection::new_query_span`) are `info_span!`, but the console
+/// filter defaults to `warn`. Composing filtering as a single `EnvFilter`
+/// layer wrapping the whole `Registry` (the old code: `registry.with(env_filter)`
+/// before adding the fmt/OTLP layers) makes every layer's `enabled()` check
+/// AND together — `tracing_subscriber::Layered::enabled` requires BOTH the
+/// outer layer's filter AND the inner filter to admit an event/span. So a
+/// `warn`-default outer filter silently vetoed the info-level lifecycle spans
+/// for every layer beneath it, including the OTLP exporter — enabling tracing
+/// the documented way (`enable_tracing = true` + `otlp_endpoint` set, no
+/// `RUST_LOG` override) exported ZERO `pg_connection`/`pg_query` spans.
+///
+/// Per-layer filtering (`Layer::with_filter`, giving each concrete layer its
+/// own `Filtered<_, _, _>` wrapper instead of one shared filter around the
+/// `Registry`) makes each layer's `enabled()` independent of the others, so
+/// this filter alone decides what the OTLP layer exports. Fixed at `info`
+/// (not read from `RUST_LOG`) so enabling tracing always exports the
+/// lifecycle spans without requiring the operator to also raise the console
+/// log level.
+pub(crate) fn otlp_export_filter() -> EnvFilter {
+    EnvFilter::new("info")
+}
+
 /// Initialize observability (tracing, metrics, OpenTelemetry)
 pub fn init(config: &ObservabilityConfig) -> Result<()> {
     // Latch the log-hygiene flag before any sensitive log site can run.
     set_unsafe_debug_logging(config.unsafe_debug_logging);
-
-    // Set up tracing subscriber with env filter
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
-
-    let registry = tracing_subscriber::registry().with(env_filter);
 
     // Initialize OpenTelemetry if enabled
     if config.enable_tracing {
@@ -91,20 +122,34 @@ pub fn init(config: &ObservabilityConfig) -> Result<()> {
                 ])))
                 .install_batch(runtime::TokioCurrentThread)?;
 
-            // Add OpenTelemetry layer to tracing
-            let telemetry_layer = OpenTelemetryLayer::new(tracer);
+            // Add OpenTelemetry layer to tracing, with its OWN filter so it
+            // exports the info-level lifecycle spans regardless of the
+            // (possibly warn-default) console filter below.
+            let telemetry_layer = OpenTelemetryLayer::new(tracer).with_filter(otlp_export_filter());
 
-            registry
-                .with(tracing_subscriber::fmt::layer().with_target(true))
+            tracing_subscriber::registry()
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_target(true)
+                        .with_filter(console_filter()),
+                )
                 .with(telemetry_layer)
                 .init();
         } else {
             // No OTLP endpoint configured, use default tracing only
-            registry.with(tracing_subscriber::fmt::layer().with_target(true)).init();
+            tracing_subscriber::registry()
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_target(true)
+                        .with_filter(console_filter()),
+                )
+                .init();
         }
     } else {
         // Tracing disabled, use basic logging only
-        registry.with(tracing_subscriber::fmt::layer().with_target(true)).init();
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_target(true).with_filter(console_filter()))
+            .init();
     }
 
     tracing::info!("Observability initialized");

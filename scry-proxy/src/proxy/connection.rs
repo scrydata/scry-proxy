@@ -2765,6 +2765,46 @@ mod tests {
         );
     }
 
+    /// Whole-branch-review regression (Fix 1, P4 §4.6): `new_query_span` is
+    /// `info_span!`, and the console/log filter defaults to `warn` when
+    /// `RUST_LOG` is unset — the documented "just enable tracing" path
+    /// (`enable_tracing = true` + `otlp_endpoint` set, no `RUST_LOG`
+    /// override). A single shared `EnvFilter` wrapping the whole layer stack
+    /// (the pre-fix `observability::init` shape) makes every layer's
+    /// `enabled()` check AND together, so a warn-default filter silently
+    /// vetoes info-level spans for every layer beneath it, including the
+    /// OTLP exporter — enabling tracing the documented way exported ZERO
+    /// `pg_query` spans. This drives the REAL `new_query_span` helper under a
+    /// subscriber shaped exactly like `init()`'s OTLP branch now is: a real
+    /// `fmt::layer` carrying a warn-default console filter, PLUS the
+    /// capturing layer standing in for the real `OpenTelemetryLayer`,
+    /// carrying its own `observability::otlp_export_filter()` via per-layer
+    /// filtering (`Layer::with_filter`). If per-layer filtering ever
+    /// regresses back to one shared filter, this span stops being captured
+    /// and the test fails.
+    #[test]
+    fn query_span_exports_under_the_real_otlp_layer_filter() {
+        let (subscriber, captured) =
+            crate::observability::test_support::capturing_subscriber_with_filters(
+                tracing_subscriber::EnvFilter::new("warn"),
+                crate::observability::otlp_export_filter(),
+            );
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        {
+            let _entered = new_query_span(7, "session", "backend-0", "SELECT 1").entered();
+            // Span closes (and is captured) when `_entered` drops here.
+        }
+
+        let captured = captured.lock().unwrap();
+        assert!(
+            captured.span_named("pg_query").is_some(),
+            "pg_query span must be exported under the OTLP layer's own info filter, even \
+             though the console/log filter defaults to warn — captured spans: {:?}",
+            captured.spans.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
     #[tokio::test]
     async fn classify_pool_error_for_metrics_records_request_shed_on_real_message() {
         // Same fixture as tcp_pool.rs's test_breaker_opens_and_sheds_when_backend_down:

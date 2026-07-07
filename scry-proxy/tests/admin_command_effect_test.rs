@@ -140,6 +140,74 @@ async fn pause_unknown_database_returns_honest_error() {
     );
 }
 
+/// Extract a `RowSet`'s `(columns, rows)`, panicking with a useful message on
+/// any other response variant.
+fn expect_rowset(response: AdminResponse) -> (Vec<String>, Vec<Vec<String>>) {
+    match response {
+        AdminResponse::RowSet { columns, rows } => (columns, rows),
+        other => panic!("expected RowSet, got {other:?}"),
+    }
+}
+
+fn col_index(columns: &[String], name: &str) -> usize {
+    columns.iter().position(|c| c == name).unwrap_or_else(|| panic!("missing column {name}"))
+}
+
+/// SHOW DATABASES must reflect LIVE pause state (WP-10 whole-branch review,
+/// Fix 2), not a hardcoded `"0"`. Before `PAUSE`, `paused=0`; after
+/// `PAUSE <db>`, that db's row shows `paused=1`; after `RESUME <db>`, back to
+/// `0`. This is the RED case for the pre-fix hardcoded column: it always
+/// reports `0`, so the post-PAUSE assertion below fails against it. No
+/// backend container is needed — `ProxyServer::new` never dials the backend,
+/// and PAUSE/RESUME/SHOW DATABASES only touch pool-manager/config state.
+#[tokio::test]
+async fn pause_reflected_in_show_databases_paused_column() {
+    let config = create_test_config("127.0.0.1".to_string(), 1, PoolingStrategy::Session);
+    let publisher: Arc<dyn EventPublisher> = Arc::new(TestPublisher::new());
+    let (_proxy_port, handles) =
+        start_test_proxy_with_handles(config.clone(), publisher).await.unwrap();
+
+    let admin = admin_console(handles.clone());
+    let db = config.backend.database.clone();
+
+    let (columns, rows) = expect_rowset(admin.execute("SHOW DATABASES").await.unwrap());
+    let name_idx = col_index(&columns, "name");
+    let paused_idx = col_index(&columns, "paused");
+    let row =
+        rows.iter().find(|r| r[name_idx] == db).unwrap_or_else(|| panic!("no row for db {db}"));
+    assert_eq!(row[paused_idx], "0", "expected paused=0 before PAUSE, got row {row:?}");
+
+    let resp = admin.execute(&format!("PAUSE {db}")).await.unwrap();
+    assert!(
+        matches!(resp, AdminResponse::CommandComplete { .. }),
+        "PAUSE {db} should return CommandComplete, got {resp:?}"
+    );
+
+    let (columns, rows) = expect_rowset(admin.execute("SHOW DATABASES").await.unwrap());
+    let paused_idx = col_index(&columns, "paused");
+    let row =
+        rows.iter().find(|r| r[name_idx] == db).unwrap_or_else(|| panic!("no row for db {db}"));
+    assert_eq!(
+        row[paused_idx], "1",
+        "SHOW DATABASES MUST report paused=1 for {db} after PAUSE, got row {row:?}"
+    );
+
+    let resp = admin.execute(&format!("RESUME {db}")).await.unwrap();
+    assert!(
+        matches!(resp, AdminResponse::CommandComplete { .. }),
+        "RESUME {db} should return CommandComplete, got {resp:?}"
+    );
+
+    let (columns, rows) = expect_rowset(admin.execute("SHOW DATABASES").await.unwrap());
+    let paused_idx = col_index(&columns, "paused");
+    let row =
+        rows.iter().find(|r| r[name_idx] == db).unwrap_or_else(|| panic!("no row for db {db}"));
+    assert_eq!(
+        row[paused_idx], "0",
+        "SHOW DATABASES MUST report paused=0 for {db} after RESUME, got row {row:?}"
+    );
+}
+
 /// A `config.databases` entry named `name`, routed to the same real backend
 /// the default pool uses. Two of these give us two DISTINCT logical databases
 /// (`db1`, `db2`) whose live clients we can tell apart in the registry, both
