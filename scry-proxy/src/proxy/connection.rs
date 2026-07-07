@@ -184,6 +184,116 @@ fn redact_param(p: &ParamValue) -> ParamValue {
     }
 }
 
+/// A bounded, non-sensitive command tag for a SQL statement (Task 9, P4 §4.6):
+/// the leading clause keyword, upper-cased, from a small known-safe set, or
+/// `"OTHER"` for anything else. Cheap (no parsing, unlike `CommandDetector`/
+/// `QueryAnonymizer`) and never a raw-SQL leak — it's always one of a fixed
+/// handful of strings, independent of the statement's literal content, so
+/// it's safe to attach to a span field unconditionally.
+fn command_tag(sql: &str) -> &'static str {
+    const KEYWORDS: &[&str] = &[
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE",
+        "WITH",
+        "VALUES",
+        "TABLE",
+        "BEGIN",
+        "START",
+        "COMMIT",
+        "ROLLBACK",
+        "SAVEPOINT",
+        "RELEASE",
+        "SET",
+        "SHOW",
+        "EXPLAIN",
+        "CREATE",
+        "DROP",
+        "ALTER",
+        "DECLARE",
+        "CLOSE",
+        "DEALLOCATE",
+        "LISTEN",
+        "UNLISTEN",
+        "NOTIFY",
+    ];
+    let upper = sql.trim_start().to_uppercase();
+    for kw in KEYWORDS {
+        if let Some(rest) = upper.strip_prefix(kw) {
+            if rest.is_empty()
+                || rest.starts_with(|c: char| c.is_whitespace() || c == '(' || c == ';')
+            {
+                return kw;
+            }
+        }
+    }
+    "OTHER"
+}
+
+/// A one-way, unsalted fingerprint of a query's exact text (Task 9, P4 §4.6):
+/// 16 hex characters of a BLAKE3 hash. Safe to expose unconditionally — even
+/// with `unsafe_debug_logging` off — because a cryptographic hash cannot be
+/// inverted to recover the query text; it only lets a trace correlate
+/// repeated occurrences of the same statement. Deliberately distinct from
+/// `QueryAnonymizer`'s per-VALUE fingerprints (which require the query to
+/// parse successfully): this covers every query, parseable or not, at
+/// negligible cost, so it's always available for a span field.
+fn query_fingerprint(sql: &str) -> String {
+    blake3::hash(sql.as_bytes()).to_hex()[..16].to_string()
+}
+
+/// Build the per-query span (Task 9, P4 §4.6): dispatch → backend → response.
+/// Created as a child of whatever span is active when a query/statement is
+/// dispatched (the connection span from `handle_client_connection` and the
+/// `handle()` span above it), and exported through the existing OTLP layer
+/// configured by `observability::init` — near-zero cost when no subscriber is
+/// interested (the default, no OTLP endpoint configured).
+///
+/// Deliberately does NOT put the raw query or parameter values in an
+/// always-on field: `command` and `query_fingerprint` are bounded/one-way and
+/// therefore safe unconditionally, and the `query` field itself is gated by
+/// the exact same `loggable()` redaction every other query log site in this
+/// file already uses — it only reveals raw SQL when `unsafe_debug_logging` is
+/// explicitly enabled, never by default, and never a new leak surface beyond
+/// what logs already allow. `duration_ms`/`success` start `Empty` and are
+/// filled in via `record_query_span_outcome` once the query completes —
+/// bridging dispatch and completion across read-loop iterations is what
+/// storing this `Span` on `PendingExecution` is for.
+///
+/// Phase durations: only the total/backend `duration_ms` is cheaply available
+/// today. `queue`/`pool-acquire` durations are tracked by `QueryTimeline` but
+/// are never marked by any production call site in this file (only by
+/// `observability::metrics`'s own unit tests) — fabricating them here would
+/// be dishonest, so they're deliberately left off rather than always-zero.
+fn new_query_span(
+    connection_id: u64,
+    pooling_mode: &str,
+    backend_id: &str,
+    query: &str,
+) -> tracing::Span {
+    tracing::info_span!(
+        "pg_query",
+        conn_id = connection_id,
+        pooling_mode = %pooling_mode,
+        backend_id = %backend_id,
+        command = %command_tag(query),
+        query_fingerprint = %query_fingerprint(query),
+        query = %crate::observability::loggable(query),
+        duration_ms = tracing::field::Empty,
+        success = tracing::field::Empty,
+    )
+}
+
+/// Record a query span's outcome at completion (Task 9, P4 §4.6). The span
+/// itself closes (and is exported) when its last handle — the one stored on
+/// the taken `PendingExecution` — is dropped at the end of the caller's
+/// block, so no explicit close call is needed here.
+fn record_query_span_outcome(span: &tracing::Span, duration: Duration, success: bool) {
+    span.record("duration_ms", duration.as_millis() as u64);
+    span.record("success", success);
+}
+
 /// Handles a single client connection, forwarding messages to/from the backend
 pub struct ConnectionHandler {
     client_stream: ClientTransport,
@@ -949,6 +1059,10 @@ impl ConnectionHandler {
         let pooling_strategy = self.config.performance.connection_pooling.clone();
         let pooling_mode = Self::pooling_mode(&pooling_strategy);
         let mode_enforcer = ModeEnforcer::new(pooling_mode);
+        // Cheap, pre-formatted span attributes (Task 9, P4 §4.6): computed once
+        // per connection rather than per query.
+        let pooling_mode_str = format!("{pooling_mode:?}");
+        let backend_id = format!("{}:{}", self.config.backend.host, self.config.backend.port);
         let mut txn_tracker = TransactionTracker::new();
         let mut conn_state = ConnectionState::new(self.config.protocol.max_prepared_statements);
 
@@ -1042,6 +1156,7 @@ impl ConnectionHandler {
                                             param_oids: param_oids.clone(),
                                         });
                                         stmt_cache.set_pending(String::new(), PendingExecution {
+                                            span: new_query_span(connection_id, &pooling_mode_str, &backend_id, query),
                                             query: query.clone(),
                                             params: vec![],
                                             params_incomplete: true,
@@ -1069,6 +1184,7 @@ impl ConnectionHandler {
                                         };
 
                                         stmt_cache.set_pending(portal, PendingExecution {
+                                            span: new_query_span(connection_id, &pooling_mode_str, &backend_id, &query),
                                             query,
                                             params,
                                             params_incomplete: incomplete,
@@ -1089,6 +1205,7 @@ impl ConnectionHandler {
 
                                         debug!(query = %crate::observability::loggable(query), "Simple query");
                                         stmt_cache.set_pending(String::new(), PendingExecution {
+                                            span: new_query_span(connection_id, &pooling_mode_str, &backend_id, query),
                                             query: query.clone(),
                                             params: vec![],
                                             params_incomplete: false,
@@ -1201,6 +1318,7 @@ impl ConnectionHandler {
                                 if let Some(pending) = stmt_cache.take_pending("") {
                                     let duration = pending.started_at.elapsed();
                                     warn!(query = %crate::observability::loggable(&pending.query), error = %crate::observability::loggable(&error_msg), duration_ms = duration.as_millis(), "Query failed");
+                                    record_query_span_outcome(&pending.span, duration, false);
 
                                     let error_field = anon_settings.error_field(&extractor, data, error_msg);
                                     if let Some((event, fingerprints)) = anon_settings.build_event(
@@ -1228,6 +1346,7 @@ impl ConnectionHandler {
                                 if let Some(pending) = stmt_cache.take_pending("") {
                                     let duration = pending.started_at.elapsed();
                                     debug!(query = %crate::observability::loggable(&pending.query), duration_ms = duration.as_millis(), "Query completed successfully");
+                                    record_query_span_outcome(&pending.span, duration, true);
 
                                     // WP-9 Task 9 (P2 §4.6): a simple-Query
                                     // `pending.query` may itself be a
@@ -1479,6 +1598,12 @@ impl ConnectionHandler {
         let anon_settings = AnonymizationSettings::from_config(&self.config);
         let metrics = Arc::clone(&self.metrics);
         let max_stmts = self.config.protocol.max_prepared_statements;
+        // Cheap, pre-formatted span attributes (Task 9, P4 §4.6). This path
+        // bypasses the `PoolManager`/`ModeEnforcer` entirely (a direct,
+        // unpooled backend connection), so `pooling_mode` is a fixed literal
+        // rather than a `PoolingMode` variant.
+        let pooling_mode_str = "direct".to_string();
+        let backend_id = format!("{}:{}", self.config.backend.host, self.config.backend.port);
 
         // Shared prepared statement cache between both async tasks
         let stmt_cache: Arc<Mutex<PreparedStatementCache>> =
@@ -1513,9 +1638,16 @@ impl ConnectionHandler {
                                         );
                                         // Set pending with empty params for Parse errors
                                         // Will be overwritten by Bind if Parse succeeds
+                                        let span = new_query_span(
+                                            connection_id,
+                                            &pooling_mode_str,
+                                            &backend_id,
+                                            &query,
+                                        );
                                         cache.set_pending(
                                             String::new(),
                                             PendingExecution {
+                                                span,
                                                 query,
                                                 params: vec![],
                                                 params_incomplete: true,
@@ -1556,9 +1688,16 @@ impl ConnectionHandler {
                                             }
                                         };
 
+                                        let span = new_query_span(
+                                            connection_id,
+                                            &pooling_mode_str,
+                                            &backend_id,
+                                            &query,
+                                        );
                                         cache.set_pending(
                                             portal,
                                             PendingExecution {
+                                                span,
                                                 query,
                                                 params,
                                                 params_incomplete: incomplete,
@@ -1568,9 +1707,16 @@ impl ConnectionHandler {
                                     }
                                     Message::Query { query } => {
                                         debug!(query = %crate::observability::loggable(&query), "Simple query");
+                                        let span = new_query_span(
+                                            connection_id,
+                                            &pooling_mode_str,
+                                            &backend_id,
+                                            &query,
+                                        );
                                         cache.set_pending(
                                             String::new(),
                                             PendingExecution {
+                                                span,
                                                 query,
                                                 params: vec![],
                                                 params_incomplete: false,
@@ -1628,6 +1774,7 @@ impl ConnectionHandler {
                                     duration_ms = duration.as_millis(),
                                     "Query failed"
                                 );
+                                record_query_span_outcome(&pending.span, duration, false);
 
                                 let error_field =
                                     anon_settings.error_field(&extractor, data, error_msg);
@@ -1664,6 +1811,7 @@ impl ConnectionHandler {
                                     duration_ms = duration.as_millis(),
                                     "Query completed successfully"
                                 );
+                                record_query_span_outcome(&pending.span, duration, true);
 
                                 if let Some((event, fingerprints)) = anon_settings.build_event(
                                     &pending.query,

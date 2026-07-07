@@ -25,7 +25,7 @@ use tokio::net::TcpListener;
 use tokio::net::UnixListener;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, warn, Instrument};
 
 /// RAII guard that brackets a connection's lifetime: decrements the active
 /// connection counter/metric AND removes the connection from the client
@@ -1231,104 +1231,143 @@ impl ProxyServer {
         tls: bool,
     ) {
         let addr_str = client_addr.map(|a| a.to_string()).unwrap_or_else(|| "unix".to_string());
+        // Connection span (accept → auth), Task 9, P4 §4.6: entered for the
+        // whole body below via `.instrument()` (never a held `Entered` guard
+        // across `.await` points), so every nested span this task creates —
+        // `ConnectionHandler::handle`'s own `#[instrument]`, and the per-query
+        // `pg_query` spans created deep inside it — nests under this as a
+        // child, and every log event on this task (including the existing
+        // client-authenticated/auth-failed events) is attributed to it too.
+        let conn_span = new_connection_span(conn_id, &addr_str, tls);
 
-        // Parse startup message to get user/database and check for admin. UNIX
-        // sockets deliver an empty `startup_data` here (their startup is read
-        // later by the connection handler), so their identity fields stay empty
-        // for 1.0 — a documented limitation, not false state.
-        let (database_name, user_name, is_admin) = if !startup_data.is_empty() {
-            if let Some(startup) = StartupMessage::parse(&startup_data) {
-                let db = startup.database().map(|s| s.to_string());
-                let user = startup.user().map(|s| s.to_string());
-                let is_admin = db.as_ref().is_some_and(|d| d.eq_ignore_ascii_case(ADMIN_DATABASE));
-                (db, user, is_admin)
+        async move {
+            // Parse startup message to get user/database and check for admin. UNIX
+            // sockets deliver an empty `startup_data` here (their startup is read
+            // later by the connection handler), so their identity fields stay empty
+            // for 1.0 — a documented limitation, not false state.
+            let (database_name, user_name, is_admin) = if !startup_data.is_empty() {
+                if let Some(startup) = StartupMessage::parse(&startup_data) {
+                    let db = startup.database().map(|s| s.to_string());
+                    let user = startup.user().map(|s| s.to_string());
+                    let is_admin =
+                        db.as_ref().is_some_and(|d| d.eq_ignore_ascii_case(ADMIN_DATABASE));
+                    (db, user, is_admin)
+                } else {
+                    (None, None, false)
+                }
             } else {
                 (None, None, false)
+            };
+
+            // Fill in the span's `database` field now that it's known. Only the
+            // database (GUC) name is ever recorded here — never the password or
+            // any other startup-message parameter.
+            if let Some(ref db) = database_name {
+                tracing::Span::current().record("database", db.as_str());
             }
-        } else {
-            (None, None, false)
-        };
 
-        // Register this connection in the client registry now that its identity
-        // is known (WP-10, P4 §4.1). O(1) bookkeeping, off the per-query hot
-        // path. Admin clients are registered too (PgBouncer lists them),
-        // distinguished by `ClientState::Admin`. The `ConnectionCountGuard` in
-        // the spawn closure removes this entry on every exit path.
-        admin_handles.client_registry.register(ClientEntry {
-            conn_id,
-            addr: addr_str.clone(),
-            user: user_name.clone().unwrap_or_default(),
-            database: database_name.clone().unwrap_or_default(),
-            state: if is_admin { ClientState::Admin } else { ClientState::Active },
-            connect_time: std::time::Instant::now(),
-            last_request_time: std::time::Instant::now(),
-            tls,
-        });
+            // Register this connection in the client registry now that its identity
+            // is known (WP-10, P4 §4.1). O(1) bookkeeping, off the per-query hot
+            // path. Admin clients are registered too (PgBouncer lists them),
+            // distinguished by `ClientState::Admin`. The `ConnectionCountGuard` in
+            // the spawn closure removes this entry on every exit path.
+            admin_handles.client_registry.register(ClientEntry {
+                conn_id,
+                addr: addr_str.clone(),
+                user: user_name.clone().unwrap_or_default(),
+                database: database_name.clone().unwrap_or_default(),
+                state: if is_admin { ClientState::Admin } else { ClientState::Active },
+                connect_time: std::time::Instant::now(),
+                last_request_time: std::time::Instant::now(),
+                tls,
+            });
 
-        // Select the appropriate pool manager for this database
-        let pool_manager = database_name
-            .as_ref()
-            .and_then(|db| pool_managers.get(db))
-            .or_else(|| pool_managers.get("*"))
-            .cloned();
+            // Select the appropriate pool manager for this database
+            let pool_manager = database_name
+                .as_ref()
+                .and_then(|db| pool_managers.get(db))
+                .or_else(|| pool_managers.get("*"))
+                .cloned();
 
-        if let Some(ref db) = database_name {
-            debug!(
-                connection_id = conn_id,
-                database = %db,
-                has_specific_pool = pool_managers.contains_key(db),
-                "Routing connection to database"
-            );
-        }
+            if let Some(ref db) = database_name {
+                debug!(
+                    connection_id = conn_id,
+                    database = %db,
+                    has_specific_pool = pool_managers.contains_key(db),
+                    "Routing connection to database"
+                );
+            }
 
-        if is_admin {
+            if is_admin {
+                info!(
+                    connection_id = conn_id,
+                    client_addr = %addr_str,
+                    "Routing to admin console"
+                );
+
+                if let Err(e) = handle_admin_connection(transport, admin_handles, metrics).await {
+                    error!(
+                        connection_id = conn_id,
+                        client_addr = %addr_str,
+                        error = %e,
+                        "Admin console connection failed"
+                    );
+                }
+            } else {
+                // Use a placeholder address for UNIX sockets
+                let handler_addr = client_addr
+                    .unwrap_or_else(|| "0.0.0.0:0".parse().expect("valid placeholder addr"));
+
+                let handler = ConnectionHandler::new(
+                    transport,
+                    handler_addr,
+                    conn_id,
+                    config,
+                    batcher,
+                    pool_manager,
+                    metrics,
+                    startup_data,
+                    authenticator,
+                );
+
+                if let Err(e) = handler.handle().await {
+                    error!(
+                        connection_id = conn_id,
+                        client_addr = %addr_str,
+                        error = %e,
+                        "Connection handler failed"
+                    );
+                }
+            }
+
             info!(
                 connection_id = conn_id,
                 client_addr = %addr_str,
-                "Routing to admin console"
+                "Connection closed"
             );
-
-            if let Err(e) = handle_admin_connection(transport, admin_handles, metrics).await {
-                error!(
-                    connection_id = conn_id,
-                    client_addr = %addr_str,
-                    error = %e,
-                    "Admin console connection failed"
-                );
-            }
-        } else {
-            // Use a placeholder address for UNIX sockets
-            let handler_addr =
-                client_addr.unwrap_or_else(|| "0.0.0.0:0".parse().expect("valid placeholder addr"));
-
-            let handler = ConnectionHandler::new(
-                transport,
-                handler_addr,
-                conn_id,
-                config,
-                batcher,
-                pool_manager,
-                metrics,
-                startup_data,
-                authenticator,
-            );
-
-            if let Err(e) = handler.handle().await {
-                error!(
-                    connection_id = conn_id,
-                    client_addr = %addr_str,
-                    error = %e,
-                    "Connection handler failed"
-                );
-            }
         }
-
-        info!(
-            connection_id = conn_id,
-            client_addr = %addr_str,
-            "Connection closed"
-        );
+        .instrument(conn_span)
+        .await
     }
+}
+
+/// Build the per-connection span (accept → auth) for `handle_client_connection`
+/// (Task 9, P4 §4.6), exported through the existing OTLP layer configured by
+/// `observability::init` — near-zero cost when no subscriber is interested
+/// (the default, no OTLP endpoint configured). `database` is unknown at
+/// accept time (only known after parsing the client's startup message a few
+/// lines into the body), so it starts `Empty` and is filled in via
+/// `Span::record` once parsed. Deliberately takes only `conn_id`/`client_addr`
+/// (from the socket, never client-supplied)/`tls` as eager fields — never a
+/// password or any other startup-message parameter.
+fn new_connection_span(conn_id: u64, client_addr: &str, tls: bool) -> tracing::Span {
+    tracing::info_span!(
+        "pg_connection",
+        conn_id = conn_id,
+        client_addr = %client_addr,
+        tls = tls,
+        database = tracing::field::Empty,
+    )
 }
 
 /// Constant-time byte-slice equality, to avoid leaking the admin password
@@ -1832,5 +1871,202 @@ mod tests {
         assert_eq!(server.active_connection_count(), 0);
 
         // Integration test will verify actual increment/decrement behavior
+    }
+
+    // --- Task 9 (P4 §4.6): OTel tracing spans over the connection/query
+    // lifecycle + log safety --------------------------------------------
+
+    /// `new_connection_span` (the exact helper `handle_client_connection`
+    /// calls) must declare `conn_id`/`client_addr`/`tls`/`database` as span
+    /// fields, and recording `database` afterward (the way the real code does
+    /// once the startup message is parsed) must show up under that key —
+    /// never leaking anything beyond the database name itself.
+    #[test]
+    fn connection_span_declares_expected_field_keys_and_records_database() {
+        let (subscriber, captured) = crate::observability::test_support::capturing_subscriber();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        {
+            let span = new_connection_span(42, "127.0.0.1:55555", true);
+            span.record("database", "app_db");
+            // Span closes (and is captured) when it drops at the end of this block.
+        }
+
+        let captured = captured.lock().unwrap();
+        let conn = captured
+            .span_named("pg_connection")
+            .expect("pg_connection span must be captured on close");
+        for key in ["conn_id", "client_addr", "tls", "database"] {
+            assert!(conn.fields.contains_key(key), "pg_connection span missing field `{key}`");
+        }
+        assert_eq!(conn.fields.get("database").unwrap(), "\"app_db\"");
+        // `client_addr` is recorded via `%client_addr` (Display), which
+        // tracing renders without the `str`-Debug quoting `.record()` uses.
+        assert_eq!(conn.fields.get("client_addr").unwrap(), "127.0.0.1:55555");
+    }
+
+    /// End-to-end (RED→GREEN target): drive a real client query through the
+    /// REAL `handle_client_connection` -> `ConnectionHandler::handle()` ->
+    /// direct/owned-backend dispatch path (no mocks of the span machinery)
+    /// against a fake in-process Postgres backend, with
+    /// `unsafe_debug_logging` off (the default). Asserts:
+    /// 1. a `pg_connection` span and a nested `pg_query` span are both
+    ///    captured, with the query span's expected attribute KEYS present
+    ///    (`conn_id`, `pooling_mode`, `backend_id`, `duration_ms`, `success`);
+    /// 2. the distinctive literal in `SELECT 'SECRET_LITERAL_XYZ'` appears in
+    ///    NEITHER a captured span field NOR a captured log event — i.e. no
+    ///    raw-SQL leak anywhere tracing touches, by default.
+    #[tokio::test]
+    async fn end_to_end_query_produces_connection_and_query_spans_without_leaking_secret() {
+        use tokio::net::{TcpListener, TcpStream};
+
+        // Defensive: this global flag is process-shared (P1 §4.4's
+        // `set_unsafe_debug_logging`); pin it to the safe default so this
+        // test's log-safety assertion can't be polluted by another test that
+        // temporarily flips it on.
+        crate::observability::set_unsafe_debug_logging(false);
+
+        const SECRET: &str = "SECRET_LITERAL_XYZ";
+        let query = format!("SELECT '{SECRET}'");
+
+        fn build_simple_query(sql: &str) -> Vec<u8> {
+            let mut body = sql.as_bytes().to_vec();
+            body.push(0);
+            let mut msg = vec![b'Q'];
+            msg.extend_from_slice(&((4 + body.len()) as i32).to_be_bytes());
+            msg.extend_from_slice(&body);
+            msg
+        }
+
+        fn build_command_complete(tag: &str) -> Vec<u8> {
+            let mut body = tag.as_bytes().to_vec();
+            body.push(0);
+            let mut msg = vec![b'C'];
+            msg.extend_from_slice(&((4 + body.len()) as i32).to_be_bytes());
+            msg.extend_from_slice(&body);
+            msg
+        }
+
+        const READY_FOR_QUERY: [u8; 6] = [b'Z', 0, 0, 0, 5, b'I'];
+
+        async fn read_until_ready_for_query(stream: &mut TcpStream) -> Vec<u8> {
+            let mut acc = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut buf).await.expect("read from stream");
+                assert!(n > 0, "stream closed before ReadyForQuery");
+                acc.extend_from_slice(&buf[..n]);
+                if acc.ends_with(&READY_FOR_QUERY) {
+                    return acc;
+                }
+            }
+        }
+
+        // Fake backend: completes a trust startup, then answers one simple query.
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend_listener.local_addr().unwrap();
+        let backend_task = tokio::spawn(async move {
+            let (mut stream, _) = backend_listener.accept().await.unwrap();
+
+            // Consume the proxy's backend-directed StartupMessage.
+            let mut buf = vec![0u8; 8192];
+            let n = stream.read(&mut buf).await.unwrap();
+            assert!(n > 0, "backend never received a StartupMessage");
+
+            // AuthenticationOk + ReadyForQuery completes backend startup.
+            let mut resp = build_auth_ok();
+            resp.extend_from_slice(&READY_FOR_QUERY);
+            stream.write_all(&resp).await.unwrap();
+
+            // The client's simple Query.
+            let n = stream.read(&mut buf).await.unwrap();
+            assert!(n > 0, "backend never received the client's Query message");
+            assert_eq!(buf[0], b'Q', "expected a simple Query message forwarded to the backend");
+
+            let mut resp2 = build_command_complete("SELECT 1");
+            resp2.extend_from_slice(&READY_FOR_QUERY);
+            stream.write_all(&resp2).await.unwrap();
+
+            // Keep the socket open briefly so the proxy's forwarding loop
+            // doesn't race an early EOF against the write above.
+            let _ = stream.read(&mut buf).await;
+        });
+
+        // Fake client: connects, completes startup, sends the query, reads
+        // the response, then disconnects (ending the handler loop).
+        let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client_listen_addr = client_listener.local_addr().unwrap();
+        let query_for_client = query.clone();
+        let client_task = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(client_listen_addr).await.unwrap();
+            let _ = read_until_ready_for_query(&mut stream).await;
+
+            stream.write_all(&build_simple_query(&query_for_client)).await.unwrap();
+            let _ = read_until_ready_for_query(&mut stream).await;
+            // Dropping `stream` here closes the client side, which is what
+            // ends the proxy's `handle_with_owned_backend` forwarding loop.
+        });
+
+        let (proxy_client_stream, _) = client_listener.accept().await.unwrap();
+        let peer_addr = proxy_client_stream.peer_addr().unwrap();
+
+        let mut config = create_test_config();
+        config.backend.host = backend_addr.ip().to_string();
+        config.backend.port = backend_addr.port();
+        config.backend.user = "postgres".to_string();
+        config.backend.password = String::new();
+        config.backend.database = "postgres".to_string();
+        config.auth.auth_type = AuthType::Trust;
+
+        let admin_handles = AdminHandles::for_test_with_config(config.clone());
+        let batcher =
+            Arc::new(EventBatcher::new(Arc::new(DebugLoggerPublisher::new()), 10, 100, 1000));
+        let metrics = Arc::new(ProxyMetrics::new(100, HealthConfig::default()));
+        let startup_bytes = StartupMessage::build("testuser", "testdb", &[]);
+
+        let (subscriber, captured) = crate::observability::test_support::capturing_subscriber();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        ProxyServer::handle_client_connection(
+            ClientTransport::Plain(proxy_client_stream),
+            Some(peer_addr),
+            4242,
+            Arc::new(config),
+            batcher,
+            HashMap::new(), // no pool manager -> direct/owned-backend path
+            metrics,
+            startup_bytes,
+            None,
+            admin_handles,
+            false,
+        )
+        .await;
+
+        client_task.await.expect("client task must not panic");
+        backend_task.await.expect("backend task must not panic");
+
+        let captured = captured.lock().unwrap();
+
+        assert!(
+            captured.span_named("pg_connection").is_some(),
+            "expected a pg_connection span; captured spans: {:?}",
+            captured.spans.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        let query_span = captured.span_named("pg_query").expect("expected a pg_query span");
+        for key in ["conn_id", "pooling_mode", "backend_id", "duration_ms", "success"] {
+            assert!(query_span.fields.contains_key(key), "pg_query span missing field `{key}`");
+        }
+        // `command` is recorded via `%command_tag(query)` (Display), so it
+        // renders without `str`-Debug quoting.
+        assert_eq!(query_span.fields.get("command").map(String::as_str), Some("SELECT"));
+        assert_eq!(query_span.fields.get("success").map(String::as_str), Some("true"));
+
+        // The safety-critical assertion: the distinctive literal must not
+        // leak into ANY captured span field or log event.
+        assert!(
+            !captured.contains_value(SECRET),
+            "raw query literal {SECRET:?} leaked into a span field or log event with \
+             unsafe_debug_logging off (the default)"
+        );
     }
 }

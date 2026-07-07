@@ -4,6 +4,8 @@ pub mod hot_data;
 pub mod metrics;
 pub mod metrics_server;
 pub mod prometheus;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod timeline;
 
 // Re-exports for convenience
