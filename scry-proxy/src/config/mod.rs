@@ -976,6 +976,47 @@ mod validation_tests {
 }
 
 #[cfg(test)]
+mod secure_defaults_snapshot {
+    use super::*;
+
+    /// Serialize every security-relevant default to a stable, sorted form.
+    /// Any change here means a default moved; the snapshot test forces it to be
+    /// reviewed and re-approved in the same PR (P1 §5.2).
+    fn snapshot() -> String {
+        let c = Config::default();
+        let mut lines = vec![
+            format!("admin.enabled = {}", c.admin.enabled),
+            format!("auth.allow_trust = {}", c.auth.allow_trust),
+            format!("auth.auth_type = {:?}", c.auth.auth_type),
+            format!("backend.password_is_empty = {}", c.backend.password.is_empty()),
+            format!("observability.unsafe_debug_logging = {}", c.observability.unsafe_debug_logging),
+            format!("publisher.allow_insecure = {}", c.publisher.allow_insecure),
+            format!("publisher.anonymize = {}", c.publisher.anonymize),
+            format!("publisher.parse_failure_mode = {:?}", c.publisher.parse_failure_mode),
+            format!("tls.client_tls_sslmode = {:?}", c.tls.client_tls_sslmode),
+            format!("tls.server_tls_sslmode = {:?}", c.tls.server_tls_sslmode),
+        ];
+        lines.sort();
+        let mut s = lines.join("\n");
+        s.push('\n');
+        s
+    }
+
+    #[test]
+    fn secure_defaults_are_locked() {
+        let expected = include_str!("../../tests/fixtures/secure_defaults.snapshot");
+        let actual = snapshot();
+        assert_eq!(
+            actual, expected,
+            "Security-relevant defaults changed.\n\nIf this change is intentional AND \
+             still secure (a default did not move toward less protection), update \
+             tests/fixtures/secure_defaults.snapshot in the same PR. If a default became \
+             less safe, reconsider it — this snapshot exists to catch exactly that (P1 §5.2)."
+        );
+    }
+}
+
+#[cfg(test)]
 mod redacting_debug_tests {
     use super::*;
 

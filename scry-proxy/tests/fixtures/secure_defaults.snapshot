@@ -1,0 +1,10 @@
+admin.enabled = false
+auth.allow_trust = false
+auth.auth_type = Trust
+backend.password_is_empty = true
+observability.unsafe_debug_logging = false
+publisher.allow_insecure = false
+publisher.anonymize = true
+publisher.parse_failure_mode = Redact
+tls.client_tls_sslmode = Disable
+tls.server_tls_sslmode = Disable
