@@ -111,12 +111,31 @@ pub struct ManagedConnection {
 impl ManagedConnection {
     /// Get a reference to the underlying backend transport (TCP or TLS)
     pub fn stream(&self) -> Result<&BackendTransport, ConnectionTaken> {
-        self.connection.as_deref().ok_or(ConnectionTaken)
+        self.connection.as_deref().map(|p| &p.transport).ok_or(ConnectionTaken)
     }
 
     /// Get a mutable reference to the underlying backend transport (TCP or TLS)
     pub fn stream_mut(&mut self) -> Result<&mut BackendTransport, ConnectionTaken> {
-        self.connection.as_deref_mut().ok_or(ConnectionTaken)
+        self.connection.as_deref_mut().map(|p| &mut p.transport).ok_or(ConnectionTaken)
+    }
+
+    /// The captured client-facing startup response for this physical backend, if
+    /// it has already completed its one-time Postgres startup handshake (WP-9
+    /// Task 8, P2 §5.3). `Some` means this connection is being warm-reused and
+    /// the caller must replay these bytes to the client instead of re-running the
+    /// backend startup handshake; `None` means this is a fresh backend that still
+    /// needs to be initialized.
+    pub fn startup_response(&self) -> Option<&[u8]> {
+        self.connection.as_deref().and_then(|p| p.startup_response.as_deref())
+    }
+
+    /// Record the backend's client-facing startup response after a fresh backend
+    /// has been initialized, so a later client that warm-reuses this same
+    /// physical connection can be served without re-handshaking the backend.
+    pub fn set_startup_response(&mut self, bytes: Vec<u8>) {
+        if let Some(p) = self.connection.as_deref_mut() {
+            p.startup_response = Some(bytes);
+        }
     }
 
     /// Check if this connection is pinned

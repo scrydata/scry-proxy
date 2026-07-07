@@ -284,6 +284,35 @@ This ensures connections are "clean" for the next query, preventing state leakag
 > or `LISTEN`-using clients get **less pooling** in Transaction mode. Stateless clients pool as
 > before. See [transparency-contract.md §4](transparency-contract.md#4-pooling-mode-scope).
 
+#### Graceful client disconnect: Terminate is intercepted, not forwarded (P2 §5.3)
+
+A well-behaved Postgres client sends a `Terminate` ('X') message before closing its socket. In
+the **pooled path**, Scry does **not** forward that `Terminate` to the backend — forwarding it
+would close the physical Postgres session, so the pooled connection could never be **warm-reused**
+by a different client (every new client would pay a full TCP connect + startup + authentication).
+Instead the proxy treats `Terminate` as "this client is done", ends the client's session, and
+returns the still-alive backend to the pool. `Terminate` is the one client message Scry
+deliberately does not forward, because it is a connection-lifecycle signal the pool owns; every
+other message is forwarded transparently. (The non-pooled/owned path still forwards `Terminate`
+1:1.) This is implemented in the managed client-read loop in `src/proxy/connection.rs`.
+
+What makes warm reuse **clean**: the surviving backend goes through the same recycle sequence
+before the next client checks it out — **`health_check` → `DISCARD ALL` (reset) → reuse**. The
+`health_check` rejects a desynced/dead connection (falling back to creating a fresh one), and
+`DISCARD ALL` wipes all session state (temp tables, prepared statements, `SET` variables, advisory
+locks, cursors, `LISTEN`), so the next client sees a pristine session on a genuinely reused
+backend process. This is verified end-to-end by the §5.3 dirty-connection auditor
+(`tests/differential_transparency_test.rs`), which confirms via matching `pg_backend_pid()` across
+two client connections that the **same** physical backend is reused, and that none of the first
+client's state is observable to the second.
+
+Because a Postgres backend performs its startup/authentication exactly once and then stays in the
+query loop for life, a warm-reused backend is **not** re-initialized. The proxy captures the
+backend's client-facing startup response (`ParameterStatus`, `BackendKeyData`, `ReadyForQuery`) on
+first initialization (stored on the pooled connection) and **replays** it to any later client that
+reuses the same physical backend, while authenticating that client normally — so the client's
+startup sequence stays faithful without ever re-handshaking the backend.
+
 ### 4. Health Checks (Passive)
 
 Every connection is health-checked **before** being returned from the pool:

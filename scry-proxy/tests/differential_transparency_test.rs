@@ -644,19 +644,48 @@ async fn dirty_connection_invariant_hybrid_mode() {
          the connection instead of pinning it (§5.3 fail-closed violation)"
     );
 
-    // Same invariant, extended protocol — Task 4/6's own guardrail, asserted
-    // again here explicitly as the named §5.3 fail-closed invariant.
-    assert_extended_state_survives_hybrid_recycle(
-        &client_c,
-        proxy_port,
-        "postgres",
-        "postgres",
-        "postgres",
-        "wp9_survive_ext_guc",
-        "wp9_survive_ext_value",
-    )
-    .await
-    .expect("extended-protocol state must survive the Hybrid recycle boundary (§5.3)");
+    // Same invariant (b), extended protocol — Task 4/6's own guardrail, asserted
+    // here explicitly as the named §5.3 fail-closed invariant, and entirely on
+    // client C (its CONTINUING logical session), with NO second concurrent
+    // client. The cross-client NON-leak half of §5.3 is invariant (a), already
+    // proven above with client B on a genuinely warm-reused backend; opening a
+    // second client here would be unsatisfiable anyway — this proxy is capped at
+    // `pool_size = 1` and client C's connection is (correctly) PINNED because it
+    // carries live session state, so no second physical backend can exist for a
+    // concurrent client to land on.
+    //
+    // A dotted custom GUC name (`wp9.survive_ext_guc`) is required: Postgres
+    // rejects `SET` of a bare, non-namespaced unknown parameter ("unrecognized
+    // configuration parameter"), but accepts any dotted name as a session
+    // placeholder GUC — exactly the leakable extended-protocol session state this
+    // invariant probes. A distinct namespace from the simple-protocol
+    // `application_name` probe above keeps the two checks independent.
+    //
+    // The `SET` goes over the EXTENDED protocol (`.execute()`), which is the pin
+    // trigger under test (Task 4's Parse-arm classification). `DEALLOCATE ALL`
+    // (simple) strips the incidental prepared-statement pin so this asserts the
+    // session-variable pin specifically; BEGIN/COMMIT (simple) are what make
+    // Hybrid evaluate its release-vs-pin decision at all.
+    client_c.batch_execute("BEGIN").await.expect("BEGIN (ext survive)");
+    client_c
+        .execute("SET wp9.survive_ext_guc = 'wp9_survive_ext_value'", &[])
+        .await
+        .expect("extended-protocol SET should succeed");
+    client_c.batch_execute("DEALLOCATE ALL").await.expect("DEALLOCATE ALL");
+    client_c.batch_execute("COMMIT").await.expect("COMMIT (ext survive)");
+    for _ in 0..5 {
+        client_c.simple_query("SELECT 1").await.expect("keepalive SELECT 1 (ext survive)");
+    }
+    let ext_guc: String = client_c
+        .query_one("SHOW wp9.survive_ext_guc", &[])
+        .await
+        .expect("SHOW wp9.survive_ext_guc")
+        .get(0);
+    assert_eq!(
+        ext_guc, "wp9_survive_ext_value",
+        "GUC set via EXTENDED protocol was silently dropped — Hybrid mode recycled the \
+         connection instead of pinning it (§5.3 fail-closed violation)"
+    );
 }
 
 /// §5.3 dirty-connection invariant auditor (WP-9 Task 8, P2 §5.3) — Transaction mode.

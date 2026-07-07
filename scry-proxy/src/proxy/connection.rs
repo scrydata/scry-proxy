@@ -632,6 +632,143 @@ impl ConnectionHandler {
         Ok(())
     }
 
+    /// Fresh-backend startup handshake for the pooled path that ALSO captures the
+    /// backend's client-facing startup response for warm reuse (WP-9 Task 8, P2
+    /// §5.3).
+    ///
+    /// Identical in effect to [`Self::perform_startup_handshake`], but it records
+    /// every byte the backend sends after `AuthenticationOk` (its `ParameterStatus`
+    /// messages, `BackendKeyData`, and terminating `ReadyForQuery`) and returns
+    /// them. The caller stores this on the pooled connection so a later client that
+    /// warm-reuses the same physical backend can be given a faithful startup
+    /// sequence via [`Self::replay_startup_to_client`] without the backend being
+    /// re-initialized.
+    async fn perform_startup_handshake_capturing(
+        &mut self,
+        backend_stream: &mut (impl AsyncWriteExt + AsyncReadExt + Unpin),
+    ) -> Result<Vec<u8>> {
+        let connection_id = self.connection_id;
+        debug!(connection_id, "Starting handshake (capturing for warm reuse)");
+
+        let authenticator =
+            Authenticator::new(Arc::clone(&self.config), self.authenticator.clone());
+
+        let auth_result = authenticator
+            .authenticate(&mut self.client_stream, &self.startup_data)
+            .await
+            .context("Client authentication failed")?;
+        debug!(connection_id, username = %auth_result.username, "Client authenticated");
+
+        // Forward startup to backend.
+        backend_stream
+            .write_all(&auth_result.startup_bytes)
+            .await
+            .context("Failed to forward startup to backend")?;
+
+        // Handle backend authentication.
+        let backend_auth = crate::auth::BackendAuthenticator::new(
+            self.config.backend.user.clone(),
+            self.config.backend.password.clone(),
+        );
+        let remaining_data = backend_auth
+            .authenticate(backend_stream, &[])
+            .await
+            .context("Backend authentication failed")?;
+
+        // Forward AuthenticationOk to client.
+        let auth_ok = crate::protocol::build_auth_ok();
+        self.client_stream
+            .write_all(&auth_ok)
+            .await
+            .context("Failed to send AuthenticationOk to client")?;
+
+        // Forward the rest of the backend's startup stream to the client AND
+        // capture it verbatim, up to and including ReadyForQuery.
+        let mut captured: Vec<u8> = Vec::new();
+        let mut pending = remaining_data;
+        let mut backend_buffer = vec![0u8; 8192];
+        let extractor = MessageExtractor::new();
+
+        loop {
+            if !pending.is_empty() {
+                self.client_stream
+                    .write_all(&pending)
+                    .await
+                    .context("Failed to forward startup data to client")?;
+                captured.extend_from_slice(&pending);
+
+                if extractor.contains_ready_for_query(&pending) {
+                    debug!(connection_id, "Backend startup complete (ReadyForQuery received)");
+                    break;
+                }
+                pending.clear();
+            }
+
+            let n = backend_stream
+                .read(&mut backend_buffer)
+                .await
+                .context("Failed to read backend startup data")?;
+            if n == 0 {
+                anyhow::bail!("Backend closed connection during startup");
+            }
+            let data = &backend_buffer[..n];
+
+            self.client_stream
+                .write_all(data)
+                .await
+                .context("Failed to forward startup data to client")?;
+            captured.extend_from_slice(data);
+
+            if extractor.contains_ready_for_query(data) {
+                debug!(connection_id, "Backend startup complete (ReadyForQuery received)");
+                break;
+            }
+        }
+
+        debug!(
+            connection_id,
+            captured_bytes = captured.len(),
+            "Handshake complete; captured backend startup response for warm reuse"
+        );
+        Ok(captured)
+    }
+
+    /// Warm-reuse startup: serve a NEW client on a backend that has already
+    /// completed its one-time Postgres startup (WP-9 Task 8, P2 §5.3).
+    ///
+    /// The backend is already authenticated and (via recycle's `DISCARD ALL`)
+    /// reset clean, so it MUST NOT be re-initialized. We authenticate only the
+    /// client, send it `AuthenticationOk`, and replay the backend's original
+    /// captured startup response (`ParameterStatus*` + `BackendKeyData` +
+    /// `ReadyForQuery`). No bytes are sent to the backend, so its clean idle
+    /// state is preserved for the client's first real query.
+    async fn replay_startup_to_client(&mut self, captured: &[u8]) -> Result<()> {
+        let connection_id = self.connection_id;
+        debug!(connection_id, "Warm-reuse handshake: authenticating client, replaying startup");
+
+        let authenticator =
+            Authenticator::new(Arc::clone(&self.config), self.authenticator.clone());
+        let auth_result = authenticator
+            .authenticate(&mut self.client_stream, &self.startup_data)
+            .await
+            .context("Client authentication failed")?;
+        debug!(connection_id, username = %auth_result.username, "Client authenticated (warm reuse)");
+
+        let auth_ok = crate::protocol::build_auth_ok();
+        self.client_stream
+            .write_all(&auth_ok)
+            .await
+            .context("Failed to send AuthenticationOk to client")?;
+        self.client_stream
+            .write_all(captured)
+            .await
+            .context("Failed to replay captured startup response to client")?;
+        self.client_stream.flush().await.context("Failed to flush replayed startup response")?;
+
+        debug!(connection_id, "Warm-reuse handshake complete");
+        Ok(())
+    }
+
     /// Handle connection with a managed connection from PoolManager
     ///
     /// This method integrates with the PoolManager for proper connection lifecycle:
@@ -675,10 +812,37 @@ impl ConnectionHandler {
         let query_timeout_dur = Duration::from_secs(query_timeout_secs);
         let mut query_deadline: Option<tokio::time::Instant> = None;
 
-        // Perform authentication and startup handshake
-        self.perform_startup_handshake(managed_conn.stream_mut()?)
-            .await
-            .context("Startup handshake failed")?;
+        // Reuse-aware startup handshake (WP-9 Task 8, P2 §5.3).
+        //
+        // A Postgres backend performs its startup+authentication exactly once and
+        // then stays in the query loop for life; it cannot be re-initialized with
+        // a second StartupMessage. Because a client's graceful `Terminate` is now
+        // intercepted (below) so the backend survives for warm reuse, the backend
+        // we just acquired from the pool may ALREADY be initialized (a previous
+        // client did its startup handshake and recycle DISCARD-ALL-reset it clean).
+        //
+        // - Fresh backend (no captured startup response): run the full handshake
+        //   AND capture the backend's client-facing startup response, storing it
+        //   on the pooled connection for the next reuser.
+        // - Warm-reused backend (captured startup response present): authenticate
+        //   only the CLIENT and replay the captured startup response to it —
+        //   NEVER re-send a StartupMessage to the already-initialized backend
+        //   (doing so corrupts its protocol stream and closes the session).
+        match managed_conn.startup_response() {
+            Some(captured) => {
+                let captured = captured.to_vec();
+                self.replay_startup_to_client(&captured)
+                    .await
+                    .context("Client handshake on warm-reused backend failed")?;
+            }
+            None => {
+                let captured = self
+                    .perform_startup_handshake_capturing(managed_conn.stream_mut()?)
+                    .await
+                    .context("Startup handshake failed")?;
+                managed_conn.set_startup_response(captured);
+            }
+        }
 
         loop {
             // Copy the deadline for this iteration so the timeout branch owns it
@@ -695,6 +859,10 @@ impl ConnectionHandler {
                         Ok(n) => {
                             let data = &client_buffer[..n];
                             let mut should_forward = true;
+                            // WP-9 Task 8 (P2 §5.3): set when the client sends a graceful
+                            // Terminate ('X'). We intercept it (do NOT forward) so the backend
+                            // session survives and can be warm-reused by the pool.
+                            let mut client_terminated = false;
 
                             // Process ALL protocol messages in buffer
                             for msg in extractor.extract_messages(data) {
@@ -783,6 +951,29 @@ impl ConnectionHandler {
                                             _ => {}
                                         }
                                     }
+                                    // WP-9 Task 8 (P2 §5.3): the client is gracefully
+                                    // disconnecting. Forwarding its Terminate to the backend
+                                    // would kill the physical Postgres session, so the pool
+                                    // could never warm-reuse the backend across clients (every
+                                    // new client would pay full connect+auth — defeating the
+                                    // pool's documented purpose). Intercept it instead: stop
+                                    // forwarding this buffer, end this client's session, and let
+                                    // the final `pool_manager.release(managed_conn)` return the
+                                    // still-alive backend to deadpool. Its recycle hook then
+                                    // health-checks + `DISCARD ALL`-resets the backend before the
+                                    // next client, so reuse is both warm AND clean. This is the
+                                    // ONLY message we deliberately do not forward — a
+                                    // connection-lifecycle signal the pool owns, not a data-stream
+                                    // rewrite. (The owned/non-pooled path still forwards it 1:1.)
+                                    Message::Terminate => {
+                                        debug!(
+                                            connection_id = connection_id,
+                                            "Client sent Terminate; intercepting (not forwarding) so backend returns to pool for warm reuse"
+                                        );
+                                        should_forward = false;
+                                        client_terminated = true;
+                                        break;
+                                    }
                                     _ => {}
                                 }
                             }
@@ -790,6 +981,18 @@ impl ConnectionHandler {
                             // Forward to backend if not rejected
                             if should_forward {
                                 managed_conn.stream_mut()?.write_all(data).await.context("Failed to write to backend")?;
+                            }
+
+                            // Client gracefully terminated: end the session now. The backend
+                            // never received the Terminate, so it stays alive and is released
+                            // (exactly once) by the handler-exit `release(managed_conn)` below —
+                            // no double-release (we break the outer loop here, so a following
+                            // client EOF is never read), no half-read backend (a graceful client
+                            // is idle at ReadyForQuery, so nothing is in flight; if something
+                            // rare were, recycle's health_check would catch the desync and
+                            // discard the connection — i.e. worst case is today's behavior).
+                            if client_terminated {
+                                break;
                             }
 
                             // Arm the query deadline once a query is in flight.
