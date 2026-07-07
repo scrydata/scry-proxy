@@ -109,6 +109,11 @@ impl ProxyServer {
                 Arc::clone(&protocol),
                 protocol_config,
             ));
+            // The healthcheck probes the default backend; its verdict gates that
+            // backend's ("*") circuit breaker (P3 §4.2/§5.3). Breakers are
+            // registered during pool creation below, so the loop looks them up
+            // lazily each tick.
+            let hc_metrics = Arc::clone(&metrics);
 
             tokio::spawn(async move {
                 let mut interval =
@@ -119,6 +124,10 @@ impl ProxyServer {
 
                     match healthcheck.check().await {
                         Ok(is_healthy) => {
+                            // Gate the default backend's breaker on the probe.
+                            if let Some(cb) = hc_metrics.get_circuit_breaker("*") {
+                                cb.report_health(is_healthy);
+                            }
                             if is_healthy {
                                 tracing::debug!("Active healthcheck passed");
                             } else {
@@ -126,6 +135,11 @@ impl ProxyServer {
                             }
                         }
                         Err(e) => {
+                            // A probe that could not even connect is an unhealthy
+                            // signal — shed via the breaker.
+                            if let Some(cb) = hc_metrics.get_circuit_breaker("*") {
+                                cb.report_health(false);
+                            }
                             tracing::error!(error = %e, "Active healthcheck error");
                         }
                     }

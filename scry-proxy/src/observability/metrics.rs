@@ -77,6 +77,14 @@ impl ProxyMetrics {
         self.circuit_breakers.write().clear();
     }
 
+    /// Look up a registered per-backend circuit breaker by backend identity.
+    pub fn get_circuit_breaker(
+        &self,
+        backend: &str,
+    ) -> Option<Arc<crate::resilience::CircuitBreaker>> {
+        self.circuit_breakers.read().get(backend).cloned()
+    }
+
     /// Record a completed query with timeline breakdown
     ///
     /// This is the main entry point for query metrics. Called from ConnectionHandler

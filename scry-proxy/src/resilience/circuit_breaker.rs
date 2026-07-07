@@ -284,6 +284,26 @@ impl CircuitBreaker {
         CircuitState::from(state_val)
     }
 
+    /// Gate the breaker on an external active-healthcheck probe (P3 §4.2/§5.3).
+    ///
+    /// An unhealthy probe opens the breaker *proactively* — traffic is shed
+    /// before clients ever hit a failure. A healthy probe lets an already-open
+    /// breaker begin recovering (half-open) immediately, so a backend that comes
+    /// back is not held down for the full open timeout.
+    pub fn report_health(&self, healthy: bool) {
+        match (healthy, self.get_state()) {
+            (false, state) if state != CircuitState::Open => {
+                warn!("Active healthcheck reports backend unhealthy; opening circuit");
+                self.transition_to_open();
+            }
+            (true, CircuitState::Open) => {
+                // The probe reached the backend — allow a recovery attempt.
+                self.try_transition_to_half_open();
+            }
+            _ => {}
+        }
+    }
+
     // Private helper methods
 
     fn transition_to_open(&self) {
@@ -343,6 +363,34 @@ impl CircuitBreaker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_report_health_gates_the_breaker() {
+        let config = CircuitBreakerConfig {
+            enabled: true,
+            // High threshold so failure-driven logic doesn't interfere.
+            failure_threshold: 100,
+            success_threshold: 2,
+            window_secs: 30,
+            open_timeout_secs: 60,
+            use_health_monitor: false,
+        };
+        let cb = CircuitBreaker::new(config, None);
+        assert_eq!(cb.get_state(), CircuitState::Closed);
+
+        // A healthy probe on a closed breaker is a no-op.
+        cb.report_health(true);
+        assert_eq!(cb.get_state(), CircuitState::Closed);
+
+        // An unhealthy probe opens the breaker proactively and sheds traffic.
+        cb.report_health(false);
+        assert_eq!(cb.get_state(), CircuitState::Open);
+        assert!(cb.allow_request().is_err(), "open breaker must shed requests");
+
+        // A healthy probe on an open breaker starts recovery (half-open).
+        cb.report_health(true);
+        assert_eq!(cb.get_state(), CircuitState::HalfOpen);
+    }
 
     #[test]
     fn test_circuit_breaker_creation() {
