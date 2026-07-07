@@ -3,6 +3,18 @@ use bytes::{Buf, Bytes};
 use std::sync::Mutex;
 use tracing::{debug, trace, warn};
 
+/// Parsed fields from a Postgres ErrorResponse.
+#[derive(Debug, Default)]
+struct ErrorFields {
+    /// 'S' severity (e.g. "ERROR", "FATAL").
+    severity: Option<String>,
+    /// 'C' SQLSTATE code (e.g. "23505"). Safe to surface — carries no literals.
+    sqlstate: Option<String>,
+    /// 'M' human-readable message. May echo query literals; never surface on
+    /// the anonymized path.
+    message: Option<String>,
+}
+
 /// Extracts query information from Postgres wire protocol messages
 pub struct MessageExtractor {
     buffer: Mutex<Vec<u8>>,
@@ -85,6 +97,37 @@ impl MessageExtractor {
     ///
     /// Returns Some(error_message) if an ErrorResponse (E) message is found
     pub fn extract_error(&self, data: &[u8]) -> Option<String> {
+        let fields = Self::find_error_fields(data)?;
+        // Full form (used only on the non-anonymized path): severity + the
+        // human-readable message, which can echo query literals. Callers that
+        // anonymize must use `extract_error_scrubbed` instead.
+        match (fields.severity, fields.message) {
+            (Some(sev), Some(msg)) => Some(format!("{}: {}", sev, msg)),
+            (None, Some(msg)) => Some(msg),
+            (Some(sev), None) => Some(sev),
+            (None, None) => None,
+        }
+    }
+
+    /// Extract a *scrubbed* error suitable for anonymized events.
+    ///
+    /// Returns only the severity and SQLSTATE code (e.g. `"ERROR: 23505"`),
+    /// never the free-text 'M' message — which routinely echoes the offending
+    /// literal ("Key (email)=(bob@example.com) already exists") and would defeat
+    /// anonymization (P1 §4.4). Returns `None` only when neither severity nor
+    /// SQLSTATE is present.
+    pub fn extract_error_scrubbed(&self, data: &[u8]) -> Option<String> {
+        let fields = Self::find_error_fields(data)?;
+        match (fields.severity, fields.sqlstate) {
+            (Some(sev), Some(code)) => Some(format!("{}: {}", sev, code)),
+            (Some(sev), None) => Some(sev),
+            (None, Some(code)) => Some(code),
+            (None, None) => None,
+        }
+    }
+
+    /// Locate the first ErrorResponse in `data` and parse its fields.
+    fn find_error_fields(data: &[u8]) -> Option<ErrorFields> {
         if data.is_empty() {
             return None;
         }
@@ -101,7 +144,7 @@ impl MessageExtractor {
 
                 if bytes.remaining() >= length - 4 {
                     let error_data = &bytes[..length - 4];
-                    return Self::parse_error_fields(error_data);
+                    return Some(Self::parse_error_fields(error_data));
                 }
             } else if bytes.remaining() >= 5 {
                 // Try to skip this message
@@ -124,12 +167,11 @@ impl MessageExtractor {
         None
     }
 
-    /// Parse error fields from ErrorResponse message payload
-    ///
-    /// Extracts the 'M' (message) field as the primary error description
-    fn parse_error_fields(data: &[u8]) -> Option<String> {
-        let mut message = None;
-        let mut severity = None;
+    /// Parse the severity ('S'), SQLSTATE ('C') and message ('M') fields from an
+    /// ErrorResponse message payload. The free-text message is captured but must
+    /// only be surfaced on the non-anonymized path (see `extract_error_scrubbed`).
+    fn parse_error_fields(data: &[u8]) -> ErrorFields {
+        let mut fields = ErrorFields::default();
         let mut i = 0;
 
         while i < data.len() {
@@ -154,21 +196,17 @@ impl MessageExtractor {
             // Extract field value
             if let Ok(value) = std::str::from_utf8(&data[start..i]) {
                 match field_type {
-                    b'S' => severity = Some(value.to_string()),
-                    b'M' => message = Some(value.to_string()),
-                    _ => {} // Ignore other fields for now
+                    b'S' => fields.severity = Some(value.to_string()),
+                    b'C' => fields.sqlstate = Some(value.to_string()),
+                    b'M' => fields.message = Some(value.to_string()),
+                    _ => {} // Ignore other fields (detail/hint may echo literals)
                 }
             }
 
             i += 1; // Skip null terminator
         }
 
-        // Construct error message with severity if available
-        match (severity, message) {
-            (Some(sev), Some(msg)) => Some(format!("{}: {}", sev, msg)),
-            (None, Some(msg)) => Some(msg),
-            _ => None,
-        }
+        fields
     }
 
     fn parse_messages_from(buffer: &[u8]) -> Option<String> {
@@ -620,6 +658,58 @@ mod tests {
         let error = result.unwrap();
         assert!(error.contains("ERROR"));
         assert!(error.contains("syntax error"));
+    }
+
+    /// Build an ErrorResponse with severity, SQLSTATE, and a literal-echoing
+    /// message field.
+    fn build_error_response_with_sqlstate() -> Vec<u8> {
+        let mut msg = vec![MSG_ERROR_RESPONSE];
+        let mut fields = Vec::new();
+        fields.push(b'S');
+        fields.extend_from_slice(b"ERROR");
+        fields.push(0);
+        fields.push(b'C');
+        fields.extend_from_slice(b"23505"); // unique_violation
+        fields.push(0);
+        fields.push(b'M');
+        // A real Postgres message frequently echoes the offending literal:
+        fields.extend_from_slice(b"duplicate key value violates unique constraint; Key (email)=(bob@example.com) already exists.");
+        fields.push(0);
+        fields.push(0);
+        let length = (fields.len() + 4) as i32;
+        msg.extend_from_slice(&length.to_be_bytes());
+        msg.extend_from_slice(&fields);
+        msg
+    }
+
+    #[test]
+    fn test_extract_error_scrubbed_drops_freetext_message() {
+        let extractor = MessageExtractor::new();
+        let msg = build_error_response_with_sqlstate();
+
+        let scrubbed = extractor.extract_error_scrubbed(&msg).expect("scrubbed error");
+        // Must carry severity + SQLSTATE...
+        assert!(scrubbed.contains("ERROR"), "scrubbed error should keep severity: {scrubbed}");
+        assert!(scrubbed.contains("23505"), "scrubbed error should keep SQLSTATE: {scrubbed}");
+        // ...and must NOT leak the free-text message or any literal it echoed.
+        assert!(
+            !scrubbed.contains("bob@example.com"),
+            "scrubbed error must not leak the literal: {scrubbed}"
+        );
+        assert!(
+            !scrubbed.contains("duplicate key"),
+            "scrubbed error must not leak the free-text message: {scrubbed}"
+        );
+    }
+
+    #[test]
+    fn test_extract_error_still_captures_sqlstate() {
+        let extractor = MessageExtractor::new();
+        let msg = build_error_response_with_sqlstate();
+        // The full (non-scrubbed) accessor keeps the human-readable message for
+        // the non-anonymized path.
+        let full = extractor.extract_error(&msg).expect("full error");
+        assert!(full.contains("duplicate key"));
     }
 
     #[test]

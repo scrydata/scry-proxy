@@ -2,7 +2,7 @@ use blake3::Hasher;
 use sqlparser::ast::{Expr, Query, SetExpr, Statement, Value, Visit, Visitor};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// Result of anonymizing a query
 #[derive(Debug, Clone, PartialEq)]
@@ -43,7 +43,15 @@ impl QueryAnonymizer {
         let statements = match Parser::parse_sql(&dialect, query) {
             Ok(stmts) => stmts,
             Err(e) => {
-                warn!(error = %e, query = %query, "Failed to parse query for anonymization");
+                // Never log the raw query here: on parse failure the caller
+                // fails closed (redact/drop), and echoing the unparsed text
+                // would leak the very literals anonymization exists to protect
+                // (P1 §4.4). Log only the parser error and the query length.
+                debug!(
+                    error = %e,
+                    query_len = query.len(),
+                    "Failed to parse query for anonymization; failing closed"
+                );
                 return None;
             }
         };
