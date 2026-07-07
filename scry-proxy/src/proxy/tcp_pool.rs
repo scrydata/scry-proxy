@@ -501,6 +501,70 @@ mod tests {
         )));
     }
 
+    /// Fault injection: when the backend is down, the per-backend breaker opens
+    /// after the failure threshold and then *sheds* further requests fast with a
+    /// clean error instead of repeatedly attempting to connect (P3 §4.1/§5.1).
+    #[tokio::test]
+    async fn test_breaker_opens_and_sheds_when_backend_down() {
+        use crate::config::CircuitBreakerConfig;
+        use crate::resilience::CircuitBreaker;
+
+        // A free port with nothing listening → connection refused immediately.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let protocol = Arc::new(PostgresProtocol::new()) as Arc<dyn Protocol>;
+        let config = ProtocolConfig {
+            host: "127.0.0.1".to_string(),
+            port: dead_port,
+            database: Some("test".to_string()),
+            user: Some("postgres".to_string()),
+            password: Some("postgres".to_string()),
+        };
+        let tls_config = TlsConfig::default();
+        let breaker = Arc::new(CircuitBreaker::new(
+            CircuitBreakerConfig {
+                enabled: true,
+                failure_threshold: 2,
+                success_threshold: 2,
+                window_secs: 30,
+                open_timeout_secs: 60,
+                use_health_monitor: false,
+            },
+            None,
+        ));
+
+        let pool = TcpConnectionPool::new(
+            protocol,
+            config,
+            &tls_config,
+            4,
+            None,
+            Some(Arc::clone(&breaker)),
+            None, // retry disabled so each get() is one attempt
+            true,
+            500,
+        )
+        .expect("pool");
+
+        // The first `failure_threshold` acquisitions fail with real connection
+        // errors and trip the breaker.
+        for _ in 0..2 {
+            assert!(pool.get().await.is_err(), "connect to dead backend should fail");
+        }
+
+        // Now the breaker is open: further requests are shed fast with a clean
+        // circuit-breaker error, not another connect attempt.
+        match pool.get().await {
+            Ok(_) => panic!("breaker should shed the request"),
+            Err(e) => {
+                let msg = format!("{e:?}");
+                assert!(msg.contains("Circuit breaker"), "expected breaker shed, got: {msg}");
+            }
+        }
+    }
+
     /// Fault injection: a backend that black-holes the SYN must not hang the
     /// connect forever — the connect timeout must fire promptly (P3 §4.5).
     #[tokio::test]
