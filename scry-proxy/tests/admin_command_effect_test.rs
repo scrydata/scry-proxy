@@ -347,10 +347,25 @@ async fn shutdown_wait_blocks_until_drain_completes() {
     });
 
     // WAIT blocks until the drain signal fires, then returns CommandComplete.
+    // Record elapsed time around the call: this is the load-bearing part of
+    // the test. A stubbed/no-op WAIT that skips `.wait_for(...)` and returns
+    // immediately would still produce a `CommandComplete` here, so the tag
+    // check alone can't tell a real block from a stub. Requiring elapsed time
+    // to approach (but stay comfortably under) the background task's 150ms
+    // delay proves `execute` genuinely blocked on the completion signal rather
+    // than returning early.
+    let started = std::time::Instant::now();
     let resp = timeout(Duration::from_secs(3), admin.execute("SHUTDOWN WAIT"))
         .await
         .expect("SHUTDOWN WAIT must return once drain completes (bounded)")
         .unwrap();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(140),
+        "SHUTDOWN WAIT returned after {elapsed:?}, which is too fast to have actually blocked on \
+         the drain-completion signal (background signal fires at ~150ms) — WAIT appears to have \
+         degenerated into a no-op that returns immediately"
+    );
     assert!(
         matches!(resp, AdminResponse::CommandComplete { .. }),
         "SHUTDOWN WAIT should return CommandComplete after drain, got {resp:?}"

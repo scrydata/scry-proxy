@@ -1013,9 +1013,16 @@ impl AdminConsole {
     /// past the drain's own bound.
     ///
     /// Deadlock note: when WAIT is issued over a connection that is itself part
-    /// of the drained set (the normal case), that connection is force-aborted at
-    /// `shutdown_timeout_secs`, so WAIT behaves like plain SHUTDOWN there — its
-    /// distinct value is for out-of-band callers holding these handles directly.
+    /// of the drained set (the normal case), that connection's own task is one
+    /// of the `connection_tasks` `drain_connections` is waiting on — so the
+    /// completion signal can't fire until this very task finishes, but this
+    /// task is blocked awaiting that same signal. The only way out is the hard
+    /// `shutdown_timeout_secs` force-abort, which tears the connection down
+    /// abruptly (no `CommandComplete`, no response at all) — still bounded,
+    /// never an infinite hang, but distinctly worse than the honest timeout
+    /// error below (there the connection survives to receive it). WAIT's
+    /// distinct value over plain SHUTDOWN is for out-of-band callers holding
+    /// these handles directly, not for the connection being drained.
     async fn shutdown(&self, wait: bool) -> Result<AdminResponse> {
         // Subscribe to the completion signal BEFORE triggering, so a fast drain
         // can't flip-and-be-missed between trigger and await.
@@ -1035,13 +1042,31 @@ impl AdminConsole {
 
         // WAIT: block until the drain completes, bounded so we never hang past
         // the drain's own timeout (+ slack for the force-abort/flush tail).
-        // Both outcomes (Ok = drain completed / sender dropped as the process
-        // tore down; Err = outer bound elapsed while the time-bounded drain is
-        // still proceeding) resolve to the same honest completion — the `let`
-        // binding drops the borrow of `drain_rx` before the function returns.
+        // The trigger above has already fired regardless of what happens here —
+        // shutdown is proceeding in the background either way. Only a confirmed
+        // drain (Ok(Ok(_))) earns a `CommandComplete`; if the outer bound
+        // elapses first, or the watch sender is dropped without ever observing
+        // `true`, we must not claim completion we haven't confirmed — return a
+        // distinct honest `Error` instead (WP-10: no false success).
         let bound = Duration::from_secs(self.handles.config.proxy.shutdown_timeout_secs + 2);
-        let _drained = tokio::time::timeout(bound, drain_rx.wait_for(|done| *done)).await;
-        Ok(AdminResponse::CommandComplete { tag: "SHUTDOWN".to_string() })
+        let result = tokio::time::timeout(bound, drain_rx.wait_for(|done| *done)).await;
+        match result {
+            Ok(Ok(_)) => Ok(AdminResponse::CommandComplete { tag: "SHUTDOWN".to_string() }),
+            Ok(Err(_)) => Ok(AdminResponse::Error {
+                message: format!(
+                    "shutdown initiated but drain completion signal was lost before confirming \
+                     within {}s (drain proceeding in background)",
+                    bound.as_secs()
+                ),
+            }),
+            Err(_) => Ok(AdminResponse::Error {
+                message: format!(
+                    "shutdown initiated but drain did not complete within {}s (drain proceeding \
+                     in background)",
+                    bound.as_secs()
+                ),
+            }),
+        }
     }
 
     /// KILL [db] — forcibly disconnect all live client connections for a
