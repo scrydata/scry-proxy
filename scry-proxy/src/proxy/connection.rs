@@ -681,7 +681,10 @@ impl ConnectionHandler {
         backend_startup_bytes: &[u8],
         backend_stream: &mut (impl AsyncWriteExt + AsyncReadExt + Unpin),
     ) -> Result<Vec<u8>> {
-        debug!(connection_id, "Initializing backend startup (backend-only, capturing for warm reuse)");
+        debug!(
+            connection_id,
+            "Initializing backend startup (backend-only, capturing for warm reuse)"
+        );
 
         // Send the StartupMessage to the freshly-created backend.
         backend_stream
@@ -690,8 +693,7 @@ impl ConnectionHandler {
             .context("Failed to forward startup to backend")?;
 
         // Handle backend authentication.
-        let backend_auth =
-            crate::auth::BackendAuthenticator::new(backend_user, backend_password);
+        let backend_auth = crate::auth::BackendAuthenticator::new(backend_user, backend_password);
         let remaining_data = backend_auth
             .authenticate(backend_stream, &[])
             .await
@@ -789,10 +791,7 @@ impl ConnectionHandler {
             .write_all(&captured)
             .await
             .context("Failed to forward startup data to client")?;
-        self.client_stream
-            .flush()
-            .await
-            .context("Failed to flush startup response to client")?;
+        self.client_stream.flush().await.context("Failed to flush startup response to client")?;
 
         debug!(
             connection_id,
@@ -2422,7 +2421,10 @@ mod tests {
         // The captured startup response is the backend's client-facing sequence
         // AFTER AuthenticationOk (which backend auth consumes): it starts with the
         // first ParameterStatus 'S' and contains a terminating ReadyForQuery.
-        assert_eq!(captured[0], b'S', "capture must begin at ParameterStatus, not AuthenticationOk");
+        assert_eq!(
+            captured[0], b'S',
+            "capture must begin at ParameterStatus, not AuthenticationOk"
+        );
         let extractor = MessageExtractor::new();
         assert!(
             extractor.contains_ready_for_query(&captured),
