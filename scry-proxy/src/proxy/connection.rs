@@ -600,12 +600,11 @@ impl ConnectionHandler {
                 // test asserting on "Circuit breaker"), so a substring match on
                 // this already-slow error path is cheap and reliable without
                 // threading a typed error or `ProxyMetrics` through the pool.
-                let msg = e.to_string();
-                if msg.contains("Circuit breaker") {
-                    self.metrics.pool_metrics().record_request_shed();
-                } else if msg.contains("Timed out after") {
-                    self.metrics.pool_metrics().record_backend_connect_timeout();
-                }
+                // Extracted into `classify_pool_error_for_metrics` (below) so
+                // tests can drive a REAL `tcp_pool.rs` error message through
+                // this exact match — see that function's doc comment and the
+                // `classify_pool_error_for_metrics_*` tests.
+                classify_pool_error_for_metrics(&e.to_string(), &self.metrics);
 
                 return Err(e.context("Failed to acquire connection from pool"));
             }
@@ -1719,6 +1718,28 @@ impl ConnectionHandler {
     }
 }
 
+/// Classify a pool-acquire error message into the corresponding metric and
+/// record it — this is the substring match from `handle_acquire_error`'s
+/// `AcquireError::PoolError` arm (P3 §4.1/§4.5), extracted to a standalone,
+/// `ConnectionHandler`-free function.
+///
+/// `handle_acquire_error` requires a live `ClientTransport` (a real socket),
+/// which makes it impractical to drive end-to-end in a unit test. Extracting
+/// the classification itself lets tests feed it a REAL error message produced
+/// by `TcpConnectionPool::get`'s own fault-injection fixtures (breaker-open
+/// shed, unreachable-backend connect timeout — see `tcp_pool.rs`) instead of
+/// only asserting the `ProxyMetrics` counters directly, which is what left
+/// this match unguarded: a reword of either message in `tcp_pool.rs` (~:155
+/// `"Circuit breaker: {}"`, ~:344 `"Timed out after ..."`) must make one of
+/// the `classify_pool_error_for_metrics_*` tests below fail.
+fn classify_pool_error_for_metrics(msg: &str, metrics: &ProxyMetrics) {
+    if msg.contains("Circuit breaker") {
+        metrics.pool_metrics().record_request_shed();
+    } else if msg.contains("Timed out after") {
+        metrics.pool_metrics().record_backend_connect_timeout();
+    }
+}
+
 #[cfg(test)]
 mod anonymization_tests {
     use super::*;
@@ -2508,6 +2529,133 @@ mod tests {
         assert!(
             extractor.contains_ready_for_query(&captured),
             "captured startup response must include ReadyForQuery (backend is ready for a query)"
+        );
+    }
+
+    // --- classify_pool_error_for_metrics: real-event guarding tests (WP-10 Task 8 review fix) ---
+    //
+    // These drive an ACTUAL `AcquireError::PoolError` message produced by
+    // `TcpConnectionPool::get`'s own fault-injection fixtures (the same ones
+    // used by `tcp_pool.rs`'s `test_breaker_opens_and_sheds_when_backend_down`
+    // and `test_connect_timeout_fires_on_unreachable_backend`) through the
+    // real `classify_pool_error_for_metrics` substring match, instead of
+    // calling `ProxyMetrics::record_*` directly. A reword of either message
+    // in `tcp_pool.rs` (~:155 `"Circuit breaker: {}"`, ~:344 `"Timed out
+    // after ..."`) must make one of these fail — verified manually by
+    // temporarily rewording each message and confirming RED, then GREEN
+    // again on revert (see Task 8 fix report).
+
+    use crate::config::CircuitBreakerConfig;
+    use crate::observability::HealthConfig;
+    use crate::protocol::postgres::PostgresProtocol;
+    use crate::protocol::{Protocol, ProtocolConfig};
+    use crate::proxy::TcpConnectionPool;
+    use crate::resilience::CircuitBreaker;
+
+    #[tokio::test]
+    async fn classify_pool_error_for_metrics_records_backend_connect_timeout_on_real_message() {
+        // Same fixture as tcp_pool.rs's test_connect_timeout_fires_on_unreachable_backend:
+        // TEST-NET-3 (RFC 5737) is reserved/unroutable, so the SYN is
+        // dropped and the connect budget is guaranteed to expire.
+        let protocol = Arc::new(PostgresProtocol::new()) as Arc<dyn Protocol>;
+        let config = ProtocolConfig {
+            host: "203.0.113.1".to_string(),
+            port: 5432,
+            database: Some("test".to_string()),
+            user: Some("postgres".to_string()),
+            password: Some("postgres".to_string()),
+        };
+        let tls_config = crate::config::TlsConfig::default();
+        let pool =
+            TcpConnectionPool::new(protocol, config, &tls_config, 2, None, None, None, true, 800)
+                .expect("pool");
+
+        let err = match pool.get().await {
+            Ok(_) => panic!("connect to unreachable backend should fail"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+
+        let metrics = ProxyMetrics::new(100, HealthConfig::default());
+        classify_pool_error_for_metrics(&msg, &metrics);
+
+        assert_eq!(
+            metrics.pool_metrics().get_backend_connect_timeouts_total(),
+            1,
+            "real tcp_pool.rs connect-timeout message {msg:?} must classify as backend_connect_timeout"
+        );
+        assert_eq!(
+            metrics.pool_metrics().get_requests_shed_total(),
+            0,
+            "a connect timeout must not also count as a shed request"
+        );
+    }
+
+    #[tokio::test]
+    async fn classify_pool_error_for_metrics_records_request_shed_on_real_message() {
+        // Same fixture as tcp_pool.rs's test_breaker_opens_and_sheds_when_backend_down:
+        // a dead local port trips the breaker after `failure_threshold` real
+        // connection failures, then the next `get()` is shed by the breaker.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let protocol = Arc::new(PostgresProtocol::new()) as Arc<dyn Protocol>;
+        let config = ProtocolConfig {
+            host: "127.0.0.1".to_string(),
+            port: dead_port,
+            database: Some("test".to_string()),
+            user: Some("postgres".to_string()),
+            password: Some("postgres".to_string()),
+        };
+        let tls_config = crate::config::TlsConfig::default();
+        let breaker = Arc::new(CircuitBreaker::new(
+            CircuitBreakerConfig {
+                enabled: true,
+                failure_threshold: 2,
+                success_threshold: 2,
+                window_secs: 30,
+                open_timeout_secs: 60,
+                use_health_monitor: false,
+            },
+            None,
+        ));
+
+        let pool = TcpConnectionPool::new(
+            protocol,
+            config,
+            &tls_config,
+            4,
+            None,
+            Some(Arc::clone(&breaker)),
+            None,
+            true,
+            500,
+        )
+        .expect("pool");
+
+        for _ in 0..2 {
+            assert!(pool.get().await.is_err(), "connect to dead backend should fail");
+        }
+
+        let err = match pool.get().await {
+            Ok(_) => panic!("breaker should shed the request"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+
+        let metrics = ProxyMetrics::new(100, HealthConfig::default());
+        classify_pool_error_for_metrics(&msg, &metrics);
+
+        assert_eq!(
+            metrics.pool_metrics().get_requests_shed_total(),
+            1,
+            "real tcp_pool.rs breaker-shed message {msg:?} must classify as a shed request"
+        );
+        assert_eq!(
+            metrics.pool_metrics().get_backend_connect_timeouts_total(),
+            0,
+            "a breaker shed must not also count as a backend connect timeout"
         );
     }
 }
