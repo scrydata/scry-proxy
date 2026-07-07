@@ -847,8 +847,9 @@ impl Config {
 
 /// Collect every valid dotted config-key path from the default configuration
 /// (e.g. `"backend.password"`, `"resilience.circuit_breaker.enabled"`). Used to
-/// detect unknown `SCRY_*` environment variables at load time.
-fn valid_config_paths() -> std::collections::HashSet<String> {
+/// detect unknown `SCRY_*` environment variables at load time, and by the
+/// docs/code parity guardrail.
+pub fn valid_config_paths() -> std::collections::HashSet<String> {
     let mut paths = std::collections::HashSet::new();
     if let Ok(value) = serde_json::to_value(Config::default()) {
         collect_paths(&value, "", &mut paths);

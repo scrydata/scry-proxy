@@ -484,13 +484,8 @@ Health monitoring and anomaly detection.
 | `pool_saturation_threshold` | f64 | `0.95` | Pool utilization threshold (0.0-1.0) |
 | `ema_alpha` | f64 | `0.1` | EMA smoothing factor (0.0-1.0) |
 
-**Environment Variables**:
-```bash
-SCRY_HEALTH__ERROR_RATE_SPIKE_FACTOR=5.0
-SCRY_HEALTH__LATENCY_SPIKE_FACTOR=3.0
-SCRY_HEALTH__POOL_SATURATION_THRESHOLD=0.90
-SCRY_HEALTH__EMA_ALPHA=0.2
-```
+> **Note:** These passive health-monitor thresholds currently use built-in
+> defaults and are not yet environment-configurable.
 
 ## Common Scenarios
 

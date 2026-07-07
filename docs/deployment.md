@@ -117,7 +117,9 @@ services:
       SCRY_BACKEND__PORT: 5432
       SCRY_BACKEND__DATABASE: production_db
       SCRY_BACKEND__USER: scry_proxy
-      SCRY_BACKEND__PASSWORD_FILE: /run/secrets/db_password
+      # Provide the backend password value directly. (Loading secrets from a
+      # file path is planned but not yet implemented.)
+      SCRY_BACKEND__PASSWORD: "${DB_PASSWORD}"
       SCRY_BACKEND__POOL_SIZE: 50
 
       # Proxy settings
@@ -133,7 +135,9 @@ services:
       SCRY_PUBLISHER__ENABLED: "true"
       SCRY_PUBLISHER__PUBLISHER_TYPE: "http"
       SCRY_PUBLISHER__HTTP_ENDPOINT: "https://analytics.company.com/events"
-      SCRY_PUBLISHER__HTTP_API_KEY_FILE: /run/secrets/analytics_api_key
+      # Provide the API key value directly. (Loading secrets from a file path
+      # is planned but not yet implemented.)
+      SCRY_PUBLISHER__HTTP_API_KEY: "${ANALYTICS_API_KEY}"
       SCRY_PUBLISHER__ANONYMIZE: "true"
 
       # Metrics
