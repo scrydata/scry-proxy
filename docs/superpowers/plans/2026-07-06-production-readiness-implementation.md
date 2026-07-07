@@ -189,8 +189,8 @@ Implements P2 §4.1 (Phase-1-eligible), §5.4.
 - Test: `scry-proxy/tests/pooling_safety_test.rs`
 
 **Tasks:**
-- [ ] **Task 6.1 — Failing pooling-safety property test (P2 §5.4).** Assert: for any operation the detector does not positively classify as clean, the connection is **pinned** (kept with the client), not released.
-- [ ] **Task 6.2 — Implement fail-closed pinning.** Release only when positively known clean; any unrecognized command, parse/reassembly uncertainty, or unclassified extended-protocol message → pinned. Preserves the passthrough invariant. Run tests → pass. Commit.
+- [x] **Task 6.1 — Failing pooling-safety property test (P2 §5.4).** Assert: for any operation the detector does not positively classify as clean, the connection is **pinned** (kept with the client), not released.
+- [x] **Task 6.2 — Implement fail-closed pinning.** Release only when positively known clean; any unrecognized command, parse/reassembly uncertainty, or unclassified extended-protocol message → pinned. Preserves the passthrough invariant. Run tests → pass. Commit.
 
 **Guardrail:** pooling-safety property test.
 
