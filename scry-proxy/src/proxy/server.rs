@@ -940,6 +940,16 @@ impl ProxyServer {
                         );
                         (ClientTransport::Plain(stream), startup_data)
                     }
+                    Ok(SslStartupResult::Rejected) => {
+                        // TLS downgrade attempt under a require/verify-* sslmode.
+                        // handle_ssl_startup already sent the ErrorResponse and
+                        // closed the stream; refuse to serve the connection.
+                        warn!(
+                            connection_id = conn_id,
+                            "Rejected client connection: TLS required but client sent plaintext"
+                        );
+                        return;
+                    }
                     Err(e) => {
                         error!(connection_id = conn_id, error = %e, "SSL startup failed");
                         return;

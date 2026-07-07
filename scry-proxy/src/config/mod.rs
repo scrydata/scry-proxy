@@ -290,6 +290,18 @@ pub enum TlsSslMode {
     VerifyFull,
 }
 
+impl TlsSslMode {
+    /// Whether this mode requires the client connection to be encrypted.
+    ///
+    /// `require`/`verify-ca`/`verify-full` mandate TLS; a client that attempts
+    /// to bypass it (no SSLRequest) must be rejected, not silently served in
+    /// plaintext (P1 §4.2 downgrade protection). `disable`/`allow` do not
+    /// require encryption.
+    pub fn requires_encryption(&self) -> bool {
+        matches!(self, TlsSslMode::Require | TlsSslMode::VerifyCa | TlsSslMode::VerifyFull)
+    }
+}
+
 /// TLS configuration for client and server connections
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TlsConfig {

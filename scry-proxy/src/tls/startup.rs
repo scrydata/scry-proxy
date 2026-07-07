@@ -1,5 +1,5 @@
 use crate::config::TlsSslMode;
-use crate::protocol::read_startup_message;
+use crate::protocol::{build_error_response, read_startup_message};
 use rustls::ServerConfig;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
@@ -42,6 +42,11 @@ pub enum SslStartupResult {
     Declined(TcpStream, Vec<u8>),
     /// Client didn't request SSL (startup message buffered)
     NoSslRequest(TcpStream, Vec<u8>),
+    /// Client attempted to bypass a required TLS mode (sent a plaintext
+    /// StartupMessage under `require`/`verify-ca`/`verify-full`). A FATAL
+    /// ErrorResponse (SQLSTATE 28000) has already been written to the client;
+    /// the caller must close the connection without serving it (P1 §4.2).
+    Rejected,
 }
 
 /// Handle the PostgreSQL SSL startup handshake
@@ -74,6 +79,26 @@ pub async fn handle_ssl_startup(
 
     // Check if it's an SSL request
     if !is_ssl_request(&buf) {
+        // Downgrade protection (P1 §4.2): under a TLS-requiring sslmode a client
+        // must negotiate TLS via SSLRequest first. A client that jumps straight
+        // to a plaintext StartupMessage is refused with a Postgres ErrorResponse
+        // and closed, never served in plaintext.
+        if sslmode.requires_encryption() {
+            warn!(
+                ?sslmode,
+                "Client sent plaintext StartupMessage under a TLS-requiring sslmode; rejecting"
+            );
+            let err = build_error_response(
+                "FATAL",
+                "28000",
+                "SSL connection is required by this server",
+            );
+            // Best-effort: send the error and close. Any write error is moot —
+            // we are refusing the connection regardless.
+            let _ = stream.write_all(&err).await;
+            let _ = stream.shutdown().await;
+            return Ok(SslStartupResult::Rejected);
+        }
         debug!("Client sent StartupMessage without SSLRequest");
         return Ok(SslStartupResult::NoSslRequest(stream, buf));
     }
@@ -149,6 +174,79 @@ pub async fn handle_ssl_startup(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::StartupMessage;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+
+    #[test]
+    fn test_requires_encryption() {
+        assert!(!TlsSslMode::Disable.requires_encryption());
+        assert!(!TlsSslMode::Allow.requires_encryption());
+        assert!(TlsSslMode::Require.requires_encryption());
+        assert!(TlsSslMode::VerifyCa.requires_encryption());
+        assert!(TlsSslMode::VerifyFull.requires_encryption());
+    }
+
+    /// A client that sends a plaintext StartupMessage (no SSLRequest) under a
+    /// TLS-requiring sslmode must be rejected with a FATAL 28000 ErrorResponse
+    /// and closed — never served in plaintext (P1 §4.2 downgrade protection).
+    #[tokio::test]
+    async fn plaintext_startup_under_require_is_rejected() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Server side: no TLS config available, sslmode = require.
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_ssl_startup(stream, &TlsSslMode::Require, None).await
+        });
+
+        // Client side: skip SSLRequest, send a normal plaintext StartupMessage.
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let startup = StartupMessage::build("someuser", "somedb", &[]);
+        client.write_all(&startup).await.unwrap();
+
+        // The proxy must answer with a Postgres ErrorResponse ('E') carrying
+        // SQLSTATE 28000, then close the connection.
+        let mut resp = Vec::new();
+        client.read_to_end(&mut resp).await.unwrap();
+        assert!(!resp.is_empty(), "expected an ErrorResponse, got nothing (served plaintext?)");
+        assert_eq!(resp[0], b'E', "expected ErrorResponse tag 'E'");
+        assert!(
+            resp.windows(5).any(|w| w == b"28000"),
+            "ErrorResponse must carry SQLSTATE 28000, got: {:?}",
+            String::from_utf8_lossy(&resp)
+        );
+
+        let result = server.await.unwrap();
+        assert!(
+            matches!(result, Ok(SslStartupResult::Rejected)),
+            "handle_ssl_startup must return Rejected for a plaintext downgrade attempt"
+        );
+    }
+
+    /// Under a non-requiring sslmode (disable), a plaintext StartupMessage is
+    /// still accepted (NoSslRequest) — behavior must be unchanged.
+    #[tokio::test]
+    async fn plaintext_startup_under_disable_is_allowed() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_ssl_startup(stream, &TlsSslMode::Disable, None).await
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let startup = StartupMessage::build("someuser", "somedb", &[]);
+        client.write_all(&startup).await.unwrap();
+
+        let result = server.await.unwrap();
+        assert!(
+            matches!(result, Ok(SslStartupResult::NoSslRequest(_, _))),
+            "disable mode must retain plaintext behavior (NoSslRequest)"
+        );
+    }
 
     #[test]
     fn test_ssl_request_detection() {
