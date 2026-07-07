@@ -1166,8 +1166,9 @@ async fn handle_admin_connection(
     let mut auth_buf = vec![0u8; 4096];
     let auth_n = client.read(&mut auth_buf).await.context("Failed to read admin password")?;
     let provided = parse_password_message(&auth_buf[..auth_n]);
-    let authenticated =
-        provided.as_deref().is_some_and(|p| constant_time_eq(p.as_bytes(), expected_password.as_bytes()));
+    let authenticated = provided
+        .as_deref()
+        .is_some_and(|p| constant_time_eq(p.as_bytes(), expected_password.as_bytes()));
 
     if !authenticated {
         warn!("Admin console authentication failed");
@@ -1284,13 +1285,14 @@ mod tests {
 
         // If the server asked for a password ('R' auth request) and we have one
         // to send, send it and read the follow-up frame instead.
-        let response = if !first.is_empty() && first[0] == b'R' && password_to_send.is_some() {
-            client.write_all(&build_password_message(password_to_send.unwrap())).await.unwrap();
-            let mut second = vec![0u8; 1024];
-            let n2 = client.read(&mut second).await.unwrap_or(0);
-            second[..n2].to_vec()
-        } else {
-            first
+        let response = match password_to_send {
+            Some(pw) if !first.is_empty() && first[0] == b'R' => {
+                client.write_all(&build_password_message(pw)).await.unwrap();
+                let mut second = vec![0u8; 1024];
+                let n2 = client.read(&mut second).await.unwrap_or(0);
+                second[..n2].to_vec()
+            }
+            _ => first,
         };
 
         // Close the client so the server's post-auth command loop (which blocks

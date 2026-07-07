@@ -105,7 +105,11 @@ impl AnonymizationSettings {
             match self.anonymizer.anonymize(query) {
                 Some(anon) => {
                     // Never ship raw: the event query IS the normalized form.
-                    (anon.normalized_query.clone(), Some(anon.normalized_query), anon.value_fingerprints)
+                    (
+                        anon.normalized_query.clone(),
+                        Some(anon.normalized_query),
+                        anon.value_fingerprints,
+                    )
                 }
                 None => match self.parse_failure {
                     // Fail closed: a query we cannot parse is never shipped raw.
@@ -158,9 +162,7 @@ fn redact_param(p: &ParamValue) -> ParamValue {
         ParamValue::Time(_) => ParamValue::Time(0),
         ParamValue::Timestamp(_) => ParamValue::Timestamp(0),
         ParamValue::TimestampTz(_) => ParamValue::TimestampTz(0),
-        ParamValue::Interval { .. } => {
-            ParamValue::Interval { months: 0, days: 0, microseconds: 0 }
-        }
+        ParamValue::Interval { .. } => ParamValue::Interval { months: 0, days: 0, microseconds: 0 },
         ParamValue::Uuid(_) => ParamValue::Uuid([0u8; 16]),
         ParamValue::Json(_) => ParamValue::Json(String::new()),
         ParamValue::Array { elements, dimensions } => ParamValue::Array {
@@ -635,7 +637,7 @@ impl ConnectionHandler {
                                     Message::Parse { ref name, ref query, ref param_oids } => {
                                         // Validate command against pooling mode
                                         if let Err(err_msg) = mode_enforcer.validate(query, txn_tracker.is_in_transaction()) {
-                                            warn!(query = %crate::observability::loggable(&query), error = %err_msg, "Command rejected by pooling mode");
+                                            warn!(query = %crate::observability::loggable(query), error = %err_msg, "Command rejected by pooling mode");
                                             let error_response = ModeEnforcer::build_error_response(&err_msg);
                                             self.client_stream.write_all(&error_response).await.context("Failed to send error to client")?;
                                             // Send ReadyForQuery to complete the error cycle
@@ -645,7 +647,7 @@ impl ConnectionHandler {
                                             break;
                                         }
 
-                                        debug!(name = %name, query = %crate::observability::loggable(&query), "Cached prepared statement");
+                                        debug!(name = %name, query = %crate::observability::loggable(query), "Cached prepared statement");
                                         stmt_cache.insert_statement(name.clone(), PreparedStatement {
                                             query: query.clone(),
                                             param_oids: param_oids.clone(),
@@ -691,7 +693,7 @@ impl ConnectionHandler {
                                     Message::Query { ref query } => {
                                         // Validate command against pooling mode
                                         if let Err(err_msg) = mode_enforcer.validate(query, txn_tracker.is_in_transaction()) {
-                                            warn!(query = %crate::observability::loggable(&query), error = %err_msg, "Command rejected by pooling mode");
+                                            warn!(query = %crate::observability::loggable(query), error = %err_msg, "Command rejected by pooling mode");
                                             let error_response = ModeEnforcer::build_error_response(&err_msg);
                                             self.client_stream.write_all(&error_response).await.context("Failed to send error to client")?;
                                             let ready_for_query = Self::build_ready_for_query(txn_tracker.state());
@@ -700,7 +702,7 @@ impl ConnectionHandler {
                                             break;
                                         }
 
-                                        debug!(query = %crate::observability::loggable(&query), "Simple query");
+                                        debug!(query = %crate::observability::loggable(query), "Simple query");
                                         stmt_cache.set_pending(String::new(), PendingExecution {
                                             query: query.clone(),
                                             params: vec![],
@@ -1158,7 +1160,8 @@ impl ConnectionHandler {
                                     "Query failed"
                                 );
 
-                                let error_field = anon_settings.error_field(&extractor, data, error_msg);
+                                let error_field =
+                                    anon_settings.error_field(&extractor, data, error_msg);
                                 if let Some((event, fingerprints)) = anon_settings.build_event(
                                     &pending.query,
                                     pending.params,
@@ -1272,7 +1275,11 @@ mod anonymization_tests {
         assert!(!event.query.contains("bob@example.com"), "query leaked literal: {}", event.query);
         assert!(!event.query.contains("42 "), "query leaked literal: {}", event.query);
         assert_eq!(event.query, event.normalized_query.clone().unwrap());
-        assert!(event.query.contains('?'), "normalized query should use placeholders: {}", event.query);
+        assert!(
+            event.query.contains('?'),
+            "normalized query should use placeholders: {}",
+            event.query
+        );
         // Two literals → two fingerprints.
         assert_eq!(fingerprints.len(), 2);
     }
@@ -1305,8 +1312,16 @@ mod anonymization_tests {
     fn parse_failure_drop_drops_event() {
         let settings = enabled_settings(ParseFailureMode::Drop);
         let raw = "CREATE ROLE admin PASSWORD 'super-secret-pw' GIBBERISH";
-        let result =
-            settings.build_event(raw, vec![], false, Duration::from_millis(1), false, None, "c1", "db");
+        let result = settings.build_event(
+            raw,
+            vec![],
+            false,
+            Duration::from_millis(1),
+            false,
+            None,
+            "c1",
+            "db",
+        );
         assert!(result.is_none(), "drop mode must drop the event entirely");
     }
 
@@ -1387,14 +1402,22 @@ mod anonymization_fuzz {
         }
     }
 
-    fn build(settings: &AnonymizationSettings, query: &str, params: Vec<ParamValue>) -> Option<QueryEvent> {
+    fn build(
+        settings: &AnonymizationSettings,
+        query: &str,
+        params: Vec<ParamValue>,
+    ) -> Option<QueryEvent> {
         settings
             .build_event(query, params, false, Duration::from_millis(1), true, None, "conn", "db")
             .map(|(event, _fps)| event)
     }
 
     /// Serialized event JSON — the exact bytes that would be published.
-    fn event_json(settings: &AnonymizationSettings, query: &str, params: Vec<ParamValue>) -> Option<String> {
+    fn event_json(
+        settings: &AnonymizationSettings,
+        query: &str,
+        params: Vec<ParamValue>,
+    ) -> Option<String> {
         build(settings, query, params).map(|e| serde_json::to_string(&e).expect("serialize event"))
     }
 
@@ -1447,8 +1470,14 @@ mod anonymization_fuzz {
         let corpus: &[(&str, &[&str])] = &[
             ("CREATE ROLE deploy PASSWORD 'super-secret-pw'", &["super-secret-pw"]),
             ("SELECT * FROM patients WHERE ssn = '123-45-6789'", &["123-45-6789"]),
-            ("INSERT INTO t (a, b) VALUES ('alice@example.com', 'hunter2')", &["alice@example.com", "hunter2"]),
-            ("UPDATE users SET pw = 'secretA' WHERE email = 'secretB@x.io'", &["secretA", "secretB@x.io"]),
+            (
+                "INSERT INTO t (a, b) VALUES ('alice@example.com', 'hunter2')",
+                &["alice@example.com", "hunter2"],
+            ),
+            (
+                "UPDATE users SET pw = 'secretA' WHERE email = 'secretB@x.io'",
+                &["secretA", "secretB@x.io"],
+            ),
             ("$$ totally @@ unparseable ## vendor 'embedded-secret' syntax", &["embedded-secret"]),
         ];
 

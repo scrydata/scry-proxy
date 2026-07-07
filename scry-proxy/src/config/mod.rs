@@ -307,7 +307,7 @@ impl Default for AuthConfig {
 /// Disabled by default; enabling it exposes SHOW/PAUSE/RESUME/RELOAD style
 /// commands, so it must be explicitly turned on and (when enabled) should be
 /// paired with a userlist or inline credential.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct AdminConfig {
     /// Enable the admin console (disabled by default).
     #[serde(default)]
@@ -328,12 +328,6 @@ impl std::fmt::Debug for AdminConfig {
             .field("admin_users", &self.admin_users)
             .field("admin_password", &redacted_opt(&self.admin_password))
             .finish()
-    }
-}
-
-impl Default for AdminConfig {
-    fn default() -> Self {
-        Self { enabled: false, admin_users: None, admin_password: None }
     }
 }
 
@@ -730,7 +724,9 @@ impl Config {
 
         // 6. Anonymization requires a salt; otherwise "anonymized" output can be
         // trivially reversed/correlated.
-        if self.publisher.enabled && self.publisher.anonymize && self.publisher.anonymize_salt.is_none()
+        if self.publisher.enabled
+            && self.publisher.anonymize
+            && self.publisher.anonymize_salt.is_none()
         {
             anyhow::bail!(
                 "publisher.anonymize = true requires publisher.anonymize_salt to be set."
@@ -989,7 +985,10 @@ mod secure_defaults_snapshot {
             format!("auth.allow_trust = {}", c.auth.allow_trust),
             format!("auth.auth_type = {:?}", c.auth.auth_type),
             format!("backend.password_is_empty = {}", c.backend.password.is_empty()),
-            format!("observability.unsafe_debug_logging = {}", c.observability.unsafe_debug_logging),
+            format!(
+                "observability.unsafe_debug_logging = {}",
+                c.observability.unsafe_debug_logging
+            ),
             format!("publisher.allow_insecure = {}", c.publisher.allow_insecure),
             format!("publisher.anonymize = {}", c.publisher.anonymize),
             format!("publisher.parse_failure_mode = {:?}", c.publisher.parse_failure_mode),
@@ -1079,10 +1078,7 @@ mod fail_closed_tests {
     fn test_validate_rejects_scram_sha256_auth() {
         let mut config = fully_valid_config();
         config.auth.auth_type = AuthType::ScramSha256;
-        assert!(
-            config.validate().is_err(),
-            "SCRAM-SHA-256 auth must be rejected (unsupported)"
-        );
+        assert!(config.validate().is_err(), "SCRAM-SHA-256 auth must be rejected (unsupported)");
     }
 
     // Case 2: Cert auth requires a verifying client TLS mode.

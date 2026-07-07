@@ -63,6 +63,15 @@ jobs:
       - name: Run tests
         run: cargo test --workspace
 
+      # Crown-jewel privacy guardrail (P1 §5.3): run the anonymization fuzzer
+      # with an elevated case count so it exercises far more adversarial inputs
+      # than the default per-run budget. Asserts no event or log line leaks an
+      # input literal/parameter value when anonymization is enabled.
+      - name: Anonymization fuzzer (elevated cases)
+        run: cargo test -p scry --lib anonymization_fuzz
+        env:
+          PROPTEST_CASES: "4096"
+
   audit:
     name: audit
     runs-on: ubuntu-latest

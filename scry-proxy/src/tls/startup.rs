@@ -88,11 +88,8 @@ pub async fn handle_ssl_startup(
                 ?sslmode,
                 "Client sent plaintext StartupMessage under a TLS-requiring sslmode; rejecting"
             );
-            let err = build_error_response(
-                "FATAL",
-                "28000",
-                "SSL connection is required by this server",
-            );
+            let err =
+                build_error_response("FATAL", "28000", "SSL connection is required by this server");
             // Best-effort: send the error and close. Any write error is moot —
             // we are refusing the connection regardless.
             let _ = stream.write_all(&err).await;
