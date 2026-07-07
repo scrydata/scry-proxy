@@ -655,6 +655,26 @@ impl Config {
                 .try_parsing(true),
         );
 
+        // Reject unknown SCRY_* variables by default (P4 §4.4, §9.3): a typo'd
+        // or unimplemented key (e.g. SCRY_BACKEND__PASSWORD_FILE) must fail loudly
+        // instead of silently no-opping. Operators can opt out with
+        // SCRY_ALLOW_UNKNOWN_KEYS=true.
+        let allow_unknown = env::var("SCRY_ALLOW_UNKNOWN_KEYS")
+            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+            .unwrap_or(false);
+        if !allow_unknown {
+            let valid = valid_config_paths();
+            let unknown = unknown_scry_env_keys(env::vars().map(|(k, _)| k), &valid);
+            if !unknown.is_empty() {
+                anyhow::bail!(
+                    "unknown SCRY_* configuration variable(s): {}. Check for typos, or set \
+                     SCRY_ALLOW_UNKNOWN_KEYS=true to ignore. (This catches keys like \
+                     SCRY_BACKEND__PASSWORD_FILE that would otherwise silently no-op.)",
+                    unknown.join(", ")
+                );
+            }
+        }
+
         let config = builder.build()?;
         let loaded: Config = config.try_deserialize()?;
 
@@ -756,6 +776,30 @@ impl Config {
             }
         }
 
+        // --- Fail-closed capacity checks (P4 §4.4) ---
+        // Genuinely-unsafe pool/connection settings are refused, not merely
+        // warned about: they guarantee the proxy cannot serve traffic.
+
+        // 8. Zero max_connections means no client can ever connect.
+        if self.proxy.max_connections == 0 {
+            anyhow::bail!(
+                "proxy.max_connections is 0; the proxy would accept no client connections."
+            );
+        }
+
+        // 9. A zero-size pool while pooling is enabled can never hand out a
+        // backend connection — every query would block forever.
+        if self.performance.connection_pooling != PoolingStrategy::Disabled
+            && self.performance.pool_size == 0
+        {
+            anyhow::bail!(
+                "performance.pool_size is 0 while connection pooling is enabled \
+                 ({:?}); no backend connection could ever be acquired. Set a non-zero \
+                 pool_size or performance.connection_pooling = disabled.",
+                self.performance.connection_pooling
+            );
+        }
+
         // --- Non-fatal warnings ---
 
         // Check pool ratio (only if threshold is non-zero)
@@ -799,6 +843,57 @@ impl Config {
 
         Ok(warnings)
     }
+}
+
+/// Collect every valid dotted config-key path from the default configuration
+/// (e.g. `"backend.password"`, `"resilience.circuit_breaker.enabled"`). Used to
+/// detect unknown `SCRY_*` environment variables at load time.
+fn valid_config_paths() -> std::collections::HashSet<String> {
+    let mut paths = std::collections::HashSet::new();
+    if let Ok(value) = serde_json::to_value(Config::default()) {
+        collect_paths(&value, "", &mut paths);
+    }
+    paths
+}
+
+fn collect_paths(
+    value: &serde_json::Value,
+    prefix: &str,
+    out: &mut std::collections::HashSet<String>,
+) {
+    if let serde_json::Value::Object(map) = value {
+        for (k, v) in map {
+            let path = if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
+            out.insert(path.clone());
+            collect_paths(v, &path, out);
+        }
+    }
+}
+
+/// Return any `SCRY_*` environment variable name that does not map to a known
+/// config field. Meta variables (`SCRY_CONFIG_FILE`, `SCRY_ALLOW_UNKNOWN_KEYS`)
+/// and the dynamically-sized `databases` section are ignored.
+fn unknown_scry_env_keys<I>(env_keys: I, valid: &std::collections::HashSet<String>) -> Vec<String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut unknown = Vec::new();
+    for key in env_keys {
+        let Some(rest) = key.strip_prefix("SCRY_") else { continue };
+        if rest == "CONFIG_FILE" || rest == "ALLOW_UNKNOWN_KEYS" {
+            continue;
+        }
+        let path = rest.to_lowercase().replace("__", ".");
+        // `databases` is a Vec<DatabaseConfig>; its element paths aren't in the
+        // default schema, so don't strict-check that subtree.
+        if path == "databases" || path.starts_with("databases.") {
+            continue;
+        }
+        if !valid.contains(&path) {
+            unknown.push(key);
+        }
+    }
+    unknown
 }
 
 #[cfg(test)]
@@ -1044,6 +1139,77 @@ mod redacting_debug_tests {
         let dbg = format!("{config:?}");
         // Unset optional secrets render as None, not a redaction placeholder.
         assert!(dbg.contains("http_api_key: None"));
+    }
+}
+
+#[cfg(test)]
+mod capacity_and_unknown_key_tests {
+    use super::*;
+
+    fn base() -> Config {
+        let mut c = Config::default();
+        c.auth.allow_trust = true;
+        c.backend.password = "pw".to_string();
+        c.publisher.anonymize_salt = Some("salt".to_string());
+        c
+    }
+
+    #[test]
+    fn rejects_zero_max_connections() {
+        let mut c = base();
+        c.proxy.max_connections = 0;
+        assert!(c.validate().is_err(), "zero max_connections must be rejected");
+    }
+
+    #[test]
+    fn rejects_zero_pool_size_when_pooling_enabled() {
+        let mut c = base();
+        c.performance.connection_pooling = PoolingStrategy::Transaction;
+        c.performance.pool_size = 0;
+        assert!(c.validate().is_err(), "zero pool_size with pooling on must be rejected");
+    }
+
+    #[test]
+    fn allows_zero_pool_size_when_pooling_disabled() {
+        let mut c = base();
+        c.performance.connection_pooling = PoolingStrategy::Disabled;
+        c.performance.pool_size = 0;
+        // Pool ratio warning is skipped when pool_size == 0; this must not error.
+        assert!(c.validate().is_ok(), "zero pool_size is fine when pooling is disabled");
+    }
+
+    #[test]
+    fn valid_config_paths_include_known_leaves() {
+        let paths = valid_config_paths();
+        assert!(paths.contains("backend.password"), "missing backend.password");
+        assert!(paths.contains("proxy.listen_address"), "missing proxy.listen_address");
+        assert!(paths.contains("publisher.anonymize_salt"), "missing publisher.anonymize_salt");
+        assert!(
+            paths.contains("resilience.circuit_breaker.enabled"),
+            "missing nested resilience.circuit_breaker.enabled"
+        );
+        // The typo'd key this pillar exists to catch is NOT a valid path.
+        assert!(!paths.contains("backend.password_file"));
+    }
+
+    #[test]
+    fn unknown_env_keys_are_detected() {
+        let valid = valid_config_paths();
+        let env = vec![
+            "SCRY_BACKEND__PASSWORD".to_string(),                    // known
+            "SCRY_PROXY__LISTEN_ADDRESS".to_string(),                // known
+            "SCRY_RESILIENCE__CIRCUIT_BREAKER__ENABLED".to_string(), // known nested
+            "SCRY_BACKEND__PASSWORD_FILE".to_string(),               // UNKNOWN (the target bug)
+            "SCRY_TOTALLY__BOGUS".to_string(),                       // UNKNOWN
+            "SCRY_CONFIG_FILE".to_string(),                          // meta, ignored
+            "SCRY_ALLOW_UNKNOWN_KEYS".to_string(),                   // meta, ignored
+            "SCRY_DATABASES__0__HOST".to_string(),                   // dynamic Vec section, ignored
+            "PATH".to_string(),                                      // non-SCRY, ignored
+        ];
+        let unknown = unknown_scry_env_keys(env, &valid);
+        assert!(unknown.contains(&"SCRY_BACKEND__PASSWORD_FILE".to_string()));
+        assert!(unknown.contains(&"SCRY_TOTALLY__BOGUS".to_string()));
+        assert_eq!(unknown.len(), 2, "unexpected unknowns: {unknown:?}");
     }
 }
 
