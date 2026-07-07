@@ -18,7 +18,7 @@ use crate::proxy::wait_queue::{QueueFullError, WaitQueue};
 use crate::tls::BackendTransport;
 use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -35,6 +35,12 @@ pub enum AcquireError {
 
     #[error("wait timeout")]
     WaitTimeout,
+
+    /// The pool has been administratively paused (admin `PAUSE`, WP-10 Task 4).
+    /// Only NEW acquisition is gated; connections already checked out continue
+    /// until released. Surfaced to the client as a clean `ErrorResponse`.
+    #[error("pool is paused")]
+    Paused,
 }
 
 /// Returned by [`ManagedConnection::stream`]/[`ManagedConnection::stream_mut`]
@@ -172,6 +178,13 @@ pub struct PoolManager {
     config: PoolManagerConfig,
     /// Counter for generating unique binding IDs
     next_binding_id: AtomicU64,
+    /// Whether this pool accepts NEW backend acquisitions. `true` by default;
+    /// admin `PAUSE` flips it to `false` and `RESUME` back to `true` (WP-10
+    /// Task 4). Checked with a single relaxed atomic load at the top of
+    /// [`acquire`](Self::acquire) — no per-query locking, so the hot path is
+    /// unaffected. Gating only blocks new acquisition; already-checked-out
+    /// `ManagedConnection`s keep working via `release`/`pin`.
+    accepting: AtomicBool,
 }
 
 impl PoolManager {
@@ -187,7 +200,32 @@ impl PoolManager {
             wait_queue,
             config,
             next_binding_id: AtomicU64::new(1),
+            accepting: AtomicBool::new(true),
         })
+    }
+
+    /// Administratively pause NEW backend acquisition (admin `PAUSE`).
+    ///
+    /// In-flight callers holding a `ManagedConnection` are unaffected — only
+    /// subsequent [`acquire`](Self::acquire) calls are gated.
+    pub fn pause(&self) {
+        self.accepting.store(false, Ordering::Release);
+        debug!("Pool manager paused: new acquisition gated");
+    }
+
+    /// Resume NEW backend acquisition after a [`pause`](Self::pause) (admin
+    /// `RESUME`). Idempotent.
+    pub fn resume(&self) {
+        self.accepting.store(true, Ordering::Release);
+        // Wake anyone parked in the wait queue so a resumed pool doesn't leave
+        // a waiter stuck until the next natural notify.
+        self.wait_queue.notify_one();
+        debug!("Pool manager resumed: accepting new acquisition");
+    }
+
+    /// Whether this pool is currently accepting new acquisitions.
+    pub fn is_accepting(&self) -> bool {
+        self.accepting.load(Ordering::Acquire)
     }
 
     /// Acquire a connection for a client
@@ -200,6 +238,14 @@ impl PoolManager {
         client_id: u64,
         needs_sticky: bool,
     ) -> Result<ManagedConnection, AcquireError> {
+        // 0. Reject NEW acquisition if administratively paused (WP-10 Task 4).
+        // Single relaxed-ordering atomic load: no lock, off the per-query hot
+        // path's critical sections. In-flight connections are unaffected.
+        if !self.accepting.load(Ordering::Acquire) {
+            debug!(client_id, "Acquire rejected: pool is paused");
+            return Err(AcquireError::Paused);
+        }
+
         // 1. Check sticky mapping first if needed
         if needs_sticky {
             if let Some(conn) = self.get_sticky_connection(client_id) {
@@ -611,6 +657,59 @@ mod tests {
 
         let err = AcquireError::QueueFull(QueueFullError);
         assert!(format!("{}", err).contains("queue full"));
+
+        let err = AcquireError::Paused;
+        assert_eq!(format!("{}", err), "pool is paused");
+    }
+
+    #[test]
+    fn test_pause_resume_toggles_accepting() {
+        let pool = create_test_pool();
+        let wait_queue = WaitQueue::new(100);
+        let manager = PoolManager::new(pool, wait_queue, PoolManagerConfig::default());
+
+        // Default: accepting.
+        assert!(manager.is_accepting());
+
+        manager.pause();
+        assert!(!manager.is_accepting());
+
+        // Idempotent pause.
+        manager.pause();
+        assert!(!manager.is_accepting());
+
+        manager.resume();
+        assert!(manager.is_accepting());
+    }
+
+    #[tokio::test]
+    async fn test_acquire_returns_paused_when_paused() {
+        // The `accepting` gate is checked at the very top of `acquire`, before
+        // any pool/backend interaction, so this needs no live backend: a paused
+        // manager must reject immediately with `AcquireError::Paused`.
+        let pool = create_test_pool();
+        let wait_queue = WaitQueue::new(100);
+        // Short wait timeout so the post-resume acquire (which reaches an
+        // unreachable test backend and falls through to the wait queue) fails
+        // fast instead of parking for the 30s default.
+        let config = PoolManagerConfig { wait_timeout_ms: 200, ..Default::default() };
+        let manager = PoolManager::new(pool, wait_queue, config);
+
+        manager.pause();
+        let result = manager.acquire(1, false).await;
+        assert!(
+            matches!(result, Err(AcquireError::Paused)),
+            "paused pool must reject new acquisition with Paused"
+        );
+
+        // After resume the gate is open again (the acquire itself may still fail
+        // to reach the unreachable test backend, but it must NOT be `Paused`).
+        manager.resume();
+        let result = manager.acquire(1, false).await;
+        assert!(
+            !matches!(result, Err(AcquireError::Paused)),
+            "resumed pool must not return Paused"
+        );
     }
 
     #[test]

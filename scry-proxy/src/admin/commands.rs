@@ -5,7 +5,7 @@
 use super::response::AdminResponse;
 use crate::config::{redacted_opt, AuthType, Config, PoolingStrategy, RedactedSecret, TlsSslMode};
 use crate::observability::ProxyMetrics;
-use crate::proxy::{AdminHandles, ClientState};
+use crate::proxy::{AdminHandles, ClientState, PoolManager};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -917,19 +917,81 @@ impl AdminConsole {
         })
     }
 
-    async fn pause(&self, _database: Option<String>) -> Result<AdminResponse> {
-        // TODO: Implement pause functionality
-        Ok(AdminResponse::CommandComplete { tag: "PAUSE".to_string() })
+    /// Resolve a client-supplied database name to its live [`PoolManager`],
+    /// the same way the proxy resolves a startup database to a pool. A name is
+    /// accepted if it is a direct pool key (a `config.databases` entry, or the
+    /// literal `"*"`) OR the client-facing name of a configured database (e.g.
+    /// the default backend's own database name, whose pool key is `"*"`).
+    /// Returns `None` for a genuinely unknown database — the caller turns that
+    /// into an honest `ErrorResponse` rather than silently falling back to the
+    /// default pool (which would pause something the operator didn't name).
+    fn resolve_pool_manager(&self, db: &str) -> Option<Arc<PoolManager>> {
+        if let Some(pm) = self.handles.pool_managers.get(db) {
+            return Some(Arc::clone(pm));
+        }
+        let pool_key = self
+            .database_entries()
+            .into_iter()
+            .find(|e| e.name.eq_ignore_ascii_case(db))
+            .map(|e| e.pool_key)?;
+        self.handles.pool_managers.get(&pool_key).map(Arc::clone)
     }
 
-    async fn resume(&self, _database: Option<String>) -> Result<AdminResponse> {
-        // TODO: Implement resume functionality
-        Ok(AdminResponse::CommandComplete { tag: "RESUME".to_string() })
+    /// PAUSE [db] — gate NEW backend acquisition (WP-10 Task 4, P4 §4.2).
+    ///
+    /// `PAUSE db` pauses the one named pool (honest error if the database is
+    /// unknown); bare `PAUSE` pauses every configured pool. In-flight
+    /// connections are unaffected — only new acquisition is blocked, surfaced
+    /// to new clients as a clean `ErrorResponse` from the connection handler.
+    async fn pause(&self, database: Option<String>) -> Result<AdminResponse> {
+        match database {
+            Some(db) => match self.resolve_pool_manager(&db) {
+                Some(pm) => {
+                    pm.pause();
+                    Ok(AdminResponse::CommandComplete { tag: "PAUSE".to_string() })
+                }
+                None => Ok(AdminResponse::Error { message: format!("no such database: {db}") }),
+            },
+            None => {
+                for pm in self.handles.pool_managers.values() {
+                    pm.pause();
+                }
+                Ok(AdminResponse::CommandComplete { tag: "PAUSE".to_string() })
+            }
+        }
     }
 
+    /// RESUME [db] — the inverse of [`pause`](Self::pause): re-enable new
+    /// backend acquisition on the named pool, or on every pool for bare
+    /// `RESUME`. Honest error for an unknown named database.
+    async fn resume(&self, database: Option<String>) -> Result<AdminResponse> {
+        match database {
+            Some(db) => match self.resolve_pool_manager(&db) {
+                Some(pm) => {
+                    pm.resume();
+                    Ok(AdminResponse::CommandComplete { tag: "RESUME".to_string() })
+                }
+                None => Ok(AdminResponse::Error { message: format!("no such database: {db}") }),
+            },
+            None => {
+                for pm in self.handles.pool_managers.values() {
+                    pm.resume();
+                }
+                Ok(AdminResponse::CommandComplete { tag: "RESUME".to_string() })
+            }
+        }
+    }
+
+    /// RELOAD — actually attempt the config reload and report the REAL outcome
+    /// (WP-10 Task 4, P4 §5.4). Runs the ONE shared reload closure (the same one
+    /// SIGHUP uses); on success returns `CommandComplete`, on failure returns an
+    /// `ErrorResponse` carrying the real error — never a false `CommandComplete`.
+    /// Reload scope is auth_file only (documented limitation).
     async fn reload(&self) -> Result<AdminResponse> {
-        // TODO: Implement config reload
-        Ok(AdminResponse::CommandComplete { tag: "RELOAD".to_string() })
+        match (self.handles.reload_fn)() {
+            Ok(()) => Ok(AdminResponse::CommandComplete { tag: "RELOAD".to_string() }),
+            Err(e) => Ok(AdminResponse::Error { message: format!("reload failed: {e}") }),
+        }
     }
 
     async fn shutdown(&self, _wait: bool) -> Result<AdminResponse> {

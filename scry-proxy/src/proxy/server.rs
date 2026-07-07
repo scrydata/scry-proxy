@@ -63,7 +63,10 @@ pub struct ProxyServer {
     router: DatabaseRouter,
     metrics: Arc<ProxyMetrics>,
     tls_config: Option<Arc<ServerConfig>>,
-    authenticator: std::sync::RwLock<Option<Arc<FileAuthenticator>>>,
+    /// Hot-reloadable authenticator, `Arc`-shared with the reload closure
+    /// (`AdminHandles::reload_fn`) so both the SIGHUP path and admin `RELOAD`
+    /// swap the SAME cell that live connection handlers read (WP-10 Task 4).
+    authenticator: Arc<std::sync::RwLock<Option<Arc<FileAuthenticator>>>>,
     /// Channel to trigger config reload (e.g., on SIGHUP)
     #[allow(dead_code)]
     reload_trigger: watch::Receiver<()>,
@@ -390,11 +393,26 @@ impl ProxyServer {
         // becomes `Arc`-shared so both the server and the handles point at the
         // same instance.
         let config = Arc::new(config);
+
+        // The authenticator cell is `Arc`-shared between the server (whose
+        // connection handlers read it) and the reload closure (which swaps it),
+        // so a hot reload is visible to live connections.
+        let authenticator = Arc::new(std::sync::RwLock::new(authenticator));
+
+        // The ONE reload function. Both the SIGHUP path (via
+        // `apply_config_reload`) and admin `RELOAD` (via
+        // `AdminHandles::reload_fn`) call this exact closure, so the two paths
+        // can never drift. Scope is deliberately auth_file-only (documented
+        // limitation); it returns the real read/parse error instead of
+        // swallowing it, so a failed reload is reported honestly.
+        let reload_fn = Self::build_reload_fn(Arc::clone(&config), Arc::clone(&authenticator));
+
         let admin_handles = AdminHandles::new(
             Arc::clone(&config),
             pool_managers.clone(),
             reload_sender.clone(),
             shutdown_trigger,
+            Arc::clone(&reload_fn),
         );
 
         Ok(Self {
@@ -407,7 +425,7 @@ impl ProxyServer {
             router,
             metrics,
             tls_config,
-            authenticator: std::sync::RwLock::new(authenticator),
+            authenticator,
             reload_trigger,
             reload_sender,
             active_connections: Arc::new(AtomicUsize::new(0)),
@@ -451,14 +469,6 @@ impl ProxyServer {
     /// must not cascade into every new connection's spawn path panicking.
     fn authenticator_read(&self) -> std::sync::RwLockReadGuard<'_, Option<Arc<FileAuthenticator>>> {
         self.authenticator.read().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// Write-lock the authenticator, recovering from a poisoned lock (see
-    /// [`Self::authenticator_read`]).
-    fn authenticator_write(
-        &self,
-    ) -> std::sync::RwLockWriteGuard<'_, Option<Arc<FileAuthenticator>>> {
-        self.authenticator.write().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Get the reload sender for use by signal handlers
@@ -520,48 +530,57 @@ impl ProxyServer {
         total_created
     }
 
-    /// Apply a config reload, updating hot-reloadable settings
+    /// Build the single config-reload function shared by the SIGHUP path and
+    /// admin `RELOAD` (WP-10 Task 4, P4 §5.4).
     ///
-    /// Currently supports reloading:
-    /// - auth_file: Re-reads the userlist.txt file to update user credentials
+    /// Currently reloads ONLY `auth_file` (re-reads the userlist and atomically
+    /// swaps the shared authenticator cell). This scope is a documented
+    /// limitation — settings that require re-binding (listen_address,
+    /// unix_socket), pool recreation (pool sizes), or TLS-context recreation
+    /// (certificates) are NOT hot-reloaded.
     ///
-    /// Settings that require restart (not hot-reloaded):
-    /// - listen_address, unix_socket (requires re-binding)
-    /// - pool_size, pool settings (requires pool recreation)
-    /// - TLS certificates (requires TLS context recreation)
-    pub fn apply_config_reload(&self) {
-        info!("Applying config reload");
+    /// Unlike the pre-WP-10 version, it returns the real read/parse error
+    /// instead of swallowing it, so a failed reload is reported honestly to the
+    /// caller (admin `RELOAD` turns an `Err` into an `ErrorResponse`; the
+    /// SIGHUP path logs it and keeps the existing configuration).
+    fn build_reload_fn(
+        config: Arc<Config>,
+        authenticator: Arc<std::sync::RwLock<Option<Arc<FileAuthenticator>>>>,
+    ) -> Arc<dyn Fn() -> Result<()> + Send + Sync> {
+        Arc::new(move || {
+            info!("Applying config reload (scope: auth_file)");
 
-        // Reload auth file if configured
-        let auth_file = self.config.auth.auth_file.as_ref();
-        if let Some(auth_file) = auth_file {
-            match FileAuthenticator::from_file(auth_file) {
-                Ok(new_auth) => {
-                    let mut auth_guard = self.authenticator_write();
-                    let user_count = new_auth.len();
-                    *auth_guard = Some(Arc::new(new_auth));
-                    info!(
-                        auth_file = %auth_file,
-                        users = user_count,
-                        "Auth file reloaded successfully"
-                    );
-                }
-                Err(e) => {
-                    error!(
-                        auth_file = %auth_file,
-                        error = %e,
-                        "Failed to reload auth file, keeping existing configuration"
-                    );
-                }
+            if let Some(auth_file) = config.auth.auth_file.as_ref() {
+                let new_auth = FileAuthenticator::from_file(auth_file)
+                    .with_context(|| format!("Failed to reload auth file: {}", auth_file))?;
+                let user_count = new_auth.len();
+                let mut auth_guard = authenticator.write().unwrap_or_else(|e| e.into_inner());
+                *auth_guard = Some(Arc::new(new_auth));
+                info!(
+                    auth_file = %auth_file,
+                    users = user_count,
+                    "Auth file reloaded successfully"
+                );
             }
-        }
 
-        // Future: reload other hot-reloadable config here
-        // - circuit breaker thresholds
-        // - publisher settings
-        // - observability settings
+            // Future: reload other hot-reloadable config here
+            // - circuit breaker thresholds
+            // - publisher settings
+            // - observability settings
 
-        info!("Config reload complete");
+            info!("Config reload complete");
+            Ok(())
+        })
+    }
+
+    /// Apply a config reload, updating hot-reloadable settings (auth_file only,
+    /// see [`build_reload_fn`](Self::build_reload_fn)).
+    ///
+    /// Delegates to the single shared reload closure carried by
+    /// [`AdminHandles`], so this (the SIGHUP path) and admin `RELOAD` can never
+    /// diverge. Returns the real error on failure instead of swallowing it.
+    pub fn apply_config_reload(&self) -> Result<()> {
+        (self.admin_handles.reload_fn)()
     }
 
     /// Run the proxy server, accepting connections until shutdown signal
@@ -794,7 +813,9 @@ impl ProxyServer {
                 // Handle config reload signal (SIGHUP)
                 _ = self.reload_trigger.changed() => {
                     info!("Received reload signal");
-                    self.apply_config_reload();
+                    if let Err(e) = self.apply_config_reload() {
+                        error!(error = %e, "Config reload failed, keeping existing configuration");
+                    }
                 }
 
                 accept_result = self.listener.accept() => {
@@ -1715,7 +1736,7 @@ mod tests {
         drop(file);
 
         // Trigger reload
-        server.apply_config_reload();
+        server.apply_config_reload().expect("reload of valid auth file should succeed");
 
         // Verify updated state
         let auth = server.authenticator().unwrap();

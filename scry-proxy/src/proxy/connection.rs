@@ -413,6 +413,49 @@ impl ConnectionHandler {
         response
     }
 
+    /// Build a PostgreSQL ErrorResponse for an administratively paused pool
+    /// (admin `PAUSE`, WP-10 Task 4). Honest rejection so a new client's query
+    /// fails cleanly instead of hanging. SQLSTATE 57P03 (`cannot_connect_now`)
+    /// is the standard "server is not currently accepting connections" code.
+    fn build_pool_paused_error() -> Vec<u8> {
+        let mut response = Vec::new();
+        response.push(b'E'); // ErrorResponse
+
+        let mut fields = Vec::new();
+
+        // Severity (S)
+        fields.push(b'S');
+        fields.extend_from_slice(b"ERROR");
+        fields.push(0);
+
+        // SQLSTATE (C) - 57P03 = cannot_connect_now
+        fields.push(b'C');
+        fields.extend_from_slice(b"57P03");
+        fields.push(0);
+
+        // Message (M)
+        fields.push(b'M');
+        fields.extend_from_slice(b"pool is paused");
+        fields.push(0);
+
+        // Hint (H)
+        fields.push(b'H');
+        fields.extend_from_slice(
+            b"The proxy pool was paused by an administrator. Retry after RESUME.",
+        );
+        fields.push(0);
+
+        // Terminator
+        fields.push(0);
+
+        // Length (including self, 4 bytes)
+        let length = (fields.len() + 4) as i32;
+        response.extend_from_slice(&length.to_be_bytes());
+        response.extend_from_slice(&fields);
+
+        response
+    }
+
     /// Handle the connection, forwarding messages until completion
     #[instrument(skip(self), fields(connection_id = self.connection_id, client_addr = %self.client_addr))]
     pub async fn handle(mut self) -> Result<()> {
@@ -522,6 +565,18 @@ impl ConnectionHandler {
                     );
                 }
             },
+            AcquireError::Paused => {
+                // Administratively paused (admin PAUSE). Always surface a clean
+                // ErrorResponse to the client regardless of backpressure mode —
+                // this is an operator action, not load, so the client deserves
+                // an honest "paused" message rather than a silent close.
+                debug!(
+                    connection_id = self.connection_id,
+                    "Acquire rejected: pool is paused, sending ErrorResponse to client"
+                );
+                let error_msg = Self::build_pool_paused_error();
+                let _ = self.client_stream.write_all(&error_msg).await;
+            }
             AcquireError::PoolError(e) => {
                 // Pool errors are unexpected, always log them
                 error!(

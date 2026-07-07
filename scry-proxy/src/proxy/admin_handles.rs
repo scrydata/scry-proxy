@@ -194,6 +194,13 @@ pub struct AdminHandles {
     /// alongside the OS signals, so a future admin SHUTDOWN (Task 5) can
     /// initiate the same graceful drain. `send(true)` starts the drain.
     pub shutdown_trigger: watch::Sender<bool>,
+    /// The single config-reload function (WP-10 Task 4 RELOAD). Both the SIGHUP
+    /// path (`ProxyServer::apply_config_reload`) and admin `RELOAD` call this
+    /// exact closure, so the two can never drift. Returns the real error on a
+    /// failed reload (auth_file read/parse failure) so `RELOAD` can report an
+    /// honest `ErrorResponse` instead of a false `CommandComplete`. Scope is
+    /// auth_file-only (documented limitation).
+    pub reload_fn: Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>,
     /// The effective configuration (Task 3 SHOW CONFIG).
     pub config: Arc<Config>,
     /// Live client-connection registry (Task 2 SHOW CLIENTS).
@@ -210,6 +217,7 @@ impl AdminHandles {
         pool_managers: HashMap<String, Arc<PoolManager>>,
         reload_sender: watch::Sender<()>,
         shutdown_trigger: watch::Sender<bool>,
+        reload_fn: Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>,
     ) -> Arc<Self> {
         let client_registry = Arc::new(ClientRegistry::new());
         let server_registry = Arc::new(ServerRegistry::new(pool_managers.clone()));
@@ -217,6 +225,7 @@ impl AdminHandles {
             pool_managers,
             reload_sender,
             shutdown_trigger,
+            reload_fn,
             config,
             client_registry,
             server_registry,
@@ -251,6 +260,8 @@ impl AdminHandles {
     pub fn for_test_with_config(config: Config) -> Arc<Self> {
         let (reload_sender, _reload_rx) = watch::channel(());
         let (shutdown_trigger, _shutdown_rx) = watch::channel(false);
-        Self::new(Arc::new(config), HashMap::new(), reload_sender, shutdown_trigger)
+        // Test handles have no real reload seam; a no-op that always succeeds.
+        let reload_fn: Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync> = Arc::new(|| Ok(()));
+        Self::new(Arc::new(config), HashMap::new(), reload_sender, shutdown_trigger, reload_fn)
     }
 }
