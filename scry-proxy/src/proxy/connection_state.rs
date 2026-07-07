@@ -133,7 +133,48 @@ impl ConnectionState {
     /// recognized state-changing command updates the corresponding state; a
     /// command that cannot be positively classified as clean pins the
     /// connection via [`mark_unknown_command`].
+    ///
+    /// Multi-statement-aware (WP-9 Task 9, P2 §4.6): both the simple-`Query`
+    /// and `Parse` arms funnel through this single entry point with the raw
+    /// SQL text, which may itself be a `;`-separated batch (e.g.
+    /// `"SELECT 1; SET x = 1"`). Classifying only the batch's leading keyword
+    /// (the pre-Task-9 behavior) would call that whole batch `Clean` and never
+    /// observe the trailing `SET` — a real correctness bug, not just an
+    /// attribution gap: in Hybrid mode the connection would be released
+    /// un-pinned and the GUC would leak to the next pooled client. Splitting on
+    /// `;` (see [`CommandDetector::split_statements`]) and classifying+applying
+    /// EACH part closes that gap: any stateful/unknown part pins the
+    /// connection. A single-statement query (no interior `;`) behaves exactly
+    /// as before this change.
     pub fn apply_query(&mut self, query: &str) {
+        use crate::protocol::CommandDetector;
+        let statements = CommandDetector::split_statements(query);
+        if statements.is_empty() {
+            // Degenerate input: empty, all-whitespace, or `;`-only (e.g. `""`,
+            // `";"`, `"   "`). There is no real statement to split out, so
+            // fall back to classifying the ORIGINAL text directly rather than
+            // silently applying zero pins. This matters: `split_statements`
+            // filters out empty fragments, and an input that is nothing BUT
+            // empty fragments would otherwise make this loop a no-op — a
+            // fail-OPEN regression (`unknown_implies_pinned` in
+            // `pooling_safety_test.rs` caught exactly this for `sql = ""`).
+            // `classify("")` (and `classify(";")`, `classify("   ")`) is
+            // `Unknown` — none of `detect()`'s prefix checks or
+            // `is_known_clean`'s keyword check can match an empty/whitespace
+            // string — so this fallback correctly pins, exactly matching the
+            // pre-multi-statement-split behavior for these inputs.
+            self.apply_single_statement(query);
+            return;
+        }
+        for statement in statements {
+            self.apply_single_statement(statement);
+        }
+    }
+
+    /// Classify and apply exactly one (already-split) statement. See
+    /// [`apply_query`](Self::apply_query) for the multi-statement splitting
+    /// this is called once per part from.
+    fn apply_single_statement(&mut self, query: &str) {
         use crate::protocol::{CommandClass, CommandDetector, DetectedCommand};
         match CommandDetector::classify(query) {
             CommandClass::Clean => {}
@@ -701,6 +742,81 @@ mod tests {
         assert!(!names.contains(&"stmt2"));
         assert!(names.contains(&"stmt3"));
         assert!(names.contains(&"stmt4"));
+    }
+
+    // -- Multi-statement fail-closed classification (WP-9 Task 9, P2 §4.6) ----
+
+    #[test]
+    fn test_apply_query_multi_statement_set_pins_session_variable() {
+        // Confirmed gap: a leading-keyword-only classifier sees "SELECT" and
+        // calls the whole batch Clean, silently dropping the trailing SET —
+        // in Hybrid mode that leaks the GUC to the next pooled client.
+        let mut state = ConnectionState::new(1000);
+        state.apply_query("SELECT 1; SET x=1");
+
+        assert!(state.is_pinned());
+        assert!(state.pin_reasons().contains(&PinReason::SessionVariable));
+        let replay = state.get_replayable_state();
+        assert_eq!(replay.session_variables.get("x"), Some(&"1".to_string()));
+    }
+
+    #[test]
+    fn test_apply_query_multi_statement_all_clean_stays_clean() {
+        let mut state = ConnectionState::new(1000);
+        state.apply_query("SELECT 1; SELECT 2");
+
+        assert!(!state.is_pinned());
+        assert!(state.pin_reasons().is_empty());
+    }
+
+    #[test]
+    fn test_apply_query_multi_statement_unknown_tail_pins_via_unknown() {
+        let mut state = ConnectionState::new(1000);
+        state.apply_query("SELECT 1; CALL some_procedure()");
+
+        assert!(state.is_pinned());
+        assert!(state.pin_reasons().contains(&PinReason::UnknownCommand));
+    }
+
+    #[test]
+    fn test_apply_query_single_statement_unchanged_with_trailing_semicolon() {
+        // A single-statement query (no INTERIOR `;`) must behave exactly as
+        // before the split: a trailing `;` (common in real client traffic) must
+        // not affect classification.
+        let mut state = ConnectionState::new(1000);
+        state.apply_query("SELECT 1;");
+
+        assert!(!state.is_pinned());
+    }
+
+    #[test]
+    fn test_apply_query_degenerate_empty_input_still_pins() {
+        // Regression guard: naive `;` splitting filters out empty fragments,
+        // so an input that is NOTHING but empty fragments ("", ";", "   ",
+        // ";;;") must not become a silent no-op (fail-open). Caught by the
+        // `unknown_implies_pinned` property test in `pooling_safety_test.rs`
+        // during this task's implementation.
+        for degenerate in ["", ";", "   ", ";;;", " ; ; "] {
+            let mut state = ConnectionState::new(1000);
+            state.apply_query(degenerate);
+            assert!(
+                state.is_pinned(),
+                "degenerate input {degenerate:?} must still fail-closed pin (matches \
+                 CommandDetector::classify's Unknown result for the same unsplit text)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_apply_query_multi_statement_over_pins_never_under_pins() {
+        // A `;` inside a string literal is naively (mis-)split into a bogus
+        // extra fragment ("SET x=1'"), which classifies as Unknown and pins —
+        // over-pinning, never a leak. This is the documented fail-closed
+        // safety property of naive `;` splitting.
+        let mut state = ConnectionState::new(1000);
+        state.apply_query("SELECT 'a; SET x=1'");
+
+        assert!(state.is_pinned());
     }
 
     #[test]

@@ -78,6 +78,18 @@ impl CommandDetector {
     /// known-safe shape. Anything else is `Stateful` (recognized) or `Unknown`
     /// (pin) — the blast radius of a detection gap is a performance cost (an
     /// over-pinned connection), never a correctness bug (leaked session state).
+    ///
+    /// `COPY ... FROM/TO STDIN/STDOUT` deliberately has no dedicated
+    /// `DetectedCommand` variant and therefore always falls through to
+    /// `Unknown` here (see `MUST_PIN_UNKNOWN` in `pooling_safety_test.rs`).
+    /// COPY is passthrough-only by design for 1.0 (P2 §9.4): the proxy never
+    /// models or replays COPY's own sub-protocol (`CopyInResponse`/
+    /// `CopyData`/`CopyDone`/`CopyOutResponse`), it just forwards those bytes
+    /// like any other unrecognized message — fail-closed `Unknown`
+    /// classification simply keeps the connection pinned for the duration of
+    /// the COPY rather than risking a mid-COPY release. See
+    /// `copy_passthrough_byte_identical` in `differential_transparency_test.rs`
+    /// for the byte-for-byte passthrough proof (WP-9 Task 9).
     pub fn classify(sql: &str) -> CommandClass {
         if let Some(cmd) = Self::detect(sql) {
             return CommandClass::Stateful(cmd);
@@ -353,6 +365,32 @@ impl CommandDetector {
             }
         }
         None
+    }
+
+    /// Naively split `sql` into non-empty, trimmed statements on `;` (WP-9 Task
+    /// 9, P2 §4.6).
+    ///
+    /// Deliberately NOT a real SQL parser: it has no idea about string literals,
+    /// dollar-quoting, or comments, so a `;` inside a literal (e.g.
+    /// `SELECT 'a; SET x=1'`) produces a spurious extra fragment (here,
+    /// `"SET x=1'"`). That is safe by construction for every caller of this
+    /// function: `CommandDetector::classify` on a bogus fragment can only ever
+    /// return `Unknown` or, at worst, a `Stateful` match on something that looks
+    /// like a real command — both cases are fail-closed (over-pinning /
+    /// over-attribution), never fail-open. A naive split can never make a real
+    /// trailing state-changing statement (a genuine `SET`/temp-table/etc. after
+    /// a real `;`) disappear from the output, so it can never cause
+    /// under-pinning or a dropped attribution. A query with no interior `;`
+    /// yields exactly one element (the trimmed original), so single-statement
+    /// callers see no behavior change.
+    ///
+    /// Shared by [`ConnectionState::apply_query`](crate::proxy::ConnectionState::apply_query)
+    /// (fail-closed pinning: classify+apply every split part) and the
+    /// connection handler's event attribution (best-effort observability:
+    /// attribute each part to its own `QueryEvent`) so both consumers agree on
+    /// exactly one definition of "a statement" in a multi-statement batch.
+    pub fn split_statements(sql: &str) -> Vec<&str> {
+        sql.split(';').map(str::trim).filter(|s| !s.is_empty()).collect()
     }
 }
 

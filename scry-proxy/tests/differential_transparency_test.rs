@@ -255,6 +255,282 @@ async fn extended_protocol_matrix_all_modes() {
     }
 }
 
+/// Multi-statement fail-closed pinning under Hybrid pooling (WP-9 Task 9, P2
+/// §4.6, priority correctness item).
+///
+/// # The bug
+/// `CommandDetector::classify` (and, before this task, `ConnectionState::
+/// apply_query`) classified a whole simple-`Query` string by its LEADING
+/// keyword only. `"SELECT 1; SET application_name = 'wp9_multi_probe'"` leads
+/// with `SELECT`, a known-clean keyword — so the entire batch, trailing `SET`
+/// included, classified as `Clean`, and `apply_query` set NO pin. In Hybrid
+/// mode a clean connection is released back to the pool at the next
+/// transaction boundary, so the `SET`'s GUC leaked onto whichever pooled
+/// backend the next client happened to land on. This is a real transparency/
+/// isolation correctness bug, not merely an event-attribution gap.
+///
+/// # Why this must be wrapped in an explicit transaction
+/// `connection.rs` only evaluates its Hybrid release-vs-pin decision
+/// (`should_release_connection`) when a `ReadyForQuery` transitions from
+/// `InTransaction` back to `Idle` — i.e. only across an EXPLICIT `BEGIN`/
+/// `COMMIT` boundary that spans separate round trips (see
+/// `TransactionTracker`). A bare autocommit multi-statement batch (no
+/// surrounding `BEGIN`/`COMMIT` in a separate round trip) never produces that
+/// transition — Postgres auto-commits the implicit block and replies with a
+/// single `ReadyForQuery('I')`, which the proxy cannot distinguish from "was
+/// already idle". So `BEGIN` and `COMMIT` are sent as their OWN
+/// `simple_query` calls (separate round trips), with the multi-statement
+/// probe itself as a THIRD, separate `simple_query` call in between — exactly
+/// the shape `assert_extended_state_survives_hybrid_recycle` /
+/// `dirty_connection_invariant_hybrid_mode`'s client C block use for the same
+/// reason. No `Parse` is ever sent here (pure simple-protocol), so — unlike
+/// the extended-protocol tests — there is no incidental `PreparedStatement`
+/// pin to strip first; the only pin possible is the `SessionVariable` one
+/// this task adds.
+///
+/// # RED before the fix / GREEN after
+/// Before Task 9: the multi-statement batch classifies `Clean` (leading-
+/// keyword-only classification), so `should_release_connection` releases the
+/// connection at `COMMIT`; deadpool's `recycle()` then `DISCARD ALL`s it
+/// before anyone else can observe it, so this test's own client would already
+/// see the GUC gone by the "same client" check below — but at pool sizes > 1,
+/// or via a genuine mid-flight race, a fresh client for the same pooled proxy
+/// port getting this exact connection while it is still marked "released, not
+/// yet recycled" is exactly how a `SessionVariable` GUC set by one logical
+/// client becomes visible to another: the connection carries live, un-pinned
+/// state back to the pool. Manually verified RED against the pre-fix
+/// `ConnectionState::apply_query` (single-statement classification only): the
+/// "same client still sees the value" assertion below fails first (COMMIT
+/// silently drops the GUC), which is the direct, deterministic signature of
+/// the leading-keyword-only bug — see the task report for the exact
+/// pre-fix/post-fix `cargo test` transcript.
+#[tokio::test]
+async fn multi_statement_simple_query_fail_closed_hybrid_mode() {
+    let docker = Cli::default();
+    let postgres_image = RunnableImage::from(Postgres::default()).with_tag("16-alpine");
+    let postgres = docker.run(postgres_image);
+    let postgres_port = postgres.get_host_port_ipv4(5432);
+    let postgres_host = "127.0.0.1";
+
+    sleep(Duration::from_secs(2)).await;
+
+    let PairedClients { proxy_port, proxy, direct: _direct } =
+        paired_clients(postgres_host, postgres_port, scry::config::PoolingStrategy::Hybrid)
+            .await
+            .expect("failed to start paired clients for Hybrid mode");
+
+    let probe_value = "wp9_multi_probe";
+
+    proxy.simple_query("BEGIN").await.expect("BEGIN");
+    // The thing under test: a single simple-Query message carrying TWO
+    // `;`-separated statements, the second of which is state-changing. Only
+    // the multi-statement-aware `apply_query` (this task's fix) observes the
+    // trailing SET; leading-keyword-only classification sees just `SELECT`.
+    proxy
+        .simple_query(&format!("SELECT 1; SET application_name = '{probe_value}'"))
+        .await
+        .expect("multi-statement simple query should succeed in Hybrid mode");
+    proxy.simple_query("COMMIT").await.expect("COMMIT"); // transaction completes -> Hybrid release check runs
+
+    // Enough further activity that an un-pinned connection would already have
+    // been released back to the pool (and DISCARD-ALL reset) by now.
+    for _ in 0..5 {
+        proxy.simple_query("SELECT 1").await.expect("keepalive SELECT 1");
+    }
+
+    // Same client: the GUC must still be visible — proof the connection was
+    // pinned (not silently released+recycled) rather than the SET having been
+    // dropped some other way. (Uses the extended protocol purely to read the
+    // value back; by this point the release-vs-pin decision at COMMIT has
+    // already run, so a Parse here adds no incidental pin relevant to the
+    // check.)
+    let same_client_value: String = proxy
+        .query_one("SHOW application_name", &[])
+        .await
+        .expect("SHOW application_name on same client")
+        .get(0);
+    assert_eq!(
+        same_client_value, probe_value,
+        "multi-statement SET was silently dropped on the SAME client — the trailing SET in \
+         \"SELECT 1; SET application_name = '...'\" was never classified/applied, so Hybrid \
+         mode recycled the connection instead of pinning it"
+    );
+
+    // Fresh client, same pooled proxy port: must NOT see the value — proof
+    // the pin kept this connection from being handed to another client dirty.
+    assert_session_state_clean(
+        "127.0.0.1",
+        proxy_port,
+        "postgres",
+        "postgres",
+        "postgres",
+        "application_name",
+        "",
+        "wp9_multistmt_nonexistent_probe",
+    )
+    .await
+    .unwrap_or_else(|e| panic!("Hybrid multi-statement fail-closed pin check failed: {e}"));
+}
+
+/// Multi-statement event attribution (WP-9 Task 9, P2 §4.6, observability item
+/// 1).
+///
+/// Before this task, a multi-statement simple-Query batch (one `Query`
+/// message, N `CommandComplete`s on the wire) was attributed to a SINGLE
+/// `QueryEvent` under the first `CommandComplete` found — `pending.query` held
+/// the *entire* `;`-joined batch text as one event. This asserts the fix:
+/// `connection.rs`'s backend-response handler now re-uses
+/// `CommandDetector::split_statements` (the exact same fail-closed split the
+/// priority-item fix above uses for pinning) to emit one event PER statement.
+/// Best-effort observability only — this test never inspects the bytes on the
+/// wire, only the published `QueryEvent`s; the byte-level transparency
+/// guarantee is what the rest of this suite's `assert_outcomes_equivalent`
+/// calls already prove.
+#[tokio::test]
+async fn multi_statement_event_attribution() {
+    use scry::publisher::EventPublisher;
+    use std::sync::Arc;
+
+    let docker = Cli::default();
+    let postgres_image = RunnableImage::from(Postgres::default()).with_tag("16-alpine");
+    let postgres = docker.run(postgres_image);
+    let postgres_port = postgres.get_host_port_ipv4(5432);
+    let postgres_host = "127.0.0.1";
+
+    sleep(Duration::from_secs(2)).await;
+
+    let config = create_test_config(
+        postgres_host.to_string(),
+        postgres_port,
+        scry::config::PoolingStrategy::Session,
+    );
+    let test_publisher = TestPublisher::new();
+    let publisher: Arc<dyn EventPublisher> = Arc::new(test_publisher.clone());
+    let proxy_port =
+        start_test_proxy(config.clone(), publisher).await.expect("failed to start proxy");
+    sleep(Duration::from_millis(300)).await;
+
+    let client = connect_client("127.0.0.1", proxy_port, "postgres", "postgres", "postgres")
+        .await
+        .expect("client connect");
+
+    client
+        .simple_query("SELECT 1; SELECT 2")
+        .await
+        .expect("multi-statement simple query should succeed");
+
+    // Give the batcher a moment to flush (config's flush_interval_ms is 100).
+    sleep(Duration::from_millis(500)).await;
+
+    let events = test_publisher.events();
+    let queries: Vec<&str> = events.iter().map(|e| e.query.as_str()).collect();
+
+    assert!(
+        queries.iter().any(|q| q.trim() == "SELECT 1"),
+        "expected an event attributed to \"SELECT 1\" alone, got: {queries:?}"
+    );
+    assert!(
+        queries.iter().any(|q| q.trim() == "SELECT 2"),
+        "expected an event attributed to \"SELECT 2\" alone, got: {queries:?}"
+    );
+    assert!(
+        !queries.iter().any(|q| q.contains(';')),
+        "expected no single merged multi-statement event (containing ';'); got: {queries:?}"
+    );
+}
+
+/// COPY passthrough-unchanged assertion (WP-9 Task 9, observability item 2,
+/// P2 §9.4).
+///
+/// COPY stays passthrough-only for 1.0 by design: `CommandDetector`
+/// classifies `COPY ... FROM/TO STDIN/STDOUT` as `Unknown` (see
+/// `pooling_safety_test.rs`'s `MUST_PIN_UNKNOWN` list), which fail-closed PINS
+/// the connection rather than attempting to model/replay COPY's own
+/// sub-protocol (no state modeling is added here, or ever planned for 1.0).
+/// This test is the promised deliverable for that scoping decision: proof the
+/// COPY data itself is forwarded byte-for-byte, direct vs. proxied — both
+/// directions (`FROM STDIN` and `TO STDOUT`) — exactly like every other
+/// operation this differential suite already covers for ordinary queries.
+#[tokio::test]
+async fn copy_passthrough_byte_identical() {
+    use bytes::{Bytes, BytesMut};
+    use futures::{SinkExt, TryStreamExt};
+    use std::pin::pin;
+
+    let docker = Cli::default();
+    let postgres_image = RunnableImage::from(Postgres::default()).with_tag("16-alpine");
+    let postgres = docker.run(postgres_image);
+    let postgres_port = postgres.get_host_port_ipv4(5432);
+    let postgres_host = "127.0.0.1";
+
+    sleep(Duration::from_secs(2)).await;
+
+    // Hybrid mode: COPY's `Unknown` classification is exactly what should
+    // fail-closed pin the connection for the duration of the COPY, so this
+    // exercises the interaction (pinned connection, passthrough bytes) rather
+    // than a mode where pinning is moot.
+    let PairedClients { proxy_port: _, proxy, direct } =
+        paired_clients(postgres_host, postgres_port, scry::config::PoolingStrategy::Hybrid)
+            .await
+            .expect("failed to start paired clients for Hybrid mode");
+
+    for (client, table) in [(&direct, "wp9_copy_direct"), (&proxy, "wp9_copy_proxy")] {
+        client.simple_query(&format!("DROP TABLE IF EXISTS {table}")).await.unwrap();
+        client.simple_query(&format!("CREATE TABLE {table} (id int, value text)")).await.unwrap();
+    }
+
+    // COPY ... FROM STDIN: stream the identical payload through direct and
+    // proxy, via the extended protocol (as tokio_postgres's `copy_in` always
+    // uses) — the same path a real client library uses.
+    let payload = Bytes::from_static(b"1\thello\n2\tworld\n3\tembedded space\n");
+
+    let mut sink = pin!(direct.copy_in("COPY wp9_copy_direct FROM STDIN").await.unwrap());
+    sink.send(payload.clone()).await.expect("direct COPY FROM STDIN send");
+    sink.finish().await.expect("direct COPY FROM STDIN finish");
+
+    let mut sink = pin!(proxy.copy_in("COPY wp9_copy_proxy FROM STDIN").await.unwrap());
+    sink.send(payload.clone()).await.expect("proxied COPY FROM STDIN send");
+    sink.finish().await.expect("proxied COPY FROM STDIN finish");
+
+    // COPY ... TO STDOUT: read the raw COPY byte stream back out (not via
+    // SELECT, which would go through a different code path) on both sides and
+    // assert byte-for-byte equality between direct and proxied.
+    let direct_out = direct
+        .copy_out("COPY wp9_copy_direct TO STDOUT")
+        .await
+        .expect("direct COPY TO STDOUT")
+        .try_fold(BytesMut::new(), |mut buf, chunk| async move {
+            buf.extend_from_slice(&chunk);
+            Ok(buf)
+        })
+        .await
+        .expect("direct COPY TO STDOUT collect");
+
+    let proxy_out = proxy
+        .copy_out("COPY wp9_copy_proxy TO STDOUT")
+        .await
+        .expect("proxied COPY TO STDOUT")
+        .try_fold(BytesMut::new(), |mut buf, chunk| async move {
+            buf.extend_from_slice(&chunk);
+            Ok(buf)
+        })
+        .await
+        .expect("proxied COPY TO STDOUT collect");
+
+    assert_eq!(
+        &direct_out[..],
+        &proxy_out[..],
+        "COPY TO STDOUT bytes diverged between direct and proxied connections — the proxy \
+         must forward COPY data byte-for-byte (passthrough-only by design, P2 §9.4)"
+    );
+    assert_eq!(
+        &direct_out[..],
+        &payload[..],
+        "COPY round trip altered the data even relative to what was sent (sanity check on the \
+         test itself, not the proxy)"
+    );
+}
+
 /// Comparator self-proof (task brief deliverable 3): feeds the comparator two
 /// deliberately different results and confirms it reports divergence, rather
 /// than trivially passing. Container-free — this is pure logic over

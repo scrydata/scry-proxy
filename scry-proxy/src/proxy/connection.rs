@@ -6,7 +6,8 @@ use crate::auth::{Authenticator, FileAuthenticator};
 use crate::config::{BackpressureMode, Config, ParseFailureMode, PoolingStrategy};
 use crate::observability::{ProxyMetrics, QueryTimeline};
 use crate::protocol::{
-    build_error_response, decode_params, Message, MessageExtractor, QueryAnonymizer,
+    build_error_response, decode_params, CommandDetector, Message, MessageExtractor,
+    QueryAnonymizer,
 };
 use crate::publisher::{QueryEvent, QueryEventBuilder};
 use crate::tls::ClientTransport;
@@ -1098,22 +1099,52 @@ impl ConnectionHandler {
                                     let duration = pending.started_at.elapsed();
                                     debug!(query = %crate::observability::loggable(&pending.query), duration_ms = duration.as_millis(), "Query completed successfully");
 
-                                    if let Some((event, fingerprints)) = anon_settings.build_event(
-                                        &pending.query,
-                                        pending.params,
-                                        pending.params_incomplete,
-                                        duration,
-                                        true,
-                                        None,
-                                        &connection_id_str,
-                                        &database,
-                                    ) {
-                                        if let Err(e) = batcher.send_event(event) {
-                                            warn!(error = %e, "Failed to send event to batcher");
+                                    // WP-9 Task 9 (P2 §4.6): a simple-Query
+                                    // `pending.query` may itself be a
+                                    // `;`-separated multi-statement batch (one
+                                    // Query message, N CommandCompletes on the
+                                    // wire). Before this, the whole batch was
+                                    // attributed to a SINGLE event under the
+                                    // first CommandComplete found — observable
+                                    // accuracy only, never a forwarded-bytes
+                                    // change. Re-using the exact same
+                                    // fail-closed split
+                                    // `ConnectionState::apply_query` uses for
+                                    // pinning attributes each statement to its
+                                    // own event instead. A single-statement
+                                    // query (by far the common case) yields
+                                    // exactly one part, so exactly one event —
+                                    // no change there. This is pure CPU-bound
+                                    // event construction over an already-taken
+                                    // `pending`; it runs before the bytes below
+                                    // are forwarded to the client but does no
+                                    // I/O and no awaiting, so it adds no
+                                    // material latency and can't fail the
+                                    // query itself (a publish failure is
+                                    // already best-effort/logged, same as
+                                    // before).
+                                    let mut fingerprints_all = Vec::new();
+                                    for stmt_text in CommandDetector::split_statements(&pending.query) {
+                                        if let Some((event, fingerprints)) = anon_settings.build_event(
+                                            stmt_text,
+                                            pending.params.clone(),
+                                            pending.params_incomplete,
+                                            duration,
+                                            true,
+                                            None,
+                                            &connection_id_str,
+                                            &database,
+                                        ) {
+                                            if let Err(e) = batcher.send_event(event) {
+                                                warn!(error = %e, "Failed to send event to batcher");
+                                            }
+                                            if !fingerprints.is_empty() {
+                                                fingerprints_all.extend(fingerprints);
+                                            }
                                         }
-                                        if !fingerprints.is_empty() {
-                                            metrics.record_hot_data(&fingerprints);
-                                        }
+                                    }
+                                    if !fingerprints_all.is_empty() {
+                                        metrics.record_hot_data(&fingerprints_all);
                                     }
                                     metrics.record_query(&QueryTimeline::for_completed(pending.started_at), true);
                                 }
