@@ -1,0 +1,256 @@
+//! Shared operational state for the admin console (WP-10, P4 §4.1).
+//!
+//! [`AdminHandles`] is the single `Arc`-shared bundle of everything the admin
+//! console needs to *report* real proxy state and *control* the process. It is
+//! constructed once in [`ProxyServer::new`](super::ProxyServer) and threaded
+//! into each admin connection. This module is FOUNDATION/plumbing: later WP-10
+//! tasks (SHOW CLIENTS/SERVERS/CONFIG, RELOAD, SHUTDOWN) consume these handles;
+//! nothing here changes command behavior yet.
+//!
+//! Design constraints (see task brief):
+//! - Registration is O(1) bookkeeping at connect/disconnect. The proxied byte
+//!   stream and per-query hot path are untouched — no per-query locking.
+//! - No false state: a [`ClientEntry`] exists iff the connection is live
+//!   (register once identity is known, deregister on every exit path via the
+//!   connection's RAII guard).
+
+use crate::config::Config;
+use crate::proxy::PoolManager;
+use parking_lot::RwLock;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Instant;
+use tokio::sync::watch;
+
+/// Coarse lifecycle state of a client connection.
+///
+/// Deliberately coarse for 1.0: it is set at connect and can be cheaply nudged
+/// at natural boundaries, but is never updated per-query (that would add
+/// hot-path locking against the <1ms latency budget).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientState {
+    /// Handshake/startup completed; connection is serving (or idle between)
+    /// application queries. The common resting state for a regular client.
+    Active,
+    /// A client attached to the virtual admin (`pgbouncer`) console.
+    Admin,
+}
+
+/// A single live client connection, as tracked by the [`ClientRegistry`].
+#[derive(Debug, Clone)]
+pub struct ClientEntry {
+    /// Monotonic per-process connection id (matches server logs/metrics).
+    pub conn_id: u64,
+    /// Client socket address (`ip:port`), or `"unix"` for UNIX-socket clients.
+    pub addr: String,
+    /// Startup-message user, or empty if the startup was not parsed (e.g. a
+    /// UNIX client whose startup is read later by the connection handler).
+    pub user: String,
+    /// Startup-message database, or empty (same caveat as `user`).
+    pub database: String,
+    /// Coarse lifecycle state (see [`ClientState`]).
+    pub state: ClientState,
+    /// When the connection was registered.
+    pub connect_time: Instant,
+    /// Last time the state was touched. For 1.0 this equals `connect_time`
+    /// unless a caller cheaply updates it at a natural boundary.
+    pub last_request_time: Instant,
+    /// Whether the client transport was upgraded to TLS.
+    pub tls: bool,
+}
+
+/// `Arc`-shared registry of live client connections.
+///
+/// Keyed by `conn_id`. Insert on connect (once identity is known), remove on
+/// disconnect. All operations take a short write/read lock and touch a single
+/// `HashMap` slot — O(1), off the per-query hot path.
+#[derive(Debug, Default)]
+pub struct ClientRegistry {
+    inner: RwLock<HashMap<u64, ClientEntry>>,
+}
+
+impl ClientRegistry {
+    /// Create an empty registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a live connection. Idempotent per `conn_id` (last write wins).
+    pub fn register(&self, entry: ClientEntry) {
+        self.inner.write().insert(entry.conn_id, entry);
+    }
+
+    /// Remove a connection. No-op if it was never registered, so it is always
+    /// safe to call from a drop guard regardless of how far startup got.
+    pub fn deregister(&self, conn_id: u64) {
+        self.inner.write().remove(&conn_id);
+    }
+
+    /// Best-effort update of a live entry's coarse state and `last_request_time`.
+    ///
+    /// Intended for natural boundaries only (not per-query). No-op if the entry
+    /// is gone.
+    pub fn touch(&self, conn_id: u64, state: ClientState) {
+        if let Some(entry) = self.inner.write().get_mut(&conn_id) {
+            entry.state = state;
+            entry.last_request_time = Instant::now();
+        }
+    }
+
+    /// Number of live connections.
+    pub fn len(&self) -> usize {
+        self.inner.read().len()
+    }
+
+    /// Whether there are no live connections.
+    pub fn is_empty(&self) -> bool {
+        self.inner.read().is_empty()
+    }
+
+    /// Snapshot of all live entries (cloned), for a future `SHOW CLIENTS`.
+    pub fn snapshot(&self) -> Vec<ClientEntry> {
+        self.inner.read().values().cloned().collect()
+    }
+
+    /// Look up a single live entry by id.
+    pub fn get(&self, conn_id: u64) -> Option<ClientEntry> {
+        self.inner.read().get(&conn_id).cloned()
+    }
+}
+
+/// Pool-level snapshot of a configured backend, for a future `SHOW SERVERS`.
+///
+/// Granularity note: this is **pool-level**, not per-socket. deadpool does not
+/// expose stable per-connection handles, so for 1.0 we surface each pool's
+/// aggregate `status()` plus backend identity rather than a row per backend
+/// socket. A full per-socket backend registry is a documented nice-to-have.
+#[derive(Debug, Clone)]
+pub struct ServerPoolSnapshot {
+    /// Database key for this pool (`"*"` is the default pool).
+    pub database: String,
+    /// Backend address (`host:port`) this pool dials.
+    pub backend_addr: String,
+    /// Wire protocol name (e.g. `"postgres"`).
+    pub protocol: &'static str,
+    /// Current number of connections held by the pool.
+    pub size: usize,
+    /// Currently idle/available connections.
+    pub available: usize,
+    /// Configured max pool size.
+    pub max_size: usize,
+}
+
+/// Registry exposing per-backend/pool state for a future `SHOW SERVERS`.
+///
+/// Reads live through the existing [`PoolManager::status`] surface — it does
+/// not mirror or cache deadpool internals, so it can never drift from reality.
+pub struct ServerRegistry {
+    pool_managers: HashMap<String, Arc<PoolManager>>,
+}
+
+impl ServerRegistry {
+    /// Build a registry over the server's per-database pool managers.
+    pub fn new(pool_managers: HashMap<String, Arc<PoolManager>>) -> Self {
+        Self { pool_managers }
+    }
+
+    /// Live snapshot of every configured pool's status.
+    pub fn snapshot(&self) -> Vec<ServerPoolSnapshot> {
+        self.pool_managers
+            .iter()
+            .map(|(database, pm)| {
+                let status = pm.pool().status();
+                ServerPoolSnapshot {
+                    database: database.clone(),
+                    backend_addr: status.backend_addr,
+                    protocol: status.protocol,
+                    size: status.size,
+                    available: status.available,
+                    max_size: status.max_size,
+                }
+            })
+            .collect()
+    }
+
+    /// Whether any pools are configured (pooling may be disabled).
+    pub fn is_empty(&self) -> bool {
+        self.pool_managers.is_empty()
+    }
+}
+
+/// The shared operational state threaded into every admin connection.
+///
+/// Constructed once in [`ProxyServer::new`](super::ProxyServer); cloned as an
+/// `Arc` into each connection spawn and handed to
+/// [`AdminConsole::new`](crate::admin::AdminConsole). The concrete field set is
+/// the interface later WP-10 tasks depend on.
+pub struct AdminHandles {
+    /// Per-database pool managers (`"*"` is the default). Clone of the server's
+    /// map; used for `SHOW POOLS`/`SHOW SERVERS` and PAUSE/RESUME routing.
+    pub pool_managers: HashMap<String, Arc<PoolManager>>,
+    /// Sender for the config-reload channel (Task 4 RELOAD). Carried for now.
+    pub reload_sender: watch::Sender<()>,
+    /// Programmatic shutdown trigger. `run()` selects on a subscriber of this
+    /// alongside the OS signals, so a future admin SHUTDOWN (Task 5) can
+    /// initiate the same graceful drain. `send(true)` starts the drain.
+    pub shutdown_trigger: watch::Sender<bool>,
+    /// The effective configuration (Task 3 SHOW CONFIG).
+    pub config: Arc<Config>,
+    /// Live client-connection registry (Task 2 SHOW CLIENTS).
+    pub client_registry: Arc<ClientRegistry>,
+    /// Backend/pool registry (Task 2 SHOW SERVERS).
+    pub server_registry: Arc<ServerRegistry>,
+}
+
+impl AdminHandles {
+    /// Assemble the shared handles. Builds the client/server registries from
+    /// the supplied pool managers.
+    pub fn new(
+        config: Arc<Config>,
+        pool_managers: HashMap<String, Arc<PoolManager>>,
+        reload_sender: watch::Sender<()>,
+        shutdown_trigger: watch::Sender<bool>,
+    ) -> Arc<Self> {
+        let client_registry = Arc::new(ClientRegistry::new());
+        let server_registry = Arc::new(ServerRegistry::new(pool_managers.clone()));
+        Arc::new(Self {
+            pool_managers,
+            reload_sender,
+            shutdown_trigger,
+            config,
+            client_registry,
+            server_registry,
+        })
+    }
+
+    /// The default (`"*"`) pool manager, if pooling is enabled. Preserves the
+    /// pre-WP-10 `AdminConsole` behavior where the console operated on the
+    /// default pool.
+    pub fn default_pool_manager(&self) -> Option<Arc<PoolManager>> {
+        self.pool_managers.get("*").cloned()
+    }
+
+    /// Signal a programmatic graceful shutdown (Task 5 SHUTDOWN semantics).
+    ///
+    /// Returns `false` if `run()` is no longer listening (already shutting
+    /// down / receiver dropped).
+    pub fn trigger_shutdown(&self) -> bool {
+        self.shutdown_trigger.send(true).is_ok()
+    }
+
+    /// Minimal handles for unit/integration tests: default config, no pools,
+    /// throwaway reload/shutdown channels.
+    #[doc(hidden)]
+    pub fn for_test() -> Arc<Self> {
+        Self::for_test_with_config(Config::default())
+    }
+
+    /// Like [`Self::for_test`] but with a caller-supplied config (e.g. to set
+    /// `config.admin` for admin-handshake tests).
+    #[doc(hidden)]
+    pub fn for_test_with_config(config: Config) -> Arc<Self> {
+        let (reload_sender, _reload_rx) = watch::channel(());
+        let (shutdown_trigger, _shutdown_rx) = watch::channel(false);
+        Self::new(Arc::new(config), HashMap::new(), reload_sender, shutdown_trigger)
+    }
+}

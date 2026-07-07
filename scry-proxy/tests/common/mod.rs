@@ -217,6 +217,32 @@ pub async fn start_test_proxy_with_metrics(
     Ok((port, metrics))
 }
 
+/// Variant that also returns the shared [`AdminHandles`] so a test can inspect
+/// live registry state (client/server registries) or drive a programmatic
+/// shutdown. Grabs the handles before the server is moved into `run()`.
+pub async fn start_test_proxy_with_handles(
+    config: Config,
+    publisher: Arc<dyn EventPublisher>,
+) -> anyhow::Result<(u16, Arc<AdminHandles>)> {
+    let batcher = EventBatcher::new(
+        publisher,
+        config.publisher.batch_size,
+        config.publisher.flush_interval_ms,
+        config.publisher.max_queue_size,
+    );
+
+    let metrics = Arc::new(ProxyMetrics::new(100, HealthConfig::default()));
+    let server = ProxyServer::new(config.clone(), batcher, metrics).await?;
+    let port = server.local_addr()?.port();
+    let handles = server.admin_handles();
+
+    tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    Ok((port, handles))
+}
+
 /// All four pooling modes, for matrix loops.
 pub fn all_modes() -> [PoolingStrategy; 4] {
     [

@@ -5,6 +5,7 @@
 use scry::admin::{AdminCommand, AdminConsole, ADMIN_DATABASE};
 use scry::observability::{HealthConfig, ProxyMetrics};
 use scry::protocol::StartupMessage;
+use scry::proxy::AdminHandles;
 use std::sync::Arc;
 
 #[test]
@@ -42,7 +43,7 @@ fn test_startup_message_regular_database() {
 #[tokio::test]
 async fn test_admin_console_show_version() {
     let metrics = Arc::new(ProxyMetrics::new(100, HealthConfig::default()));
-    let admin = AdminConsole::new(None, metrics);
+    let admin = AdminConsole::new(AdminHandles::for_test(), metrics);
 
     let response = admin.execute("SHOW VERSION").await.unwrap();
 
@@ -61,7 +62,7 @@ async fn test_admin_console_show_version() {
 #[tokio::test]
 async fn test_admin_console_show_pools() {
     let metrics = Arc::new(ProxyMetrics::new(100, HealthConfig::default()));
-    let admin = AdminConsole::new(None, metrics);
+    let admin = AdminConsole::new(AdminHandles::for_test(), metrics);
 
     let response = admin.execute("SHOW POOLS").await.unwrap();
 
@@ -80,7 +81,7 @@ async fn test_admin_console_show_pools() {
 #[tokio::test]
 async fn test_admin_console_show_stats() {
     let metrics = Arc::new(ProxyMetrics::new(100, HealthConfig::default()));
-    let admin = AdminConsole::new(None, metrics);
+    let admin = AdminConsole::new(AdminHandles::for_test(), metrics);
 
     let response = admin.execute("SHOW STATS").await.unwrap();
 
@@ -99,7 +100,7 @@ async fn test_admin_console_show_stats() {
 #[tokio::test]
 async fn test_admin_console_show_databases() {
     let metrics = Arc::new(ProxyMetrics::new(100, HealthConfig::default()));
-    let admin = AdminConsole::new(None, metrics);
+    let admin = AdminConsole::new(AdminHandles::for_test(), metrics);
 
     let response = admin.execute("SHOW DATABASES").await.unwrap();
 
@@ -117,7 +118,7 @@ async fn test_admin_console_show_databases() {
 #[tokio::test]
 async fn test_admin_console_pause() {
     let metrics = Arc::new(ProxyMetrics::new(100, HealthConfig::default()));
-    let admin = AdminConsole::new(None, metrics);
+    let admin = AdminConsole::new(AdminHandles::for_test(), metrics);
 
     let response = admin.execute("PAUSE").await.unwrap();
 
@@ -132,7 +133,7 @@ async fn test_admin_console_pause() {
 #[tokio::test]
 async fn test_admin_console_resume() {
     let metrics = Arc::new(ProxyMetrics::new(100, HealthConfig::default()));
-    let admin = AdminConsole::new(None, metrics);
+    let admin = AdminConsole::new(AdminHandles::for_test(), metrics);
 
     let response = admin.execute("RESUME").await.unwrap();
 
@@ -147,7 +148,7 @@ async fn test_admin_console_resume() {
 #[tokio::test]
 async fn test_admin_console_reload() {
     let metrics = Arc::new(ProxyMetrics::new(100, HealthConfig::default()));
-    let admin = AdminConsole::new(None, metrics);
+    let admin = AdminConsole::new(AdminHandles::for_test(), metrics);
 
     let response = admin.execute("RELOAD").await.unwrap();
 
@@ -162,7 +163,7 @@ async fn test_admin_console_reload() {
 #[tokio::test]
 async fn test_admin_console_unknown_command() {
     let metrics = Arc::new(ProxyMetrics::new(100, HealthConfig::default()));
-    let admin = AdminConsole::new(None, metrics);
+    let admin = AdminConsole::new(AdminHandles::for_test(), metrics);
 
     // This should be parsed as unknown
     let response = admin.execute("SELECT * FROM users").await;

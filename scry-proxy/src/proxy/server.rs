@@ -1,9 +1,10 @@
 use super::{
-    ConnectionHandler, EventBatcher, PoolManager, PoolManagerConfig, TcpConnectionPool, WaitQueue,
+    AdminHandles, ClientEntry, ClientRegistry, ClientState, ConnectionHandler, EventBatcher,
+    PoolManager, PoolManagerConfig, TcpConnectionPool, WaitQueue,
 };
 use crate::admin::{AdminConsole, AdminResponse, ADMIN_DATABASE};
 use crate::auth::FileAuthenticator;
-use crate::config::{AdminConfig, AuthType, Config, DatabaseConfig, PoolingStrategy, TlsSslMode};
+use crate::config::{AuthType, Config, DatabaseConfig, PoolingStrategy, TlsSslMode};
 use crate::observability::ProxyMetrics;
 use crate::protocol::{
     build_auth_cleartext_password, build_auth_ok, build_error_response, parse_password_message,
@@ -26,16 +27,25 @@ use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
-/// RAII guard to decrement connection counter on drop
+/// RAII guard that brackets a connection's lifetime: decrements the active
+/// connection counter/metric AND removes the connection from the client
+/// registry on drop. Because it drops on *every* exit path (clean close,
+/// error, terminate, task abort), the registry can never hold a stale entry.
 struct ConnectionCountGuard {
     counter: Arc<AtomicUsize>,
     metrics: Arc<ProxyMetrics>,
+    /// Registry to deregister from on drop (WP-10, P4 §4.1).
+    client_registry: Arc<ClientRegistry>,
+    /// Connection id to remove from the registry. Deregistration is a no-op if
+    /// the connection was never registered (identity never became known).
+    conn_id: u64,
 }
 
 impl Drop for ConnectionCountGuard {
     fn drop(&mut self) {
         self.counter.fetch_sub(1, Ordering::Relaxed);
         self.metrics.decrement_active_connections();
+        self.client_registry.deregister(self.conn_id);
     }
 }
 
@@ -61,6 +71,10 @@ pub struct ProxyServer {
     reload_sender: watch::Sender<()>,
     /// Current active connection count (atomic for lock-free access)
     active_connections: Arc<AtomicUsize>,
+    /// Shared operational state threaded into every admin connection: pool
+    /// managers, reload/shutdown handles, config, and the client/server
+    /// registries (WP-10, P4 §4.1). Constructed once here in `new`.
+    admin_handles: Arc<AdminHandles>,
 }
 
 impl ProxyServer {
@@ -367,8 +381,24 @@ impl ProxyServer {
         // Create reload channel for SIGHUP config reload
         let (reload_sender, reload_trigger) = watch::channel(());
 
+        // Programmatic shutdown channel (WP-10, P4 §4.1). `run()` subscribes to
+        // this and drains alongside the OS signals; a future admin SHUTDOWN
+        // (Task 5) sends `true` on the sender carried by `AdminHandles`.
+        let (shutdown_trigger, _shutdown_seed_rx) = watch::channel(false);
+
+        // Build the shared admin handles once, from the pieces above. `Config`
+        // becomes `Arc`-shared so both the server and the handles point at the
+        // same instance.
+        let config = Arc::new(config);
+        let admin_handles = AdminHandles::new(
+            Arc::clone(&config),
+            pool_managers.clone(),
+            reload_sender.clone(),
+            shutdown_trigger,
+        );
+
         Ok(Self {
-            config: Arc::new(config),
+            config,
             listener,
             #[cfg(unix)]
             unix_listener,
@@ -381,6 +411,7 @@ impl ProxyServer {
             reload_trigger,
             reload_sender,
             active_connections: Arc::new(AtomicUsize::new(0)),
+            admin_handles,
         })
     }
 
@@ -436,6 +467,15 @@ impl ProxyServer {
     /// a config reload from external code (e.g., SIGHUP handler in main.rs).
     pub fn reload_sender(&self) -> watch::Sender<()> {
         self.reload_sender.clone()
+    }
+
+    /// Get the shared admin handles (pool managers, reload/shutdown triggers,
+    /// config, and the client/server registries).
+    ///
+    /// Exposed so callers (and tests) can inspect live registry state or wire a
+    /// programmatic shutdown, without owning the moved-into-`run` server.
+    pub fn admin_handles(&self) -> Arc<AdminHandles> {
+        Arc::clone(&self.admin_handles)
     }
 
     /// Get current active connection count
@@ -618,10 +658,17 @@ impl ProxyServer {
         let mut connection_count = 0u64;
         let mut connection_tasks = JoinSet::new();
 
+        // Programmatic shutdown trigger (WP-10, P4 §4.1): a future admin
+        // SHUTDOWN (Task 5) sends `true` here and `run()` drains via the same
+        // path as the OS signals. Subscribe before the shutdown future so we
+        // observe the transition even if it races startup.
+        let mut admin_shutdown = self.admin_handles.shutdown_trigger.subscribe();
+
         // Setup shutdown signal handling. Both SIGINT (Ctrl+C) and SIGTERM
         // (the signal orchestrators like Kubernetes/Docker send to stop a
-        // container) trigger the same graceful drain path (P3 §4.4).
-        let shutdown = async {
+        // container) trigger the same graceful drain path (P3 §4.4). The
+        // programmatic admin trigger is a third source of the same drain.
+        let shutdown = async move {
             #[cfg(unix)]
             {
                 use tokio::signal::unix::{signal, SignalKind};
@@ -629,8 +676,11 @@ impl ProxyServer {
                     Ok(s) => s,
                     Err(e) => {
                         error!(error = %e, "Failed to install SIGTERM handler");
-                        // Fall back to SIGINT-only so we still shut down cleanly.
-                        let _ = tokio::signal::ctrl_c().await;
+                        // Fall back to SIGINT/admin-only so we still shut down cleanly.
+                        tokio::select! {
+                            _ = tokio::signal::ctrl_c() => {}
+                            _ = admin_shutdown.changed() => {}
+                        }
                         return;
                     }
                 };
@@ -642,13 +692,21 @@ impl ProxyServer {
                     _ = sigterm.recv() => {
                         info!("Received SIGTERM; starting graceful shutdown");
                     }
+                    _ = admin_shutdown.changed() => {
+                        info!("Received programmatic admin shutdown request; starting graceful shutdown");
+                    }
                 }
             }
             #[cfg(not(unix))]
             {
-                match tokio::signal::ctrl_c().await {
-                    Ok(()) => info!("Received Ctrl+C signal; starting graceful shutdown"),
-                    Err(e) => error!(error = %e, "Failed to listen for Ctrl+C signal"),
+                tokio::select! {
+                    r = tokio::signal::ctrl_c() => match r {
+                        Ok(()) => info!("Received Ctrl+C signal; starting graceful shutdown"),
+                        Err(e) => error!(error = %e, "Failed to listen for Ctrl+C signal"),
+                    },
+                    _ = admin_shutdown.changed() => {
+                        info!("Received programmatic admin shutdown request; starting graceful shutdown");
+                    }
                 }
             }
         };
@@ -978,6 +1036,7 @@ impl ProxyServer {
         // Read current authenticator from RwLock (allows hot-reload via SIGHUP)
         let authenticator = self.authenticator_read().clone();
         let active_connections = Arc::clone(&self.active_connections);
+        let admin_handles = Arc::clone(&self.admin_handles);
 
         // Increment connection counter BEFORE spawning
         active_connections.fetch_add(1, Ordering::Relaxed);
@@ -985,28 +1044,34 @@ impl ProxyServer {
         metrics.increment_active_connections();
 
         connection_tasks.spawn(async move {
-            // Ensure counter is decremented on exit (drop guard pattern)
-            let _guard =
-                ConnectionCountGuard { counter: active_connections, metrics: Arc::clone(&metrics) };
-            // Handle SSL startup handshake
-            let (transport, startup_data) =
+            // Ensure counter is decremented AND the registry entry (if any) is
+            // removed on every exit path (drop guard pattern).
+            let _guard = ConnectionCountGuard {
+                counter: active_connections,
+                metrics: Arc::clone(&metrics),
+                client_registry: Arc::clone(&admin_handles.client_registry),
+                conn_id,
+            };
+            // Handle SSL startup handshake. `tls` captures whether the transport
+            // was upgraded (previously discarded) so the registry can record it.
+            let (transport, startup_data, tls) =
                 match handle_ssl_startup(client_stream, &config.tls.client_tls_sslmode, tls_config)
                     .await
                 {
                     Ok(SslStartupResult::Upgraded(transport)) => {
                         info!(connection_id = conn_id, "Connection upgraded to TLS");
-                        (transport, Vec::new())
+                        (transport, Vec::new(), true)
                     }
                     Ok(SslStartupResult::Declined(stream, startup_data)) => {
                         debug!(connection_id = conn_id, "SSL declined, continuing with plain TCP");
-                        (ClientTransport::Plain(stream), startup_data)
+                        (ClientTransport::Plain(stream), startup_data, false)
                     }
                     Ok(SslStartupResult::NoSslRequest(stream, startup_data)) => {
                         debug!(
                             connection_id = conn_id,
                             "No SSL request, continuing with plain TCP"
                         );
-                        (ClientTransport::Plain(stream), startup_data)
+                        (ClientTransport::Plain(stream), startup_data, false)
                     }
                     Ok(SslStartupResult::Rejected) => {
                         // TLS downgrade attempt under a require/verify-* sslmode.
@@ -1034,6 +1099,8 @@ impl ProxyServer {
                 metrics,
                 startup_data,
                 authenticator,
+                admin_handles,
+                tls,
             )
             .await;
         });
@@ -1054,6 +1121,7 @@ impl ProxyServer {
         // Read current authenticator from RwLock (allows hot-reload via SIGHUP)
         let authenticator = self.authenticator_read().clone();
         let active_connections = Arc::clone(&self.active_connections);
+        let admin_handles = Arc::clone(&self.admin_handles);
 
         // Increment connection counter BEFORE spawning
         active_connections.fetch_add(1, Ordering::Relaxed);
@@ -1061,14 +1129,19 @@ impl ProxyServer {
         metrics.increment_active_connections();
 
         connection_tasks.spawn(async move {
-            // Ensure counter is decremented on exit (drop guard pattern)
-            let _guard =
-                ConnectionCountGuard { counter: active_connections, metrics: Arc::clone(&metrics) };
+            // Ensure counter is decremented AND the registry entry (if any) is
+            // removed on every exit path (drop guard pattern).
+            let _guard = ConnectionCountGuard {
+                counter: active_connections,
+                metrics: Arc::clone(&metrics),
+                client_registry: Arc::clone(&admin_handles.client_registry),
+                conn_id,
+            };
             // UNIX sockets don't use SSL, so wrap directly
             let transport = ClientTransport::Unix(client_stream);
 
             // For UNIX sockets, we need to read the startup message directly
-            // since there's no SSL handshake
+            // since there's no SSL handshake. UNIX transports are never TLS.
             Self::handle_client_connection(
                 transport,
                 None, // No socket address for UNIX sockets
@@ -1079,6 +1152,8 @@ impl ProxyServer {
                 metrics,
                 Vec::new(), // Startup data will be read by connection handler
                 authenticator,
+                admin_handles,
+                false, // UNIX sockets are not TLS-upgraded
             )
             .await;
         });
@@ -1096,21 +1171,43 @@ impl ProxyServer {
         metrics: Arc<ProxyMetrics>,
         startup_data: Vec<u8>,
         authenticator: Option<Arc<FileAuthenticator>>,
+        admin_handles: Arc<AdminHandles>,
+        tls: bool,
     ) {
         let addr_str = client_addr.map(|a| a.to_string()).unwrap_or_else(|| "unix".to_string());
 
-        // Parse startup message to get database name and check for admin
-        let (database_name, is_admin) = if !startup_data.is_empty() {
+        // Parse startup message to get user/database and check for admin. UNIX
+        // sockets deliver an empty `startup_data` here (their startup is read
+        // later by the connection handler), so their identity fields stay empty
+        // for 1.0 — a documented limitation, not false state.
+        let (database_name, user_name, is_admin) = if !startup_data.is_empty() {
             if let Some(startup) = StartupMessage::parse(&startup_data) {
                 let db = startup.database().map(|s| s.to_string());
+                let user = startup.user().map(|s| s.to_string());
                 let is_admin = db.as_ref().is_some_and(|d| d.eq_ignore_ascii_case(ADMIN_DATABASE));
-                (db, is_admin)
+                (db, user, is_admin)
             } else {
-                (None, false)
+                (None, None, false)
             }
         } else {
-            (None, false)
+            (None, None, false)
         };
+
+        // Register this connection in the client registry now that its identity
+        // is known (WP-10, P4 §4.1). O(1) bookkeeping, off the per-query hot
+        // path. Admin clients are registered too (PgBouncer lists them),
+        // distinguished by `ClientState::Admin`. The `ConnectionCountGuard` in
+        // the spawn closure removes this entry on every exit path.
+        admin_handles.client_registry.register(ClientEntry {
+            conn_id,
+            addr: addr_str.clone(),
+            user: user_name.clone().unwrap_or_default(),
+            database: database_name.clone().unwrap_or_default(),
+            state: if is_admin { ClientState::Admin } else { ClientState::Active },
+            connect_time: std::time::Instant::now(),
+            last_request_time: std::time::Instant::now(),
+            tls,
+        });
 
         // Select the appropriate pool manager for this database
         let pool_manager = database_name
@@ -1135,9 +1232,7 @@ impl ProxyServer {
                 "Routing to admin console"
             );
 
-            if let Err(e) =
-                handle_admin_connection(transport, pool_manager, metrics, &config.admin).await
-            {
+            if let Err(e) = handle_admin_connection(transport, admin_handles, metrics).await {
                 error!(
                     connection_id = conn_id,
                     client_addr = %addr_str,
@@ -1200,10 +1295,10 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// which provides administrative commands for monitoring and controlling the proxy.
 async fn handle_admin_connection(
     mut client: ClientTransport,
-    pool_manager: Option<Arc<PoolManager>>,
+    admin_handles: Arc<AdminHandles>,
     metrics: Arc<ProxyMetrics>,
-    admin: &AdminConfig,
 ) -> Result<()> {
+    let admin = &admin_handles.config.admin;
     // Fail closed (P1 §4.6): the admin console is refused unless it has been
     // explicitly enabled AND an admin password is configured. Without this the
     // virtual `pgbouncer` database was an unauthenticated control channel.
@@ -1252,7 +1347,7 @@ async fn handle_admin_connection(
     let ready_for_query = [b'Z', 0, 0, 0, 5, b'I'];
     client.write_all(&ready_for_query).await.context("Failed to send ReadyForQuery")?;
 
-    let admin = AdminConsole::new(pool_manager, metrics);
+    let admin = AdminConsole::new(admin_handles, metrics);
     let mut buffer = vec![0u8; 8192];
 
     loop {
@@ -1302,7 +1397,7 @@ async fn handle_admin_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AuthType, Config};
+    use crate::config::{AdminConfig, AuthType, Config};
     use crate::observability::{HealthConfig, ProxyMetrics};
     use crate::proxy::EventBatcher;
     use crate::publisher::DebugLoggerPublisher;
@@ -1337,10 +1432,16 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let metrics = Arc::new(ProxyMetrics::new(100, HealthConfig::default()));
 
+        // Build minimal AdminHandles whose config carries the test's admin
+        // settings (handle_admin_connection reads config.admin for the gate).
+        let mut cfg = Config::default();
+        cfg.admin = admin;
+        let handles = AdminHandles::for_test_with_config(cfg);
+
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let transport = ClientTransport::Plain(stream);
-            let _ = handle_admin_connection(transport, None, metrics, &admin).await;
+            let _ = handle_admin_connection(transport, handles, metrics).await;
         });
 
         let mut client = TcpStream::connect(addr).await.unwrap();

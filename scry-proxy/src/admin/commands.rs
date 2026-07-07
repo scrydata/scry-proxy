@@ -4,7 +4,7 @@
 
 use super::response::AdminResponse;
 use crate::observability::ProxyMetrics;
-use crate::proxy::PoolManager;
+use crate::proxy::{AdminHandles, PoolManager};
 use anyhow::Result;
 use std::sync::Arc;
 
@@ -84,14 +84,26 @@ impl AdminCommand {
 
 /// Admin console for handling administrative commands
 pub struct AdminConsole {
+    /// Shared operational state: pool managers, reload/shutdown triggers,
+    /// config, and the client/server registries (WP-10, P4 §4.1). Tasks 2–5
+    /// read control/report surfaces from here.
+    #[allow(dead_code)]
+    handles: Arc<AdminHandles>,
+    /// Convenience handle to the default (`"*"`) pool, derived from `handles`.
+    /// Preserves the pre-WP-10 `SHOW POOLS` behavior, which operated on the
+    /// default pool. Kept as a field so existing command code is unchanged.
     pool_manager: Option<Arc<PoolManager>>,
     metrics: Arc<ProxyMetrics>,
 }
 
 impl AdminConsole {
-    /// Create a new admin console
-    pub fn new(pool_manager: Option<Arc<PoolManager>>, metrics: Arc<ProxyMetrics>) -> Self {
-        Self { pool_manager, metrics }
+    /// Create a new admin console from the shared [`AdminHandles`] and metrics.
+    ///
+    /// This is the interface WP-10 Tasks 2–5 depend on: the console reads all
+    /// report/control state through `handles` (plus `metrics` for SHOW STATS).
+    pub fn new(handles: Arc<AdminHandles>, metrics: Arc<ProxyMetrics>) -> Self {
+        let pool_manager = handles.default_pool_manager();
+        Self { handles, pool_manager, metrics }
     }
 
     /// Check if an SQL command is an admin command
