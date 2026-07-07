@@ -223,6 +223,34 @@ async fn extended_protocol_matrix_all_modes() {
             });
         }
 
+        // 6. LISTEN/UNLISTEN via extended protocol (WP-9 Task 5, P2 §4.3):
+        // outcome equivalence for every mode (the command itself must
+        // execute identically direct vs. proxied), plus — Hybrid-only, same
+        // shape as check 5 above — a positive proof that the typed
+        // `PinReason::Listen` keeps the connection from being recycled out
+        // from under an active registration. `UNLISTEN *` cleans up so the
+        // registration doesn't outlive this block on either client.
+        {
+            let d = run_extended(&direct, "LISTEN wp9_ext_listen_probe").await;
+            let p = run_extended(&proxy, "LISTEN wp9_ext_listen_probe").await;
+            assert_outcomes_equivalent(&d, &p, &format!("[{mode:?}] extended LISTEN"));
+            let _ = run_extended(&direct, "UNLISTEN *").await;
+            let _ = run_extended(&proxy, "UNLISTEN *").await;
+        }
+
+        if mode == scry::config::PoolingStrategy::Hybrid {
+            assert_listen_survives_hybrid_recycle(
+                &proxy,
+                proxy_port,
+                "postgres",
+                "postgres",
+                "postgres",
+                "wp9_ext_listen_hybrid_probe",
+            )
+            .await
+            .unwrap_or_else(|e| panic!("[{mode:?}] Hybrid LISTEN pin check failed: {e}"));
+        }
+
         println!("=== extended-protocol matrix: pooling mode {mode:?} OK ===");
     }
 }

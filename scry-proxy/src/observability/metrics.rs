@@ -389,6 +389,7 @@ pub struct PoolMetrics {
     pin_temp_table: AtomicU64,
     pin_cursor: AtomicU64,
     pin_advisory_lock: AtomicU64,
+    pin_listen: AtomicU64,
     pin_unknown_command: AtomicU64,
 
     // Wait time histogram (microseconds)
@@ -410,6 +411,7 @@ impl PoolMetrics {
             pin_temp_table: AtomicU64::new(0),
             pin_cursor: AtomicU64::new(0),
             pin_advisory_lock: AtomicU64::new(0),
+            pin_listen: AtomicU64::new(0),
             pin_unknown_command: AtomicU64::new(0),
             // HDR histogram: 3 significant figures, up to 1 hour in microseconds
             wait_histogram: RwLock::new(
@@ -450,6 +452,9 @@ impl PoolMetrics {
             }
             PinReason::AdvisoryLock => {
                 self.pin_advisory_lock.fetch_add(1, Ordering::Relaxed);
+            }
+            PinReason::Listen => {
+                self.pin_listen.fetch_add(1, Ordering::Relaxed);
             }
             PinReason::UnknownCommand => {
                 self.pin_unknown_command.fetch_add(1, Ordering::Relaxed);
@@ -519,6 +524,7 @@ impl PoolMetrics {
             temp_table: self.pin_temp_table.load(Ordering::Relaxed),
             cursor: self.pin_cursor.load(Ordering::Relaxed),
             advisory_lock: self.pin_advisory_lock.load(Ordering::Relaxed),
+            listen: self.pin_listen.load(Ordering::Relaxed),
             unknown_command: self.pin_unknown_command.load(Ordering::Relaxed),
         }
     }
@@ -613,6 +619,7 @@ pub struct PinReasonCounts {
     pub temp_table: u64,
     pub cursor: u64,
     pub advisory_lock: u64,
+    pub listen: u64,
     pub unknown_command: u64,
 }
 

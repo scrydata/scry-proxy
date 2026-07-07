@@ -491,6 +491,77 @@ pub async fn assert_extended_state_survives_hybrid_recycle(
     Ok(())
 }
 
+/// Hybrid-mode-only proof (WP-9 Task 5, P2 §4.3) that a `LISTEN` registration
+/// pins its connection: the mirror of [`assert_extended_state_survives_hybrid_recycle`]
+/// above, but for `PinReason::Listen` instead of `PinReason::SessionVariable`.
+///
+/// There's no `SHOW`-able GUC for "am I still listening" the way there is for a
+/// session variable, so this uses Postgres's own `pg_listening_channels()` builtin
+/// (returns the set of channels the *current backend session* is subscribed to) as
+/// the observable signal in exactly the same two-part shape Task 4 used:
+///   (a) on the SAME proxy client, after enough further activity that an unpinned
+///       connection would already have been released and recycled, `channel` must
+///       still appear in `pg_listening_channels()` — proof the backend wasn't
+///       swapped out from under the LISTEN.
+///   (b) a FRESH client against the same pooled proxy port must NOT see `channel` —
+///       proof the registration didn't leak onto some other pooled session.
+///
+/// As with Task 4, `LISTEN` is sent via the EXTENDED protocol (`.execute()`) —
+/// wrapped in a simple-query `BEGIN`/`DEALLOCATE ALL`/`COMMIT` for the same isolation
+/// reason documented on `assert_extended_state_survives_hybrid_recycle`: only an
+/// explicit transaction boundary makes `connection.rs` evaluate
+/// `should_release_connection` at all (autocommit statements never trigger a release
+/// check — see the comment in `connection.rs` near `just_finished_transaction`), and
+/// `DEALLOCATE ALL` strips the incidental `PreparedStatement` pin that every `Parse`
+/// adds, so the only pin left standing when the release check runs is the one this
+/// task added: `PinReason::Listen`.
+///
+/// Note this can only meaningfully prove non-recycle in Hybrid mode. Under strict
+/// Transaction pooling, `should_release_connection` unconditionally returns `true`
+/// regardless of any pin (`PoolingStrategy::Transaction => true`) — matching real
+/// PgBouncer transaction-pooling mode, where LISTEN/NOTIFY is documented as
+/// unsupported across an explicit transaction boundary. So this assertion is
+/// intentionally Hybrid-only; asserting it under Transaction mode would fail not
+/// because Listen pinning is broken, but because Transaction mode deliberately never
+/// honors pins at all.
+pub async fn assert_listen_survives_hybrid_recycle(
+    proxy: &Client,
+    proxy_port: u16,
+    user: &str,
+    password: &str,
+    dbname: &str,
+    channel: &str,
+) -> anyhow::Result<()> {
+    proxy.simple_query("BEGIN").await?;
+    proxy.execute(&format!("LISTEN {channel}"), &[]).await?; // EXTENDED protocol — the thing under test
+    proxy.simple_query("DEALLOCATE ALL").await?; // strips the incidental PreparedStatement pin only
+    proxy.simple_query("COMMIT").await?; // transaction completes -> Hybrid release check runs
+
+    // Enough further activity that an un-pinned connection would already
+    // have been released back to the pool (and DISCARD-ALL reset) by now.
+    for _ in 0..5 {
+        proxy.simple_query("SELECT 1").await?;
+    }
+
+    let rows = proxy.query("SELECT pg_listening_channels()", &[]).await?;
+    let channels: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
+    anyhow::ensure!(
+        channels.iter().any(|c| c == channel),
+        "LISTEN registration was lost on the SAME client — Hybrid mode recycled the connection \
+         instead of pinning it (expected '{channel}' among {channels:?})"
+    );
+
+    let fresh = connect_client("127.0.0.1", proxy_port, user, password, dbname).await?;
+    let fresh_rows = fresh.query("SELECT pg_listening_channels()", &[]).await?;
+    let fresh_channels: Vec<String> = fresh_rows.iter().map(|r| r.get(0)).collect();
+    anyhow::ensure!(
+        !fresh_channels.iter().any(|c| c == channel),
+        "LISTEN registration leaked to a fresh pooled client (found '{channel}' among {fresh_channels:?})"
+    );
+
+    Ok(())
+}
+
 /// The comparator: asserts that the direct and proxied outcomes of the same
 /// operation are equivalent — same rows (values + column names/count), same
 /// command tag / rows-affected, and (for errors) the same SQLSTATE code.

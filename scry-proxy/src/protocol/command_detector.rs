@@ -27,6 +27,15 @@ pub enum DetectedCommand {
     Deallocate { name: String },
     /// DEALLOCATE ALL
     DeallocateAll,
+    /// LISTEN channel — registers an async-notification subscription that
+    /// must stay bound to this specific backend connection (P2 §4.3).
+    Listen { channel: String },
+    /// UNLISTEN channel, or UNLISTEN * (`channel: None`)
+    Unlisten { channel: Option<String> },
+    /// NOTIFY channel [, payload] — detected for attribution only; a bare
+    /// NOTIFY does not itself register a subscription, so it never pins (see
+    /// `ConnectionState::apply_query`).
+    Notify { channel: String, payload: Option<String> },
 }
 
 /// Multiplexing-safety classification of a client command (P2 §4.1).
@@ -162,6 +171,21 @@ impl CommandDetector {
             return Self::parse_deallocate(sql_trimmed);
         }
 
+        // LISTEN channel
+        if sql_upper.starts_with("LISTEN ") {
+            return Self::parse_listen(sql_trimmed);
+        }
+
+        // UNLISTEN channel / UNLISTEN *
+        if sql_upper.starts_with("UNLISTEN ") || sql_upper == "UNLISTEN" {
+            return Self::parse_unlisten(sql_trimmed);
+        }
+
+        // NOTIFY channel [, payload]
+        if sql_upper.starts_with("NOTIFY ") {
+            return Self::parse_notify(sql_trimmed);
+        }
+
         // pg_advisory_lock
         if sql_upper.contains("PG_ADVISORY_LOCK") && !sql_upper.contains("PG_ADVISORY_UNLOCK") {
             return Some(DetectedCommand::AdvisoryLock { key: Self::extract_lock_key(&sql_upper) });
@@ -283,6 +307,41 @@ impl CommandDetector {
         } else {
             Some(DetectedCommand::Deallocate { name: rest.split_whitespace().next()?.to_string() })
         }
+    }
+
+    fn parse_listen(sql: &str) -> Option<DetectedCommand> {
+        // We know sql starts with "LISTEN " (case-insensitive) from detect().
+        let rest = sql.get(7..)?.trim();
+        let channel = rest.split_whitespace().next()?.trim_matches('"').to_string();
+        Some(DetectedCommand::Listen { channel })
+    }
+
+    fn parse_unlisten(sql: &str) -> Option<DetectedCommand> {
+        // We know sql starts with "UNLISTEN" (case-insensitive) from detect().
+        let rest = sql.get(8..).unwrap_or("").trim();
+
+        if rest.is_empty() || rest == "*" {
+            Some(DetectedCommand::Unlisten { channel: None })
+        } else {
+            let channel = rest.split_whitespace().next()?.trim_matches('"').to_string();
+            Some(DetectedCommand::Unlisten { channel: Some(channel) })
+        }
+    }
+
+    fn parse_notify(sql: &str) -> Option<DetectedCommand> {
+        // We know sql starts with "NOTIFY " (case-insensitive) from detect().
+        let rest = sql.get(7..)?.trim();
+
+        let (channel_part, payload) = match rest.find(',') {
+            Some(idx) => {
+                let payload = rest[idx + 1..].trim().trim_matches('\'').to_string();
+                (&rest[..idx], Some(payload))
+            }
+            None => (rest, None),
+        };
+
+        let channel = channel_part.trim().trim_matches('"').to_string();
+        Some(DetectedCommand::Notify { channel, payload })
     }
 
     fn extract_lock_key(sql: &str) -> Option<i64> {
@@ -431,5 +490,54 @@ mod tests {
     fn test_insert_no_detection() {
         let result = CommandDetector::detect("INSERT INTO users (name) VALUES ('test')");
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_detect_listen() {
+        let result = CommandDetector::detect("LISTEN scry_chan");
+        assert!(matches!(result, Some(DetectedCommand::Listen { channel })
+            if channel == "scry_chan"));
+    }
+
+    #[test]
+    fn test_detect_listen_mixed_case() {
+        let result = CommandDetector::detect("Listen scry_chan");
+        assert!(matches!(result, Some(DetectedCommand::Listen { channel })
+            if channel == "scry_chan"));
+    }
+
+    #[test]
+    fn test_detect_unlisten_channel() {
+        let result = CommandDetector::detect("UNLISTEN scry_chan");
+        assert!(matches!(result, Some(DetectedCommand::Unlisten { channel: Some(channel) })
+            if channel == "scry_chan"));
+    }
+
+    #[test]
+    fn test_detect_unlisten_all() {
+        let result = CommandDetector::detect("UNLISTEN *");
+        assert!(matches!(result, Some(DetectedCommand::Unlisten { channel: None })));
+    }
+
+    #[test]
+    fn test_detect_notify_bare() {
+        let result = CommandDetector::detect("NOTIFY scry_chan");
+        assert!(matches!(result, Some(DetectedCommand::Notify { channel, payload: None })
+            if channel == "scry_chan"));
+    }
+
+    #[test]
+    fn test_detect_notify_with_payload() {
+        let result = CommandDetector::detect("NOTIFY scry_chan, 'payload-42'");
+        assert!(matches!(result, Some(DetectedCommand::Notify { channel, payload: Some(payload) })
+            if channel == "scry_chan" && payload == "payload-42"));
+    }
+
+    #[test]
+    fn test_listen_is_stateful_via_classify() {
+        assert!(matches!(
+            CommandDetector::classify("LISTEN scry_chan"),
+            CommandClass::Stateful(DetectedCommand::Listen { .. })
+        ));
     }
 }

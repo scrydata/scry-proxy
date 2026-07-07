@@ -10,6 +10,12 @@ pub enum PinReason {
     TempTable,
     Cursor,
     AdvisoryLock,
+    /// An active `LISTEN` registration exists on this connection (P2 §4.3).
+    /// Non-replayable: there is no way to re-establish the exact set of
+    /// channel subscriptions on a different backend connection without
+    /// risking a missed notification in the gap, so the connection must stay
+    /// pinned for as long as any registration is active.
+    Listen,
     /// A command that could not be positively classified as safe to multiplex
     /// was observed (P2 §4.1). Fail closed: pin, because we cannot prove the
     /// connection is clean.
@@ -24,6 +30,7 @@ impl PinReason {
             PinReason::TempTable
                 | PinReason::Cursor
                 | PinReason::AdvisoryLock
+                | PinReason::Listen
                 | PinReason::UnknownCommand
         )
     }
@@ -57,6 +64,12 @@ pub struct ConnectionState {
     cursors: HashSet<String>,
     /// Advisory locks held
     advisory_locks: HashSet<i64>,
+    /// Active LISTEN channel registrations (P2 §4.3). Tracked as a set (not a
+    /// single flag) so `UNLISTEN <chan>` can precisely drop one registration
+    /// while leaving the pin in place if other channels are still active —
+    /// mirroring how `temp_tables`/`cursors` are tracked, rather than
+    /// conservatively over-pinning until `UNLISTEN *`/`DISCARD ALL`.
+    listen_channels: HashSet<String>,
     /// A command that could not be positively classified as clean was seen, so
     /// the connection must stay pinned (fail closed, P2 §4.1).
     unknown_command: bool,
@@ -73,6 +86,7 @@ impl ConnectionState {
             temp_tables: HashSet::new(),
             cursors: HashSet::new(),
             advisory_locks: HashSet::new(),
+            listen_channels: HashSet::new(),
             unknown_command: false,
             max_prepared_statements,
         }
@@ -86,6 +100,7 @@ impl ConnectionState {
             || !self.temp_tables.is_empty()
             || !self.cursors.is_empty()
             || !self.advisory_locks.is_empty()
+            || !self.listen_channels.is_empty()
     }
 
     /// Check if connection has unsafe state that cannot be replayed
@@ -94,6 +109,7 @@ impl ConnectionState {
             || !self.temp_tables.is_empty()
             || !self.cursors.is_empty()
             || !self.advisory_locks.is_empty()
+            || !self.listen_channels.is_empty()
     }
 
     /// Record that a command which could not be positively classified as clean
@@ -132,6 +148,18 @@ impl ConnectionState {
                 DetectedCommand::DiscardAll => self.clear_all(),
                 DetectedCommand::Deallocate { name } => self.remove_prepared_statement(&name),
                 DetectedCommand::DeallocateAll => self.clear_prepared_statements(),
+                DetectedCommand::Listen { channel } => self.add_listen_channel(channel),
+                DetectedCommand::Unlisten { channel } => match channel {
+                    Some(name) => self.remove_listen_channel(&name),
+                    None => self.clear_listen_channels(),
+                },
+                // NOTIFY is fire-and-forget: it never registers a
+                // subscription on this connection, so — unlike LISTEN — it
+                // must not pin. It is still classified (not folded into
+                // `is_known_clean`) purely so callers can identify/attribute
+                // it as a NOTIFY if needed; the classification itself is a
+                // no-op against `ConnectionState`.
+                DetectedCommand::Notify { .. } => {}
             },
         }
     }
@@ -153,6 +181,9 @@ impl ConnectionState {
         }
         if !self.advisory_locks.is_empty() {
             reasons.insert(PinReason::AdvisoryLock);
+        }
+        if !self.listen_channels.is_empty() {
+            reasons.insert(PinReason::Listen);
         }
         if self.unknown_command {
             reasons.insert(PinReason::UnknownCommand);
@@ -214,6 +245,19 @@ impl ConnectionState {
         self.advisory_locks.remove(&key);
     }
 
+    // LISTEN/NOTIFY channel registrations
+    pub fn add_listen_channel(&mut self, channel: String) {
+        self.listen_channels.insert(channel);
+    }
+
+    pub fn remove_listen_channel(&mut self, channel: &str) {
+        self.listen_channels.remove(channel);
+    }
+
+    pub fn clear_listen_channels(&mut self) {
+        self.listen_channels.clear();
+    }
+
     /// Get state that can be replayed on reconnection
     pub fn get_replayable_state(&self) -> ReplayableState {
         ReplayableState {
@@ -237,6 +281,7 @@ impl ConnectionState {
         self.temp_tables.clear();
         self.cursors.clear();
         self.advisory_locks.clear();
+        self.listen_channels.clear();
         // DISCARD ALL resets the session, so a prior unknown command no longer
         // keeps the connection pinned.
         self.unknown_command = false;
@@ -445,5 +490,88 @@ mod tests {
         state.remove_advisory_lock(99999);
 
         assert!(!state.is_pinned());
+    }
+
+    // -- LISTEN/NOTIFY (WP-9 Task 5, P2 §4.3) --------------------------------
+
+    #[test]
+    fn test_apply_query_listen_pins_typed_reason() {
+        let mut state = ConnectionState::new(1000);
+        state.apply_query("LISTEN foo");
+
+        assert!(state.is_pinned());
+        assert!(state.has_unsafe_state());
+        assert!(state.pin_reasons().contains(&PinReason::Listen));
+        // Fail-closed guarantee: typed classification must not be LESS pinned
+        // than the old blanket Unknown fallback.
+        assert!(!state.pin_reasons().contains(&PinReason::UnknownCommand));
+    }
+
+    #[test]
+    fn test_apply_query_unlisten_star_clears_listen_pin() {
+        let mut state = ConnectionState::new(1000);
+        state.apply_query("LISTEN foo");
+        state.apply_query("LISTEN bar");
+        state.apply_query("UNLISTEN *");
+
+        assert!(!state.pin_reasons().contains(&PinReason::Listen));
+        assert!(!state.is_pinned());
+    }
+
+    #[test]
+    fn test_apply_query_unlisten_specific_channel() {
+        let mut state = ConnectionState::new(1000);
+        state.apply_query("LISTEN foo");
+        state.apply_query("LISTEN bar");
+        state.apply_query("UNLISTEN foo");
+
+        // "bar" is still an active registration, so the Listen pin remains.
+        assert!(state.pin_reasons().contains(&PinReason::Listen));
+
+        state.apply_query("UNLISTEN bar");
+        assert!(!state.pin_reasons().contains(&PinReason::Listen));
+        assert!(!state.is_pinned());
+    }
+
+    #[test]
+    fn test_apply_query_discard_all_clears_listen_pin() {
+        let mut state = ConnectionState::new(1000);
+        state.apply_query("LISTEN foo");
+        state.apply_query("DISCARD ALL");
+
+        assert!(!state.pin_reasons().contains(&PinReason::Listen));
+        assert!(!state.is_pinned());
+    }
+
+    #[test]
+    fn test_clear_all_clears_listen_pin() {
+        let mut state = ConnectionState::new(1000);
+        state.apply_query("LISTEN foo");
+        state.clear_all();
+
+        assert!(!state.pin_reasons().contains(&PinReason::Listen));
+        assert!(!state.is_pinned());
+    }
+
+    #[test]
+    fn test_apply_query_bare_notify_does_not_pin() {
+        let mut state = ConnectionState::new(1000);
+        state.apply_query("NOTIFY foo");
+
+        assert!(!state.is_pinned());
+        assert!(state.pin_reasons().is_empty());
+    }
+
+    #[test]
+    fn test_apply_query_notify_with_payload_does_not_pin() {
+        let mut state = ConnectionState::new(1000);
+        state.apply_query("NOTIFY foo, 'payload-42'");
+
+        assert!(!state.is_pinned());
+    }
+
+    #[test]
+    fn test_pin_reason_listen_is_unsafe() {
+        assert!(PinReason::Listen.is_unsafe());
     }
 }
