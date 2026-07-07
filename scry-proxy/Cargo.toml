@@ -74,7 +74,6 @@ indexmap = "2.7"
 # TLS support
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
 webpki-roots = { workspace = true }
 
 # Authentication
