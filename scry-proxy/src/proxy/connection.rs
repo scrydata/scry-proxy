@@ -248,6 +248,37 @@ impl ConnectionHandler {
         }
     }
 
+    /// Classifies the SQL carried by a `Parse` message and applies the
+    /// resulting session-state pin to `conn_state`, then records the
+    /// prepared statement for the pin tracker (WP-9 Task 4, P2 §4.2).
+    ///
+    /// This is the exact sequence the `Message::Parse` arm performs so that
+    /// a stateful statement (`SET` / temp table / cursor / advisory lock /
+    /// `DISCARD` / `DEALLOCATE`) issued via the EXTENDED protocol
+    /// (Parse/Bind/Execute — what every modern driver, including
+    /// `tokio_postgres`'s own `.query()`/`.execute()`, actually uses) pins
+    /// the connection exactly as it would via the simple `Query` protocol.
+    /// Classification reuses [`ConnectionState::apply_query`] — the *same*
+    /// call the simple-`Query` arm makes — so there is a single classifier
+    /// call site shared by both protocols; nothing here duplicates
+    /// `CommandDetector`'s match.
+    ///
+    /// Called once per `Parse` (statement definition), not per `Bind`/
+    /// `Execute` — `Bind`/`Execute` carry no SQL text, only a statement/
+    /// portal name, so classification must happen here. Re-`Parse`ing the
+    /// same statement name is idempotent: `apply_query` and
+    /// `add_prepared_statement` both route through sets/maps keyed by name/
+    /// value that already dedupe.
+    fn apply_parse_state(
+        conn_state: &mut ConnectionState,
+        name: &str,
+        query: &str,
+        param_oids: &[u32],
+    ) {
+        conn_state.apply_query(query);
+        conn_state.add_prepared_statement(name.to_string(), query.to_string(), param_oids.to_vec());
+    }
+
     // Query-event construction now lives on `AnonymizationSettings`
     // (see below): it resolves the query text, params, and error under the
     // fail-closed anonymization policy so no call site can accidentally ship
@@ -670,11 +701,7 @@ impl ConnectionHandler {
                                             started_at: Instant::now(),
                                         });
 
-                                        conn_state.add_prepared_statement(
-                                            name.clone(),
-                                            query.clone(),
-                                            param_oids.clone(),
-                                        );
+                                        Self::apply_parse_state(&mut conn_state, name, query, param_oids);
                                     }
                                     Message::Bind { portal, statement, format_codes, params_raw } => {
                                         let (query, params, incomplete) = match stmt_cache.get_statement(&statement) {
@@ -1626,6 +1653,86 @@ mod tests {
             &PoolingStrategy::Hybrid,
             &conn_state
         ));
+    }
+
+    // Tests for apply_parse_state() — extended-protocol (Parse-arm) session
+    // state classification (WP-9 Task 4, P2 §4.2). `apply_parse_state` is the
+    // exact call the `Message::Parse` arm makes, so a stateful statement
+    // carried by Parse must pin the connection exactly as it would via the
+    // simple-`Query` arm's `ConnectionState::apply_query` — the same
+    // classifier, reused rather than duplicated.
+
+    #[test]
+    fn test_apply_parse_state_clean_select_only_pins_prepared_statement() {
+        let mut conn_state = ConnectionState::new(100);
+        ConnectionHandler::apply_parse_state(&mut conn_state, "s1", "SELECT 1", &[]);
+
+        assert!(conn_state.is_pinned());
+        assert!(!conn_state.has_unsafe_state());
+        assert_eq!(
+            conn_state.pin_reasons(),
+            std::iter::once(crate::proxy::PinReason::PreparedStatement).collect()
+        );
+    }
+
+    #[test]
+    fn test_apply_parse_state_set_adds_session_variable_pin_on_top_of_prepared_statement() {
+        let mut conn_state = ConnectionState::new(100);
+        ConnectionHandler::apply_parse_state(&mut conn_state, "s1", "SET search_path = foo", &[]);
+
+        assert!(conn_state.pin_reasons().contains(&crate::proxy::PinReason::PreparedStatement));
+        assert!(conn_state.pin_reasons().contains(&crate::proxy::PinReason::SessionVariable));
+        assert!(!conn_state.has_unsafe_state(), "SET is a safe/replayable pin, not unsafe state");
+    }
+
+    #[test]
+    fn test_apply_parse_state_temp_table_pins_unsafe_state() {
+        let mut conn_state = ConnectionState::new(100);
+        ConnectionHandler::apply_parse_state(
+            &mut conn_state,
+            "s1",
+            "CREATE TEMP TABLE tmp_ext (id int)",
+            &[],
+        );
+
+        assert!(conn_state.pin_reasons().contains(&crate::proxy::PinReason::TempTable));
+        assert!(conn_state.has_unsafe_state());
+    }
+
+    #[test]
+    fn test_apply_parse_state_advisory_lock_pins_unsafe_state() {
+        let mut conn_state = ConnectionState::new(100);
+        ConnectionHandler::apply_parse_state(
+            &mut conn_state,
+            "s1",
+            "SELECT pg_advisory_lock(42)",
+            &[],
+        );
+
+        assert!(conn_state.pin_reasons().contains(&crate::proxy::PinReason::AdvisoryLock));
+        assert!(conn_state.has_unsafe_state());
+    }
+
+    #[test]
+    fn test_apply_parse_state_unknown_command_fails_closed() {
+        let mut conn_state = ConnectionState::new(100);
+        ConnectionHandler::apply_parse_state(&mut conn_state, "s1", "VACUUM FULL", &[]);
+
+        assert!(conn_state.pin_reasons().contains(&crate::proxy::PinReason::UnknownCommand));
+        assert!(
+            conn_state.has_unsafe_state(),
+            "fail-closed: an unclassifiable Parse statement must pin as unsafe"
+        );
+    }
+
+    #[test]
+    fn test_apply_parse_state_reparse_of_same_name_is_idempotent() {
+        let mut conn_state = ConnectionState::new(100);
+        ConnectionHandler::apply_parse_state(&mut conn_state, "s1", "SET a = 'b'", &[]);
+        ConnectionHandler::apply_parse_state(&mut conn_state, "s1", "SET a = 'b'", &[]);
+
+        assert!(conn_state.pin_reasons().contains(&crate::proxy::PinReason::SessionVariable));
+        assert!(conn_state.pin_reasons().contains(&crate::proxy::PinReason::PreparedStatement));
     }
 
     #[test]

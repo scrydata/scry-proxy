@@ -385,6 +385,112 @@ pub async fn run_simple(client: &Client, sql: &str) -> RunOutcome {
     }
 }
 
+/// Runs `sql` via the EXTENDED query protocol (`.execute()`, which — unlike
+/// `.simple_query()` — always issues Parse/Bind/Execute in `tokio_postgres`,
+/// even with zero bind parameters, per its own doc comment) and captures the
+/// outcome as a [`RunOutcome`] so the same comparator
+/// ([`assert_outcomes_equivalent`]) used by the simple-protocol baseline
+/// matrix works unchanged. The statements this is used for (`BEGIN`, `SET`,
+/// `CREATE TEMP TABLE`, `DECLARE CURSOR`, `COMMIT`, `pg_advisory_lock`) are
+/// session/DDL commands with no meaningful row shape to compare, so the
+/// affected-row count is the sole `QuerySnapshot` signal — column/row lists
+/// are always empty.
+pub async fn run_extended(client: &Client, sql: &str) -> RunOutcome {
+    match client.execute(sql, &[]).await {
+        Ok(rows_affected) => RunOutcome::Ok(QuerySnapshot {
+            statements: vec![StatementResult { columns: vec![], rows: vec![], rows_affected }],
+        }),
+        Err(e) => RunOutcome::Err { sqlstate: e.code().map(|c| c.code().to_string()) },
+    }
+}
+
+/// Hybrid-mode-only proof (WP-9 Task 4, P2 §4.2): a stateful command issued
+/// via the EXTENDED protocol must pin the connection exactly as the simple
+/// protocol does, so a completed transaction does not cause Hybrid mode to
+/// silently recycle the backend connection out from under the client.
+///
+/// The `SET` itself is sent via `.execute()` (Parse/Bind/Execute) — the
+/// thing under test. The transaction boundary and cleanup
+/// (`BEGIN`/`DEALLOCATE ALL`/`COMMIT`) deliberately go over `simple_query`
+/// instead, for test isolation, not because it doesn't matter which protocol
+/// they use:
+///
+/// `Message::Parse`'s PRE-EXISTING (untouched by this task)
+/// `add_prepared_statement` bookkeeping runs for *every* Parse, and sets its
+/// own `PinReason::PreparedStatement` — a real, separate pin unrelated to
+/// classification. If `BEGIN`/`COMMIT` were also sent via `.execute()`,
+/// *their own* Parse would add a fresh prepared-statement pin (or, if the
+/// SET's still-open prepared statement hasn't been `Close`d client-side yet,
+/// *that* pin) right before the release check runs — masking whether the
+/// `SET`'s session-variable classification (what this task actually adds)
+/// is doing anything at all, since `is_pinned()` would already be true for
+/// an unrelated reason either way. Sending `BEGIN`/`COMMIT` via simple query
+/// (which never touches `add_prepared_statement`) and running an explicit
+/// `DEALLOCATE ALL` (also simple query) right after the `SET` — which clears
+/// only `prepared_statements`, per `ConnectionState::apply_query`'s
+/// `DeallocateAll` arm, leaving `session_variables` untouched — deterministically
+/// strips that incidental pin, isolating the one pin this task is
+/// responsible for.
+///
+/// `connection.rs` only evaluates `should_release_connection` when a
+/// transaction completes (auto-commit statements never trigger release —
+/// see the comment in `connection.rs` near `just_finished_transaction`), so
+/// wrapping in BEGIN/COMMIT is what exercises the Hybrid release decision
+/// this test is probing. Then:
+///   (a) drives further activity on the SAME client and confirms the GUC is
+///       still visible (proof the connection wasn't silently swapped/reset
+///       out from under it), and
+///   (b) opens a FRESH client against the same pooled proxy port and
+///       confirms it does NOT see the value (proof any pin didn't leak to a
+///       different logical session).
+///
+/// Before the Parse-arm fix: `ConnectionState` never observes the SET (the
+/// `Message::Parse` arm didn't classify the SQL it carried), so — once the
+/// incidental prepared-statement pin is stripped by `DEALLOCATE ALL` — it is
+/// unpinned, Hybrid mode releases the connection at COMMIT, and the pool's
+/// recycle step (`DISCARD ALL` via `protocol::postgres::reset_connection`)
+/// wipes the GUC before the next checkout — check (a) fails deterministically
+/// (recycle always runs `DISCARD ALL` on checkout, regardless of whether the
+/// same or a different physical backend connection is handed back).
+pub async fn assert_extended_state_survives_hybrid_recycle(
+    proxy: &Client,
+    proxy_port: u16,
+    user: &str,
+    password: &str,
+    dbname: &str,
+    guc_name: &str,
+    guc_value: &str,
+) -> anyhow::Result<()> {
+    proxy.simple_query("BEGIN").await?;
+    proxy.execute(&format!("SET {guc_name} = '{guc_value}'"), &[]).await?; // EXTENDED protocol — the thing under test
+    proxy.simple_query("DEALLOCATE ALL").await?; // strips the incidental PreparedStatement pin only
+    proxy.simple_query("COMMIT").await?; // transaction completes -> Hybrid release check runs
+
+    // Enough further activity that an un-pinned connection would already
+    // have been released back to the pool (and DISCARD-ALL reset) by now.
+    for _ in 0..5 {
+        proxy.simple_query("SELECT 1").await?;
+    }
+
+    let rows = proxy.query(&format!("SHOW {guc_name}"), &[]).await?;
+    let observed: String = rows[0].get(0);
+    anyhow::ensure!(
+        observed == guc_value,
+        "extended-protocol SET was lost on the SAME client — Hybrid mode recycled the connection \
+         instead of pinning it (expected '{guc_value}', got '{observed}')"
+    );
+
+    let fresh = connect_client("127.0.0.1", proxy_port, user, password, dbname).await?;
+    let fresh_rows = fresh.query(&format!("SHOW {guc_name}"), &[]).await?;
+    let fresh_value: String = fresh_rows[0].get(0);
+    anyhow::ensure!(
+        fresh_value != guc_value,
+        "extended-protocol SET leaked to a fresh pooled client (expected != '{guc_value}', got '{fresh_value}')"
+    );
+
+    Ok(())
+}
+
 /// The comparator: asserts that the direct and proxied outcomes of the same
 /// operation are equivalent — same rows (values + column names/count), same
 /// command tag / rows-affected, and (for errors) the same SQLSTATE code.
