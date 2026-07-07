@@ -171,10 +171,10 @@ Implements P5 §4.1, §4.2, §4.3 (non-blocking), §5.2.
 - Modify: `.github/workflows/ci.yml` (non-blocking perf signal job)
 
 **Tasks:**
-- [ ] **Task 5.1 — Wire the internal timeline (P5 §4.1, foundational).** Mark pool-acquire start/end and backend start/end at the real points in `connection.rs`; pass the populated `QueryTimeline` (not `QueryTimeline::new()`) into `record_query`. Add derived `proxy_overhead = total − backend − pool_acquire − queue`.
-- [ ] **Task 5.2 — Metrics-populated guardrail (P5 §5.2).** Integration test (testcontainers): after real queries, assert the latency histograms are **non-zero** and the phase decomposition is present. Direct regression guard against the unwired state.
-- [ ] **Task 5.3 — Budget config (P5 §4.2).** Replace dead `target_latency_ms` with per-percentile overhead thresholds (p50/p95/p99) tied to a named reference workload; document the definition of "added latency."
-- [ ] **Task 5.4 — Non-blocking delta gate (P5 §4.3).** Strengthen the criterion/harness bench to compute the direct-vs-proxy delta in code with a representative workload (reuse `benchmarks/` OLTP set) and a tail-adequate sample size; add a **non-blocking** CI job that records the delta vs. budget (baseline; flips to blocking in WP-13). Commit.
+- [x] **Task 5.1 — Wire the internal timeline (P5 §4.1, foundational).** Mark pool-acquire start/end and backend start/end at the real points in `connection.rs`; pass the populated `QueryTimeline` (not `QueryTimeline::new()`) into `record_query`. Add derived `proxy_overhead = total − backend − pool_acquire − queue`.
+- [x] **Task 5.2 — Metrics-populated guardrail (P5 §5.2).** Integration test (testcontainers): after real queries, assert the latency histograms are **non-zero** and the phase decomposition is present. Direct regression guard against the unwired state.
+- [x] **Task 5.3 — Budget config (P5 §4.2).** Replace dead `target_latency_ms` with per-percentile overhead thresholds (p50/p95/p99) tied to a named reference workload; document the definition of "added latency."
+- [x] **Task 5.4 — Non-blocking delta gate (P5 §4.3).** Strengthen the criterion/harness bench to compute the direct-vs-proxy delta in code with a representative workload (reuse `benchmarks/` OLTP set) and a tail-adequate sample size; add a **non-blocking** CI job that records the delta vs. budget (baseline; flips to blocking in WP-13). Commit.
 
 **Guardrail:** metrics-populated test (blocking) + non-blocking latency signal.
 
