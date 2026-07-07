@@ -2069,4 +2069,262 @@ mod tests {
              unsafe_debug_logging off (the default)"
         );
     }
+
+    // --- Task 9 review fix: extended-protocol (Parse/Bind/Execute) span
+    // correctness + bound-parameter log safety --------------------------
+    //
+    // The end-to-end test above only drives the SIMPLE query protocol
+    // (`Message::Query`). The EXTENDED protocol (Parse/Bind/Execute) is the
+    // dominant path for parameterized client libraries (anything using
+    // prepared statements / bind parameters, e.g. most ORMs and `tokio-postgres`
+    // itself), and it has two distinct span-lifecycle points (Parse, then
+    // Bind) that both used to create a REAL `pg_query` span sharing the same
+    // pending-execution slot — Bind's `set_pending` silently discards
+    // Parse's span, orphaning it (never recorded, but still exported as
+    // noise). These two tests drive the real extended-protocol wire format
+    // through the same owned-backend path as the test above.
+
+    /// Build a Parse message: 'P' + len + name\0 + query\0 + num_param_types(0).
+    fn build_parse(name: &str, query: &str) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(name.as_bytes());
+        body.push(0);
+        body.extend_from_slice(query.as_bytes());
+        body.push(0);
+        body.extend_from_slice(&0i16.to_be_bytes()); // no explicit param OIDs
+        let mut msg = vec![b'P'];
+        msg.extend_from_slice(&((4 + body.len()) as i32).to_be_bytes());
+        msg.extend_from_slice(&body);
+        msg
+    }
+
+    /// Build a Bind message with a single text-format bound parameter.
+    fn build_bind(portal: &str, statement: &str, param_value: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(portal.as_bytes());
+        body.push(0);
+        body.extend_from_slice(statement.as_bytes());
+        body.push(0);
+        body.extend_from_slice(&1i16.to_be_bytes()); // 1 format code
+        body.extend_from_slice(&0i16.to_be_bytes()); // text format
+        body.extend_from_slice(&1i16.to_be_bytes()); // 1 parameter
+        body.extend_from_slice(&(param_value.len() as i32).to_be_bytes());
+        body.extend_from_slice(param_value);
+        body.extend_from_slice(&0i16.to_be_bytes()); // 0 result format codes (all text)
+        let mut msg = vec![b'B'];
+        msg.extend_from_slice(&((4 + body.len()) as i32).to_be_bytes());
+        msg.extend_from_slice(&body);
+        msg
+    }
+
+    /// Build an Execute message: 'E' + len + portal\0 + max_rows(0).
+    fn build_execute(portal: &str) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(portal.as_bytes());
+        body.push(0);
+        body.extend_from_slice(&0i32.to_be_bytes()); // no row limit
+        let mut msg = vec![b'E'];
+        msg.extend_from_slice(&((4 + body.len()) as i32).to_be_bytes());
+        msg.extend_from_slice(&body);
+        msg
+    }
+
+    /// Build a Sync message: 'S' + len(4), no body.
+    fn build_sync() -> Vec<u8> {
+        vec![b'S', 0, 0, 0, 4]
+    }
+
+    /// Build ParseComplete ('1') / BindComplete ('2'), both header-only.
+    fn build_parse_complete() -> Vec<u8> {
+        vec![b'1', 0, 0, 0, 4]
+    }
+    fn build_bind_complete() -> Vec<u8> {
+        vec![b'2', 0, 0, 0, 4]
+    }
+
+    /// Drive one Parse/Bind/Execute/Sync round trip (unnamed statement +
+    /// unnamed portal — the common case for parameterized-query client
+    /// libraries) through the real owned-backend connection path, with a
+    /// captured tracing subscriber installed, and return the `Captured`
+    /// result for the caller's assertions. `query` is the SQL text sent at
+    /// Parse time; `param_value` is the single bound parameter's raw bytes
+    /// sent at Bind time — kept as two separate inputs so a test can put a
+    /// secret in ONE without it appearing in the other.
+    async fn run_extended_protocol_round_trip(
+        query: &str,
+        param_value: &[u8],
+    ) -> Arc<std::sync::Mutex<crate::observability::test_support::Captured>> {
+        use tokio::net::{TcpListener, TcpStream};
+
+        crate::observability::set_unsafe_debug_logging(false);
+
+        fn build_command_complete(tag: &str) -> Vec<u8> {
+            let mut body = tag.as_bytes().to_vec();
+            body.push(0);
+            let mut msg = vec![b'C'];
+            msg.extend_from_slice(&((4 + body.len()) as i32).to_be_bytes());
+            msg.extend_from_slice(&body);
+            msg
+        }
+
+        const READY_FOR_QUERY: [u8; 6] = [b'Z', 0, 0, 0, 5, b'I'];
+
+        async fn read_until_ready_for_query(stream: &mut TcpStream) -> Vec<u8> {
+            let mut acc = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut buf).await.expect("read from stream");
+                assert!(n > 0, "stream closed before ReadyForQuery");
+                acc.extend_from_slice(&buf[..n]);
+                if acc.ends_with(&READY_FOR_QUERY) {
+                    return acc;
+                }
+            }
+        }
+
+        // Fake backend: completes a trust startup, then answers one
+        // Parse/Bind/Execute/Sync round trip.
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend_listener.local_addr().unwrap();
+        let backend_task = tokio::spawn(async move {
+            let (mut stream, _) = backend_listener.accept().await.unwrap();
+
+            let mut buf = vec![0u8; 8192];
+            let n = stream.read(&mut buf).await.unwrap();
+            assert!(n > 0, "backend never received a StartupMessage");
+
+            let mut resp = build_auth_ok();
+            resp.extend_from_slice(&READY_FOR_QUERY);
+            stream.write_all(&resp).await.unwrap();
+
+            // The client's Parse+Bind+Execute+Sync, all forwarded verbatim
+            // in one read (they were sent in one client-side write).
+            let n = stream.read(&mut buf).await.unwrap();
+            assert!(n > 0, "backend never received the client's extended-protocol messages");
+            assert_eq!(buf[0], b'P', "expected a Parse message forwarded first");
+
+            let mut resp2 = build_parse_complete();
+            resp2.extend_from_slice(&build_bind_complete());
+            resp2.extend_from_slice(&build_command_complete("SELECT 1"));
+            resp2.extend_from_slice(&READY_FOR_QUERY);
+            stream.write_all(&resp2).await.unwrap();
+
+            let _ = stream.read(&mut buf).await;
+        });
+
+        let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client_listen_addr = client_listener.local_addr().unwrap();
+        let query_for_client = query.to_string();
+        let param_for_client = param_value.to_vec();
+        let client_task = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(client_listen_addr).await.unwrap();
+            let _ = read_until_ready_for_query(&mut stream).await;
+
+            let mut out = build_parse("", &query_for_client);
+            out.extend_from_slice(&build_bind("", "", &param_for_client));
+            out.extend_from_slice(&build_execute(""));
+            out.extend_from_slice(&build_sync());
+            stream.write_all(&out).await.unwrap();
+
+            let _ = read_until_ready_for_query(&mut stream).await;
+        });
+
+        let (proxy_client_stream, _) = client_listener.accept().await.unwrap();
+        let peer_addr = proxy_client_stream.peer_addr().unwrap();
+
+        let mut config = create_test_config();
+        config.backend.host = backend_addr.ip().to_string();
+        config.backend.port = backend_addr.port();
+        config.backend.user = "postgres".to_string();
+        config.backend.password = String::new();
+        config.backend.database = "postgres".to_string();
+        config.auth.auth_type = AuthType::Trust;
+
+        let admin_handles = AdminHandles::for_test_with_config(config.clone());
+        let batcher =
+            Arc::new(EventBatcher::new(Arc::new(DebugLoggerPublisher::new()), 10, 100, 1000));
+        let metrics = Arc::new(ProxyMetrics::new(100, HealthConfig::default()));
+        let startup_bytes = StartupMessage::build("testuser", "testdb", &[]);
+
+        let (subscriber, captured) = crate::observability::test_support::capturing_subscriber();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        ProxyServer::handle_client_connection(
+            ClientTransport::Plain(proxy_client_stream),
+            Some(peer_addr),
+            4242,
+            Arc::new(config),
+            batcher,
+            HashMap::new(), // no pool manager -> direct/owned-backend path
+            metrics,
+            startup_bytes,
+            None,
+            admin_handles,
+            false,
+        )
+        .await;
+
+        client_task.await.expect("client task must not panic");
+        backend_task.await.expect("backend task must not panic");
+
+        captured
+    }
+
+    /// RED (pre-fix) / GREEN (post-fix) target: a single prepared/bound query
+    /// driven through the real extended protocol (Parse -> Bind -> Execute ->
+    /// Sync) must produce EXACTLY ONE `pg_query` span, and that span must
+    /// carry the recorded outcome (`success = true`). Before the fix, Parse
+    /// created a real span that Bind's `set_pending` silently discarded
+    /// (orphaned, never recorded) while ALSO creating a second real span —
+    /// i.e. two closed `pg_query` spans, one of them permanently `Empty`.
+    #[tokio::test]
+    async fn extended_protocol_produces_exactly_one_recorded_pg_query_span() {
+        let captured = run_extended_protocol_round_trip("SELECT $1::text", b"hello").await;
+        let captured = captured.lock().unwrap();
+
+        let query_spans: Vec<_> = captured.spans.iter().filter(|s| s.name == "pg_query").collect();
+        assert_eq!(
+            query_spans.len(),
+            1,
+            "expected exactly one pg_query span for one Parse/Bind/Execute round trip, got {}: {:?}",
+            query_spans.len(),
+            query_spans
+        );
+
+        let query_span = query_spans[0];
+        for key in ["conn_id", "pooling_mode", "backend_id", "duration_ms", "success"] {
+            assert!(query_span.fields.contains_key(key), "pg_query span missing field `{key}`");
+        }
+        assert_eq!(
+            query_span.fields.get("success").map(String::as_str),
+            Some("true"),
+            "the single pg_query span must record the completed outcome, not be left Empty"
+        );
+    }
+
+    /// The security-priority assertion: a secret sent as a BOUND PARAMETER
+    /// value (never appearing in the SQL text itself) must be exactly as
+    /// safe as a secret in query text — absent from every captured span
+    /// field and log event when `unsafe_debug_logging` is off (the default).
+    /// This closes the previously-untested gap: the existing log-safety test
+    /// only covers a literal embedded in simple-query SQL text, never a
+    /// value carried solely in a Bind message's parameter bytes.
+    #[tokio::test]
+    async fn bound_parameter_secret_does_not_leak_into_spans_or_logs() {
+        const SECRET: &str = "SECRET_LITERAL_XYZ";
+        // The query text itself never contains the secret — only the bound
+        // parameter value does, exercising the Bind-specific path.
+        let captured = run_extended_protocol_round_trip("SELECT $1::text", SECRET.as_bytes()).await;
+        let captured = captured.lock().unwrap();
+
+        assert!(
+            captured.span_named("pg_query").is_some(),
+            "expected a pg_query span for the bound-parameter round trip"
+        );
+        assert!(
+            !captured.contains_value(SECRET),
+            "bound-parameter secret {SECRET:?} leaked into a span field or log event with \
+             unsafe_debug_logging off (the default)"
+        );
+    }
 }

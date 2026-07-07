@@ -1155,8 +1155,20 @@ impl ConnectionHandler {
                                             query: query.clone(),
                                             param_oids: param_oids.clone(),
                                         });
+                                        // Task 9 review fix (Fix 1): Parse alone doesn't execute
+                                        // a query, so it gets a `Span::none()` placeholder rather
+                                        // than a real `pg_query` span — the real span is created
+                                        // at Bind (or here, if this Parse never Binds and instead
+                                        // errors; see the Bind arm below for why one pending slot
+                                        // holding exactly one span is correct). This avoids the
+                                        // orphaned/double-span bug: previously a real span was
+                                        // created here AND at Bind, but Bind's `set_pending`
+                                        // overwrites this pending entry, discarding the Parse-time
+                                        // span before it ever recorded `duration_ms`/`success` —
+                                        // every prepared-statement query emitted one noise span
+                                        // plus the real one.
                                         stmt_cache.set_pending(String::new(), PendingExecution {
-                                            span: new_query_span(connection_id, &pooling_mode_str, &backend_id, query),
+                                            span: tracing::Span::none(),
                                             query: query.clone(),
                                             params: vec![],
                                             params_incomplete: true,
@@ -1183,6 +1195,14 @@ impl ConnectionHandler {
                                             }
                                         };
 
+                                        // Task 9 review fix (Fix 1): the real `pg_query` span is
+                                        // created HERE, at Bind, not at Parse — Bind is the point
+                                        // an extended-protocol query actually becomes executable
+                                        // (it resolves params against the cached statement), so
+                                        // this is the single source of truth for the pending
+                                        // execution's span. This `set_pending` overwrites whatever
+                                        // Parse stored (a `Span::none()` placeholder, so nothing
+                                        // real is discarded).
                                         stmt_cache.set_pending(portal, PendingExecution {
                                             span: new_query_span(connection_id, &pooling_mode_str, &backend_id, &query),
                                             query,
@@ -1636,18 +1656,21 @@ impl ConnectionHandler {
                                             name.clone(),
                                             PreparedStatement { query: query.clone(), param_oids },
                                         );
-                                        // Set pending with empty params for Parse errors
-                                        // Will be overwritten by Bind if Parse succeeds
-                                        let span = new_query_span(
-                                            connection_id,
-                                            &pooling_mode_str,
-                                            &backend_id,
-                                            &query,
-                                        );
+                                        // Set pending with empty params for Parse errors; will be
+                                        // overwritten by Bind if Parse succeeds. Task 9 review fix
+                                        // (Fix 1): the span here is `Span::none()`, not a real
+                                        // `pg_query` span — Parse alone doesn't execute a query,
+                                        // so the real span is created at Bind (see below). This
+                                        // avoids the orphaned/double-span bug: a real span used to
+                                        // be created here AND at Bind, but Bind's `set_pending`
+                                        // overwrites this pending entry, discarding the Parse-time
+                                        // span before it ever recorded `duration_ms`/`success` —
+                                        // every prepared-statement query emitted one noise span
+                                        // plus the real one.
                                         cache.set_pending(
                                             String::new(),
                                             PendingExecution {
-                                                span,
+                                                span: tracing::Span::none(),
                                                 query,
                                                 params: vec![],
                                                 params_incomplete: true,
@@ -1688,6 +1711,9 @@ impl ConnectionHandler {
                                             }
                                         };
 
+                                        // Task 9 review fix (Fix 1): the real `pg_query` span is
+                                        // created HERE, at Bind — the point an extended-protocol
+                                        // query actually becomes executable — not at Parse.
                                         let span = new_query_span(
                                             connection_id,
                                             &pooling_mode_str,
