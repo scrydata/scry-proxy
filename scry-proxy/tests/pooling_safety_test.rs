@@ -35,9 +35,13 @@ const STATE_ADDING: &[&str] = &[
 const CLEANUP: &[&str] = &["RESET ALL", "DISCARD ALL", "DEALLOCATE ALL"];
 
 /// Commands that cannot be proven clean and must therefore pin (`Unknown`).
+///
+/// NOTE: LISTEN/UNLISTEN/NOTIFY were removed here in WP-9 Task 5 — they are no
+/// longer `Unknown` but positively classified (`Stateful(Listen)` pins as unsafe;
+/// bare `Notify` is non-pinning by design). Their pin/no-pin behavior is covered
+/// by the typed state-layer unit tests in `connection_state.rs`. This list stays
+/// scoped to genuinely-unclassifiable statements exercising the fail-closed path.
 const MUST_PIN_UNKNOWN: &[&str] = &[
-    "LISTEN channel_name",
-    "NOTIFY channel_name",
     "CALL some_procedure()",
     "DO $$ BEGIN PERFORM 1; END $$",
     "COPY t FROM STDIN",
