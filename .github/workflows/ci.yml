@@ -104,3 +104,41 @@ jobs:
 
       - name: Run cargo deny check
         run: cargo deny check
+
+  pin-lint:
+    name: pin-lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Verify Dockerfile and workflow pins
+        run: |
+          set -euo pipefail
+          fail=0
+
+          echo "== Checking Dockerfile FROM lines for @sha256: digest pins =="
+          while IFS= read -r line; do
+            if [[ "$line" != *"@sha256:"* ]]; then
+              echo "UNPINNED Dockerfile base image: $line"
+              fail=1
+            fi
+          done < <(grep -E '^FROM ' Dockerfile)
+
+          echo "== Checking workflow 'uses:' lines for 40-hex commit SHA pins =="
+          # Anchored so this only matches actual YAML `uses:` step keys, not
+          # the substring "uses:" appearing inside this very script (embedded
+          # in a workflow `run:` block).
+          while IFS= read -r line; do
+            ref=$(sed -E 's/^[[:space:]]*(-[[:space:]]*)?uses:[[:space:]]*[^@]+@([^[:space:]]+).*/\2/' <<<"$line")
+            if [[ ! "$ref" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "UNPINNED action ref: $line"
+              fail=1
+            fi
+          done < <(grep -rhE '^[[:space:]]*(-[[:space:]]*)?uses:[[:space:]]*[^[:space:]]+@' .github/workflows/*.yml)
+
+          if [[ "$fail" -ne 0 ]]; then
+            echo "pin-lint FAILED"
+            exit 1
+          fi
+          echo "pin-lint OK: all base images and actions are pinned"
