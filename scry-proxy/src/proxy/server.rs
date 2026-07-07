@@ -8,7 +8,7 @@ use crate::config::{AuthType, Config, DatabaseConfig, PoolingStrategy, TlsSslMod
 use crate::observability::ProxyMetrics;
 use crate::protocol::{
     build_auth_cleartext_password, build_auth_ok, build_error_response, parse_password_message,
-    Protocol, ProtocolConfig, ProtocolRegistry, StartupMessage,
+    read_startup_message, Protocol, ProtocolConfig, ProtocolRegistry, StartupMessage,
 };
 use crate::resilience::{ActiveHealthcheck, CircuitBreaker};
 use crate::routing::DatabaseRouter;
@@ -1058,9 +1058,27 @@ impl ProxyServer {
                 match handle_ssl_startup(client_stream, &config.tls.client_tls_sslmode, tls_config)
                     .await
                 {
-                    Ok(SslStartupResult::Upgraded(transport)) => {
+                    Ok(SslStartupResult::Upgraded(mut transport)) => {
                         info!(connection_id = conn_id, "Connection upgraded to TLS");
-                        (transport, Vec::new(), true)
+                        // The client's StartupMessage hasn't been read yet (it
+                        // follows the TLS handshake on the wire). Read it now,
+                        // over the encrypted transport, so the client registry
+                        // (WP-10, P4 §4.1) can record the real user/database
+                        // for TLS connections instead of leaving them blank
+                        // (previously discarded entirely; a `SHOW CLIENTS`
+                        // truthfulness gap for exactly the connections most
+                        // worth reporting accurately).
+                        match read_startup_message(&mut transport).await {
+                            Ok(data) => (transport, data, true),
+                            Err(e) => {
+                                error!(
+                                    connection_id = conn_id,
+                                    error = %e,
+                                    "Failed to read startup message after TLS upgrade"
+                                );
+                                return;
+                            }
+                        }
                     }
                     Ok(SslStartupResult::Declined(stream, startup_data)) => {
                         debug!(connection_id = conn_id, "SSL declined, continuing with plain TCP");
