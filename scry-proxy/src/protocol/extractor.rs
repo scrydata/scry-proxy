@@ -230,7 +230,7 @@ impl MessageExtractor {
                     if bytes.remaining() >= length - 4 {
                         let query_data = &bytes[..length - 4];
                         if let Some(query_text) = Self::extract_query_text(query_data) {
-                            debug!(query = %query_text, "Extracted query from Query message");
+                            debug!(query = %crate::observability::loggable(&query_text), "Extracted query from Query message");
                             query = Some(query_text);
                         }
                         bytes.advance(length - 4);
@@ -255,7 +255,7 @@ impl MessageExtractor {
 
                             // Now extract query
                             if let Some(query_text) = Self::extract_query_text(remaining_data) {
-                                debug!(query = %query_text, "Extracted query from Parse message");
+                                debug!(query = %crate::observability::loggable(&query_text), "Extracted query from Parse message");
                                 query = Some(query_text);
                             }
                         }

@@ -67,13 +67,19 @@ impl EventPublisher for DebugLoggerPublisher {
         self.metrics.total_batches.fetch_add(1, Ordering::Relaxed);
         self.metrics.total_bytes.fetch_add(byte_size, Ordering::Relaxed);
 
-        // Log the batch
-        debug!(
-            batch_size = batch_size,
-            byte_size = byte_size,
-            events = %json,
-            "Published query event batch"
-        );
+        // Log the batch. The full serialized batch can contain raw query text
+        // when anonymization is disabled, so only dump it when the operator has
+        // opted into unsafe debug logging (P1 §4.4); otherwise log just sizes.
+        if crate::observability::unsafe_debug_logging() {
+            debug!(
+                batch_size = batch_size,
+                byte_size = byte_size,
+                events = %json,
+                "Published query event batch"
+            );
+        } else {
+            debug!(batch_size = batch_size, byte_size = byte_size, "Published query event batch");
+        }
 
         // Log summary info
         let (total_events, total_batches, total_bytes) = self.get_metrics();

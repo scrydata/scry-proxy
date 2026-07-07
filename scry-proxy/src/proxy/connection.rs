@@ -635,7 +635,7 @@ impl ConnectionHandler {
                                     Message::Parse { ref name, ref query, ref param_oids } => {
                                         // Validate command against pooling mode
                                         if let Err(err_msg) = mode_enforcer.validate(query, txn_tracker.is_in_transaction()) {
-                                            warn!(query = %query, error = %err_msg, "Command rejected by pooling mode");
+                                            warn!(query = %crate::observability::loggable(&query), error = %err_msg, "Command rejected by pooling mode");
                                             let error_response = ModeEnforcer::build_error_response(&err_msg);
                                             self.client_stream.write_all(&error_response).await.context("Failed to send error to client")?;
                                             // Send ReadyForQuery to complete the error cycle
@@ -645,7 +645,7 @@ impl ConnectionHandler {
                                             break;
                                         }
 
-                                        debug!(name = %name, query = %query, "Cached prepared statement");
+                                        debug!(name = %name, query = %crate::observability::loggable(&query), "Cached prepared statement");
                                         stmt_cache.insert_statement(name.clone(), PreparedStatement {
                                             query: query.clone(),
                                             param_oids: param_oids.clone(),
@@ -691,7 +691,7 @@ impl ConnectionHandler {
                                     Message::Query { ref query } => {
                                         // Validate command against pooling mode
                                         if let Err(err_msg) = mode_enforcer.validate(query, txn_tracker.is_in_transaction()) {
-                                            warn!(query = %query, error = %err_msg, "Command rejected by pooling mode");
+                                            warn!(query = %crate::observability::loggable(&query), error = %err_msg, "Command rejected by pooling mode");
                                             let error_response = ModeEnforcer::build_error_response(&err_msg);
                                             self.client_stream.write_all(&error_response).await.context("Failed to send error to client")?;
                                             let ready_for_query = Self::build_ready_for_query(txn_tracker.state());
@@ -700,7 +700,7 @@ impl ConnectionHandler {
                                             break;
                                         }
 
-                                        debug!(query = %query, "Simple query");
+                                        debug!(query = %crate::observability::loggable(&query), "Simple query");
                                         stmt_cache.set_pending(String::new(), PendingExecution {
                                             query: query.clone(),
                                             params: vec![],
@@ -750,7 +750,7 @@ impl ConnectionHandler {
                             if let Some(error_msg) = extractor.extract_error(data) {
                                 if let Some(pending) = stmt_cache.take_pending("") {
                                     let duration = pending.started_at.elapsed();
-                                    warn!(query = %pending.query, error = %error_msg, duration_ms = duration.as_millis(), "Query failed");
+                                    warn!(query = %crate::observability::loggable(&pending.query), error = %crate::observability::loggable(&error_msg), duration_ms = duration.as_millis(), "Query failed");
 
                                     let error_field = anon_settings.error_field(&extractor, data, error_msg);
                                     if let Some((event, fingerprints)) = anon_settings.build_event(
@@ -777,7 +777,7 @@ impl ConnectionHandler {
                             else if extractor.is_query_complete(data) {
                                 if let Some(pending) = stmt_cache.take_pending("") {
                                     let duration = pending.started_at.elapsed();
-                                    debug!(query = %pending.query, duration_ms = duration.as_millis(), "Query completed successfully");
+                                    debug!(query = %crate::observability::loggable(&pending.query), duration_ms = duration.as_millis(), "Query completed successfully");
 
                                     if let Some((event, fingerprints)) = anon_settings.build_event(
                                         &pending.query,
@@ -1035,7 +1035,7 @@ impl ConnectionHandler {
                             for msg in messages {
                                 match msg {
                                     Message::Parse { name, query, param_oids } => {
-                                        debug!(name = %name, query = %query, "Cached prepared statement");
+                                        debug!(name = %name, query = %crate::observability::loggable(&query), "Cached prepared statement");
                                         cache.insert_statement(
                                             name.clone(),
                                             PreparedStatement { query: query.clone(), param_oids },
@@ -1096,7 +1096,7 @@ impl ConnectionHandler {
                                         );
                                     }
                                     Message::Query { query } => {
-                                        debug!(query = %query, "Simple query");
+                                        debug!(query = %crate::observability::loggable(&query), "Simple query");
                                         cache.set_pending(
                                             String::new(),
                                             PendingExecution {
@@ -1152,8 +1152,8 @@ impl ConnectionHandler {
                             if let Some(pending) = cache.take_pending("") {
                                 let duration = pending.started_at.elapsed();
                                 warn!(
-                                    query = %pending.query,
-                                    error = %error_msg,
+                                    query = %crate::observability::loggable(&pending.query),
+                                    error = %crate::observability::loggable(&error_msg),
                                     duration_ms = duration.as_millis(),
                                     "Query failed"
                                 );
@@ -1185,7 +1185,7 @@ impl ConnectionHandler {
                             if let Some(pending) = cache.take_pending("") {
                                 let duration = pending.started_at.elapsed();
                                 debug!(
-                                    query = %pending.query,
+                                    query = %crate::observability::loggable(&pending.query),
                                     duration_ms = duration.as_millis(),
                                     "Query completed successfully"
                                 );
