@@ -543,28 +543,34 @@ impl ConnectionHandler {
                     );
                 }
             },
-            AcquireError::WaitTimeout => match backpressure_mode {
-                BackpressureMode::RejectImmediate => {
-                    debug!(
-                        connection_id = self.connection_id,
-                        "Wait timeout, rejecting connection"
-                    );
+            AcquireError::WaitTimeout => {
+                // P3 §4.5: acquisition hit `pool_timeout_secs`/`wait_timeout_ms`
+                // waiting for a free pool slot. Cheap atomic increment on an
+                // already-slow (rejection) path — no hot-path cost.
+                self.metrics.pool_metrics().record_pool_wait_timeout();
+                match backpressure_mode {
+                    BackpressureMode::RejectImmediate => {
+                        debug!(
+                            connection_id = self.connection_id,
+                            "Wait timeout, rejecting connection"
+                        );
+                    }
+                    BackpressureMode::RetryHint => {
+                        debug!(
+                            connection_id = self.connection_id,
+                            "Wait timeout, sending error with retry hint"
+                        );
+                        let error_msg = Self::build_wait_timeout_error();
+                        let _ = self.client_stream.write_all(&error_msg).await;
+                    }
+                    BackpressureMode::LogAndReject => {
+                        warn!(
+                            connection_id = self.connection_id,
+                            "Connection rejected: timeout waiting for pool connection"
+                        );
+                    }
                 }
-                BackpressureMode::RetryHint => {
-                    debug!(
-                        connection_id = self.connection_id,
-                        "Wait timeout, sending error with retry hint"
-                    );
-                    let error_msg = Self::build_wait_timeout_error();
-                    let _ = self.client_stream.write_all(&error_msg).await;
-                }
-                BackpressureMode::LogAndReject => {
-                    warn!(
-                        connection_id = self.connection_id,
-                        "Connection rejected: timeout waiting for pool connection"
-                    );
-                }
-            },
+            }
             AcquireError::Paused => {
                 // Administratively paused (admin PAUSE). Always surface a clean
                 // ErrorResponse to the client regardless of backpressure mode —
@@ -584,6 +590,23 @@ impl ConnectionHandler {
                     error = %e,
                     "Pool error while acquiring connection"
                 );
+
+                // Distinguish two indistinguishable-by-type causes folded into
+                // this generic `anyhow::Error` by `TcpConnectionPool::get`
+                // (P3 §4.1/§4.5): an open circuit breaker shedding load, and a
+                // backend TCP connect/TLS negotiation that hit
+                // `connection_timeout_ms`. Both are constructed with a stable,
+                // tested message prefix (see `tcp_pool.rs`'s own fault-injection
+                // test asserting on "Circuit breaker"), so a substring match on
+                // this already-slow error path is cheap and reliable without
+                // threading a typed error or `ProxyMetrics` through the pool.
+                let msg = e.to_string();
+                if msg.contains("Circuit breaker") {
+                    self.metrics.pool_metrics().record_request_shed();
+                } else if msg.contains("Timed out after") {
+                    self.metrics.pool_metrics().record_backend_connect_timeout();
+                }
+
                 return Err(e.context("Failed to acquire connection from pool"));
             }
         }
@@ -1393,6 +1416,7 @@ impl ConnectionHandler {
                     );
 
                     metrics.record_query(&QueryTimeline::new(), false);
+                    metrics.query_metrics().record_query_timeout();
                     // Mark the connection unusable so it is not returned clean.
                     conn_state.mark_unknown_command();
 

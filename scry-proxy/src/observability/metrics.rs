@@ -233,6 +233,8 @@ pub struct QueryMetrics {
     // Atomic counters
     pub total_queries: AtomicU64,
     pub total_errors: AtomicU64,
+    /// Queries aborted because they exceeded `query_timeout` (P3 §4.3).
+    total_query_timeouts: AtomicU64,
 }
 
 impl QueryMetrics {
@@ -256,7 +258,19 @@ impl QueryMetrics {
             ),
             total_queries: AtomicU64::new(0),
             total_errors: AtomicU64::new(0),
+            total_query_timeouts: AtomicU64::new(0),
         }
+    }
+
+    /// Record a query aborted due to `query_timeout` (P3 §4.3 enforcement site
+    /// in `proxy/connection.rs`). Cheap atomic increment, no locking.
+    pub fn record_query_timeout(&self) {
+        self.total_query_timeouts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Get total query timeout count
+    pub fn get_query_timeouts_total(&self) -> u64 {
+        self.total_query_timeouts.load(Ordering::Relaxed)
     }
 
     /// Record latency measurements from timeline phases
@@ -383,6 +397,17 @@ pub struct PoolMetrics {
     // New pooling metrics - counters
     queue_rejected_total: AtomicU64,
 
+    /// Acquisitions that hit `pool_timeout_secs`/`wait_timeout_ms` waiting for
+    /// a free pool slot (P3 §4.5 `AcquireError::WaitTimeout`).
+    connection_timeout_pool_wait_total: AtomicU64,
+    /// Backend TCP connect + TLS negotiation that hit `connection_timeout_ms`
+    /// (P3 §4.5 `BackendTransportManager::create`).
+    connection_timeout_backend_connect_total: AtomicU64,
+    /// Requests shed because a per-backend circuit breaker was open (P3
+    /// §4.1/§5.4 `CircuitBreaker::allow_request` rejection), distinct from
+    /// queue-full or generic pool errors.
+    requests_shed_total: AtomicU64,
+
     // Pin reason counters
     pin_prepared_statement: AtomicU64,
     pin_session_variable: AtomicU64,
@@ -406,6 +431,9 @@ impl PoolMetrics {
             queue_depth: AtomicUsize::new(0),
             max_queue_depth: AtomicUsize::new(0),
             queue_rejected_total: AtomicU64::new(0),
+            connection_timeout_pool_wait_total: AtomicU64::new(0),
+            connection_timeout_backend_connect_total: AtomicU64::new(0),
+            requests_shed_total: AtomicU64::new(0),
             pin_prepared_statement: AtomicU64::new(0),
             pin_session_variable: AtomicU64::new(0),
             pin_temp_table: AtomicU64::new(0),
@@ -483,6 +511,39 @@ impl PoolMetrics {
     /// Record a queue rejection (request rejected due to full queue)
     pub fn record_queue_rejected(&self) {
         self.queue_rejected_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record an acquisition that timed out waiting for a free pool slot
+    /// (`pool_timeout_secs`/`wait_timeout_ms`, P3 §4.5).
+    pub fn record_pool_wait_timeout(&self) {
+        self.connection_timeout_pool_wait_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Get total pool-wait timeout count
+    pub fn get_pool_wait_timeouts_total(&self) -> u64 {
+        self.connection_timeout_pool_wait_total.load(Ordering::Relaxed)
+    }
+
+    /// Record a backend connect/TLS negotiation that hit `connection_timeout_ms`
+    /// (P3 §4.5).
+    pub fn record_backend_connect_timeout(&self) {
+        self.connection_timeout_backend_connect_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Get total backend-connect timeout count
+    pub fn get_backend_connect_timeouts_total(&self) -> u64 {
+        self.connection_timeout_backend_connect_total.load(Ordering::Relaxed)
+    }
+
+    /// Record a request shed because a per-backend circuit breaker was open
+    /// (distinct from queue-full/generic pool errors, P3 §4.1/§5.4).
+    pub fn record_request_shed(&self) {
+        self.requests_shed_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Get total requests shed due to an open circuit breaker
+    pub fn get_requests_shed_total(&self) -> u64 {
+        self.requests_shed_total.load(Ordering::Relaxed)
     }
 
     /// Set the current queue depth
