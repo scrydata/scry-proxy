@@ -41,6 +41,7 @@ pub struct PublisherMetrics {
 
 impl HttpPublisher {
     /// Create a new HTTP publisher
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         endpoint: String,
         timeout_ms: u64,
@@ -48,7 +49,19 @@ impl HttpPublisher {
         api_key: Option<String>,
         shadow_id: Option<String>,
         compression: bool,
+        allow_insecure: bool,
     ) -> Result<Self> {
+        // Defense in depth (P1 §4.5): refuse to construct a publisher that would
+        // send (possibly anonymized) query events over a non-HTTPS endpoint
+        // unless the operator explicitly acknowledged it. `Config::validate()`
+        // enforces the same rule at startup; this guards direct construction.
+        if !endpoint.starts_with("https://") && !allow_insecure {
+            anyhow::bail!(
+                "refusing to publish to non-HTTPS endpoint {endpoint:?} without \
+                 allow_insecure = true"
+            );
+        }
+
         // Generate a unique proxy ID for this instance
         let proxy_id = format!("scry-{}", uuid::Uuid::new_v4());
 
@@ -242,18 +255,32 @@ mod tests {
     use crate::publisher::QueryEventBuilder;
     use std::time::Duration as StdDuration;
 
-    #[tokio::test]
-    async fn test_http_publisher_creation() {
-        let publisher = HttpPublisher::new(
-            "http://localhost:8080/events".to_string(),
+    fn make_publisher(endpoint: &str, allow_insecure: bool) -> Result<HttpPublisher> {
+        HttpPublisher::new(
+            endpoint.to_string(),
             1000,
             2,
             None,
             Some("550e8400-e29b-41d4-a716-446655440000".to_string()),
             false,
-        );
+            allow_insecure,
+        )
+    }
 
-        assert!(publisher.is_ok());
+    #[tokio::test]
+    async fn test_https_publisher_creation_ok() {
+        assert!(make_publisher("https://collector.example.com/events", false).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_http_publisher_rejected_without_allow_insecure() {
+        // Defense in depth: non-HTTPS endpoint must be refused at construction.
+        assert!(make_publisher("http://localhost:8080/events", false).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_http_publisher_allowed_with_allow_insecure() {
+        assert!(make_publisher("http://localhost:8080/events", true).is_ok());
     }
 
     #[tokio::test]
