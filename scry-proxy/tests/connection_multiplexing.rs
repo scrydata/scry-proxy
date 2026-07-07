@@ -98,7 +98,7 @@ fn create_multiplexing_config(backend_host: String, backend_port: u16, pool_size
             parse_failure_mode: ParseFailureMode::Redact,
         },
         performance: PerformanceConfig {
-            target_latency_ms: 1,
+            latency_budget: scry::config::LatencyBudget::default(),
             connection_pooling: PoolingStrategy::Transaction,
             pool_size,
             pool_min_idle: 0, // Don't pre-warm for tests

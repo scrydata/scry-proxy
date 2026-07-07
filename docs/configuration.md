@@ -115,8 +115,13 @@ max_retries = 2
 compression = true
 
 [performance]
-target_latency_ms = 1
 buffer_size = 8192
+
+[performance.latency_budget]
+overhead_p50_micros = 250
+overhead_p95_micros = 750
+overhead_p99_micros = 1000
+reference_workload = "oltp-point-select"
 
 [resilience.circuit_breaker]
 enabled = true
@@ -264,7 +269,10 @@ Performance tuning settings.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `target_latency_ms` | u64 | `1` | Target added latency in milliseconds |
+| `latency_budget.overhead_p50_micros` | u64 | `250` | p50 budget for the proxy's *added* latency (µs) |
+| `latency_budget.overhead_p95_micros` | u64 | `750` | p95 added-latency budget (µs) |
+| `latency_budget.overhead_p99_micros` | u64 | `1000` | p99 added-latency budget (µs) |
+| `latency_budget.reference_workload` | String | `oltp-point-select` | Reference workload the budget is measured against |
 | `buffer_size` | usize | `8192` | TCP buffer size in bytes |
 | `pool_size` | usize | `50` | Backend connection pool size |
 | `pool_min_idle` | usize | `5` | Minimum idle connections to maintain |
@@ -274,7 +282,7 @@ Performance tuning settings.
 
 **Environment Variables**:
 ```bash
-SCRY_PERFORMANCE__TARGET_LATENCY_MS=1
+SCRY_PERFORMANCE__LATENCY_BUDGET__OVERHEAD_P99_MICROS=1000
 SCRY_PERFORMANCE__BUFFER_SIZE=16384
 SCRY_PERFORMANCE__POOL_SIZE=50
 SCRY_PERFORMANCE__POOL_QUEUE_DEPTH=500

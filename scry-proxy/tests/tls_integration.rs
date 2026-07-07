@@ -112,7 +112,7 @@ fn create_minimal_config() -> Config {
             parse_failure_mode: ParseFailureMode::Redact,
         },
         performance: PerformanceConfig {
-            target_latency_ms: 1,
+            latency_budget: scry::config::LatencyBudget::default(),
             connection_pooling: PoolingStrategy::Disabled,
             pool_size: 5,
             pool_min_idle: 1,

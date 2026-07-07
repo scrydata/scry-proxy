@@ -401,9 +401,46 @@ impl Default for TlsConfig {
     }
 }
 
+/// Latency budget for the proxy's *added* overhead (P5 §4.2).
+///
+/// "Added latency" is the wall-clock time attributable to the proxy itself —
+/// `total − backend − pool_acquire − queue` (see
+/// `observability::TimelinePhases::proxy_overhead_micros`) — NOT the total
+/// client-observed latency, which is dominated by backend execution. The budget
+/// is expressed per percentile because tail overhead matters more than the mean,
+/// and is defined against a named reference workload so the numbers are
+/// comparable across runs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LatencyBudget {
+    /// p50 added-latency budget, microseconds.
+    pub overhead_p50_micros: u64,
+    /// p95 added-latency budget, microseconds.
+    pub overhead_p95_micros: u64,
+    /// p99 added-latency budget, microseconds.
+    pub overhead_p99_micros: u64,
+    /// Name of the reference workload the budget is measured against.
+    pub reference_workload: String,
+}
+
+impl Default for LatencyBudget {
+    fn default() -> Self {
+        // Target <1ms added latency (CLAUDE.md, P5). Tail percentiles get more
+        // headroom; the numbers are a starting baseline, tightened under load in
+        // WP-13 once measured on a stable runner.
+        Self {
+            overhead_p50_micros: 250,
+            overhead_p95_micros: 750,
+            overhead_p99_micros: 1000,
+            reference_workload: "oltp-point-select".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PerformanceConfig {
-    pub target_latency_ms: u64,
+    /// Budget for the proxy's own added latency, per percentile (P5 §4.2).
+    #[serde(default)]
+    pub latency_budget: LatencyBudget,
     pub connection_pooling: PoolingStrategy,
     pub pool_size: usize,
     pub pool_min_idle: usize,
@@ -565,7 +602,7 @@ impl Default for Config {
                 parse_failure_mode: ParseFailureMode::Redact,
             },
             performance: PerformanceConfig {
-                target_latency_ms: 1,
+                latency_budget: LatencyBudget::default(),
                 connection_pooling: PoolingStrategy::Hybrid,
                 pool_size: 50,    // Sensible default; 10:1 with max_connections=500
                 pool_min_idle: 5, // Keep low for dev/test, increase for production
@@ -1140,6 +1177,32 @@ mod redacting_debug_tests {
         let dbg = format!("{config:?}");
         // Unset optional secrets render as None, not a redaction placeholder.
         assert!(dbg.contains("http_api_key: None"));
+    }
+}
+
+#[cfg(test)]
+mod latency_budget_tests {
+    use super::*;
+
+    #[test]
+    fn default_budget_targets_sub_millisecond_overhead() {
+        let b = Config::default().performance.latency_budget;
+        assert!(b.overhead_p50_micros <= b.overhead_p95_micros);
+        assert!(b.overhead_p95_micros <= b.overhead_p99_micros);
+        // <1ms added-latency target (CLAUDE.md, P5).
+        assert!(b.overhead_p99_micros <= 1000);
+        assert!(!b.reference_workload.is_empty());
+    }
+
+    #[test]
+    fn budget_is_a_known_config_path() {
+        // The new nested budget fields must be discoverable so env overrides
+        // like SCRY_PERFORMANCE__LATENCY_BUDGET__OVERHEAD_P99_MICROS are accepted.
+        let paths = valid_config_paths();
+        assert!(paths.contains("performance.latency_budget.overhead_p99_micros"));
+        assert!(paths.contains("performance.latency_budget.reference_workload"));
+        // The dead flat field is gone.
+        assert!(!paths.contains("performance.target_latency_ms"));
     }
 }
 
