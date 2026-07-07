@@ -658,58 +658,47 @@ impl ConnectionHandler {
         Ok(())
     }
 
-    /// Fresh-backend startup handshake for the pooled path that ALSO captures the
-    /// backend's client-facing startup response for warm reuse (WP-9 Task 8, P2
-    /// §5.3).
+    /// Backend-only Postgres startup + capture — the single routine that turns a
+    /// freshly-created, never-handshaked backend into a usable one (WP-9 Task 8,
+    /// P2 §5.3; whole-branch review fix).
     ///
-    /// Identical in effect to [`Self::perform_startup_handshake`], but it records
-    /// every byte the backend sends after `AuthenticationOk` (its `ParameterStatus`
-    /// messages, `BackendKeyData`, and terminating `ReadyForQuery`) and returns
-    /// them. The caller stores this on the pooled connection so a later client that
-    /// warm-reuses the same physical backend can be given a faithful startup
-    /// sequence via [`Self::replay_startup_to_client`] without the backend being
-    /// re-initialized.
-    async fn perform_startup_handshake_capturing(
-        &mut self,
+    /// Sends the StartupMessage to the backend, completes backend authentication,
+    /// and records every byte the backend sends after `AuthenticationOk` (its
+    /// `ParameterStatus` messages, `BackendKeyData`, and terminating
+    /// `ReadyForQuery`), returning them for warm-reuse replay.
+    ///
+    /// This routine is deliberately **backend-only**: it never reads from nor
+    /// writes to the client stream. It is shared by two callers:
+    /// - the session-start capture path
+    ///   ([`Self::perform_startup_handshake_capturing`]), which afterwards forwards
+    ///   the captured response to the client to complete the client's startup, and
+    /// - the mid-session reacquire path, where the client is already authenticated
+    ///   and past its own startup, so ONLY the backend needs initializing.
+    async fn initialize_backend_startup(
+        connection_id: u64,
+        backend_user: String,
+        backend_password: String,
+        backend_startup_bytes: &[u8],
         backend_stream: &mut (impl AsyncWriteExt + AsyncReadExt + Unpin),
     ) -> Result<Vec<u8>> {
-        let connection_id = self.connection_id;
-        debug!(connection_id, "Starting handshake (capturing for warm reuse)");
+        debug!(connection_id, "Initializing backend startup (backend-only, capturing for warm reuse)");
 
-        let authenticator =
-            Authenticator::new(Arc::clone(&self.config), self.authenticator.clone());
-
-        let auth_result = authenticator
-            .authenticate(&mut self.client_stream, &self.startup_data)
-            .await
-            .context("Client authentication failed")?;
-        debug!(connection_id, username = %auth_result.username, "Client authenticated");
-
-        // Forward startup to backend.
+        // Send the StartupMessage to the freshly-created backend.
         backend_stream
-            .write_all(&auth_result.startup_bytes)
+            .write_all(backend_startup_bytes)
             .await
             .context("Failed to forward startup to backend")?;
 
         // Handle backend authentication.
-        let backend_auth = crate::auth::BackendAuthenticator::new(
-            self.config.backend.user.clone(),
-            self.config.backend.password.clone(),
-        );
+        let backend_auth =
+            crate::auth::BackendAuthenticator::new(backend_user, backend_password);
         let remaining_data = backend_auth
             .authenticate(backend_stream, &[])
             .await
             .context("Backend authentication failed")?;
 
-        // Forward AuthenticationOk to client.
-        let auth_ok = crate::protocol::build_auth_ok();
-        self.client_stream
-            .write_all(&auth_ok)
-            .await
-            .context("Failed to send AuthenticationOk to client")?;
-
-        // Forward the rest of the backend's startup stream to the client AND
-        // capture it verbatim, up to and including ReadyForQuery.
+        // Capture the backend's client-facing startup response verbatim, up to and
+        // including ReadyForQuery. Nothing is forwarded to the client here.
         let mut captured: Vec<u8> = Vec::new();
         let mut pending = remaining_data;
         let mut backend_buffer = vec![0u8; 8192];
@@ -717,12 +706,7 @@ impl ConnectionHandler {
 
         loop {
             if !pending.is_empty() {
-                self.client_stream
-                    .write_all(&pending)
-                    .await
-                    .context("Failed to forward startup data to client")?;
                 captured.extend_from_slice(&pending);
-
                 if extractor.contains_ready_for_query(&pending) {
                     debug!(connection_id, "Backend startup complete (ReadyForQuery received)");
                     break;
@@ -737,15 +721,8 @@ impl ConnectionHandler {
             if n == 0 {
                 anyhow::bail!("Backend closed connection during startup");
             }
-            let data = &backend_buffer[..n];
-
-            self.client_stream
-                .write_all(data)
-                .await
-                .context("Failed to forward startup data to client")?;
-            captured.extend_from_slice(data);
-
-            if extractor.contains_ready_for_query(data) {
+            captured.extend_from_slice(&backend_buffer[..n]);
+            if extractor.contains_ready_for_query(&backend_buffer[..n]) {
                 debug!(connection_id, "Backend startup complete (ReadyForQuery received)");
                 break;
             }
@@ -754,9 +731,75 @@ impl ConnectionHandler {
         debug!(
             connection_id,
             captured_bytes = captured.len(),
-            "Handshake complete; captured backend startup response for warm reuse"
+            "Backend startup complete; captured backend startup response for warm reuse"
         );
         Ok(captured)
+    }
+
+    /// Fresh-backend startup handshake for the session-start pooled path that ALSO
+    /// captures the backend's client-facing startup response for warm reuse (WP-9
+    /// Task 8, P2 §5.3).
+    ///
+    /// Authenticates the CLIENT, then delegates the backend side to
+    /// [`Self::initialize_backend_startup`] (the single backend-startup routine),
+    /// and finally forwards the captured backend startup response to the client to
+    /// complete its startup sequence. Returns `(captured_startup_response,
+    /// backend_startup_bytes)`: the caller stores the capture on the pooled
+    /// connection for warm reuse, and retains the backend-directed
+    /// `StartupMessage` bytes so a later mid-session reacquire of a fresh backend
+    /// can initialize it identically.
+    async fn perform_startup_handshake_capturing(
+        &mut self,
+        backend_stream: &mut (impl AsyncWriteExt + AsyncReadExt + Unpin),
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        let connection_id = self.connection_id;
+        debug!(connection_id, "Starting handshake (capturing for warm reuse)");
+
+        let authenticator =
+            Authenticator::new(Arc::clone(&self.config), self.authenticator.clone());
+
+        let auth_result = authenticator
+            .authenticate(&mut self.client_stream, &self.startup_data)
+            .await
+            .context("Client authentication failed")?;
+        debug!(connection_id, username = %auth_result.username, "Client authenticated");
+
+        // Forward AuthenticationOk to client.
+        let auth_ok = crate::protocol::build_auth_ok();
+        self.client_stream
+            .write_all(&auth_ok)
+            .await
+            .context("Failed to send AuthenticationOk to client")?;
+
+        // Initialize the backend side (StartupMessage + backend auth) and capture
+        // its client-facing startup response for warm reuse.
+        let captured = Self::initialize_backend_startup(
+            connection_id,
+            self.config.backend.user.clone(),
+            self.config.backend.password.clone(),
+            &auth_result.startup_bytes,
+            backend_stream,
+        )
+        .await?;
+
+        // Forward the captured backend startup response to the client, completing
+        // the client's startup. Transparent: identical bytes, delivered together
+        // (the same shape as the warm-reuse replay in `replay_startup_to_client`).
+        self.client_stream
+            .write_all(&captured)
+            .await
+            .context("Failed to forward startup data to client")?;
+        self.client_stream
+            .flush()
+            .await
+            .context("Failed to flush startup response to client")?;
+
+        debug!(
+            connection_id,
+            captured_bytes = captured.len(),
+            "Handshake complete; captured backend startup response for warm reuse"
+        );
+        Ok((captured, auth_result.startup_bytes))
     }
 
     /// Warm-reuse startup: serve a NEW client on a backend that has already
@@ -768,7 +811,13 @@ impl ConnectionHandler {
     /// captured startup response (`ParameterStatus*` + `BackendKeyData` +
     /// `ReadyForQuery`). No bytes are sent to the backend, so its clean idle
     /// state is preserved for the client's first real query.
-    async fn replay_startup_to_client(&mut self, captured: &[u8]) -> Result<()> {
+    ///
+    /// Returns the backend-directed `StartupMessage` bytes derived from this
+    /// client's startup. Although the warm-reused backend needs no
+    /// re-initialization, the handler retains these bytes so that a later
+    /// mid-session reacquire which lands on a fresh, never-handshaked backend can
+    /// initialize it via [`Self::initialize_backend_startup`].
+    async fn replay_startup_to_client(&mut self, captured: &[u8]) -> Result<Vec<u8>> {
         let connection_id = self.connection_id;
         debug!(connection_id, "Warm-reuse handshake: authenticating client, replaying startup");
 
@@ -792,7 +841,7 @@ impl ConnectionHandler {
         self.client_stream.flush().await.context("Failed to flush replayed startup response")?;
 
         debug!(connection_id, "Warm-reuse handshake complete");
-        Ok(())
+        Ok(auth_result.startup_bytes)
     }
 
     /// Handle connection with a managed connection from PoolManager
@@ -854,21 +903,26 @@ impl ConnectionHandler {
         //   only the CLIENT and replay the captured startup response to it —
         //   NEVER re-send a StartupMessage to the already-initialized backend
         //   (doing so corrupts its protocol stream and closes the session).
-        match managed_conn.startup_response() {
+        // The backend-directed `StartupMessage` bytes for this client, retained so
+        // a mid-session reacquire that lands on a fresh, never-handshaked backend
+        // (pool grew during this session) can initialize it identically instead of
+        // forwarding the client's next query to an un-initialized backend.
+        let backend_startup_bytes: Vec<u8> = match managed_conn.startup_response() {
             Some(captured) => {
                 let captured = captured.to_vec();
                 self.replay_startup_to_client(&captured)
                     .await
-                    .context("Client handshake on warm-reused backend failed")?;
+                    .context("Client handshake on warm-reused backend failed")?
             }
             None => {
-                let captured = self
+                let (captured, backend_startup_bytes) = self
                     .perform_startup_handshake_capturing(managed_conn.stream_mut()?)
                     .await
                     .context("Startup handshake failed")?;
                 managed_conn.set_startup_response(captured);
+                backend_startup_bytes
             }
-        }
+        };
 
         loop {
             // Copy the deadline for this iteration so the timeout branch owns it
@@ -1202,6 +1256,37 @@ impl ConnectionHandler {
                                         new_is_pinned = managed_conn.is_pinned(),
                                         "Re-acquired connection from pool"
                                     );
+
+                                    // WP-9 whole-branch review fix: Task 8 made a
+                                    // physical backend perform its Postgres startup
+                                    // exactly once, lazily, only on the
+                                    // session-start path. If the pool GREW during
+                                    // this active session (all existing backends
+                                    // busy), deadpool may hand us a brand-new
+                                    // backend that has never received a
+                                    // StartupMessage and is not authenticated.
+                                    // Forwarding the client's next query to it would
+                                    // desync the session. Initialize its BACKEND
+                                    // side here (the client is already authenticated
+                                    // and past its own startup, so we touch ONLY the
+                                    // backend, never the client stream) and capture
+                                    // its startup response for future warm reuse. A
+                                    // warm/reused backend already has a captured
+                                    // startup response and is skipped.
+                                    if managed_conn.startup_response().is_none() {
+                                        let captured = Self::initialize_backend_startup(
+                                            connection_id,
+                                            self.config.backend.user.clone(),
+                                            self.config.backend.password.clone(),
+                                            &backend_startup_bytes,
+                                            managed_conn.stream_mut()?,
+                                        )
+                                        .await
+                                        .context(
+                                            "Backend startup on mid-session reacquired connection failed",
+                                        )?;
+                                        managed_conn.set_startup_response(captured);
+                                    }
 
                                     // No state replay: under restrict-by-pinning
                                     // (WP-9 Task 6, P2 §4.5) this block is reached
@@ -2276,6 +2361,72 @@ mod tests {
         assert!(
             error_str.contains("timeout waiting for connection"),
             "Should contain timeout message"
+        );
+    }
+
+    /// WP-9 whole-branch review fix: the backend-only startup routine used by the
+    /// mid-session reacquire path must turn a freshly-created, never-handshaked
+    /// backend into a usable, Postgres-initialized backend — sending the
+    /// StartupMessage, completing backend auth, and capturing the backend's
+    /// client-facing startup response for warm reuse — WITHOUT touching the
+    /// client stream.
+    #[tokio::test]
+    async fn test_initialize_backend_startup_handshakes_fresh_backend_and_captures_response() {
+        use tokio::io::duplex;
+
+        // The proxy->backend StartupMessage bytes (length 8, protocol 3.0). Our
+        // fake backend does not parse these; it only asserts they arrive.
+        let backend_startup_bytes: Vec<u8> = vec![0, 0, 0, 8, 0, 3, 0, 0];
+
+        let (mut proxy_side, mut backend_side) = duplex(8192);
+
+        // Fake un-handshaked backend: expects the StartupMessage, then replies
+        // with AuthenticationOk + ParameterStatus + BackendKeyData + ReadyForQuery.
+        let backend_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            let n = backend_side.read(&mut buf).await.unwrap();
+            // The backend must have received the StartupMessage before any query.
+            assert_eq!(&buf[..n], &[0u8, 0, 0, 8, 0, 3, 0, 0]);
+
+            let mut resp: Vec<u8> = Vec::new();
+            // AuthenticationOk
+            resp.extend_from_slice(&[b'R', 0, 0, 0, 8, 0, 0, 0, 0]);
+            // ParameterStatus server_version=16.0
+            resp.push(b'S');
+            let payload = b"server_version\016.0\0";
+            resp.extend_from_slice(&((4 + payload.len()) as i32).to_be_bytes());
+            resp.extend_from_slice(payload);
+            // BackendKeyData (pid=1, secret=2)
+            resp.extend_from_slice(&[b'K', 0, 0, 0, 12, 0, 0, 0, 1, 0, 0, 0, 2]);
+            // ReadyForQuery (Idle)
+            resp.extend_from_slice(&[b'Z', 0, 0, 0, 5, b'I']);
+            backend_side.write_all(&resp).await.unwrap();
+
+            // Keep the backend half open so the duplex isn't torn down early.
+            let _ = backend_side.read(&mut buf).await;
+        });
+
+        let captured = ConnectionHandler::initialize_backend_startup(
+            42,
+            "postgres".to_string(),
+            String::new(),
+            &backend_startup_bytes,
+            &mut proxy_side,
+        )
+        .await
+        .expect("backend startup on a fresh backend should succeed");
+
+        drop(proxy_side);
+        let _ = backend_task.await;
+
+        // The captured startup response is the backend's client-facing sequence
+        // AFTER AuthenticationOk (which backend auth consumes): it starts with the
+        // first ParameterStatus 'S' and contains a terminating ReadyForQuery.
+        assert_eq!(captured[0], b'S', "capture must begin at ParameterStatus, not AuthenticationOk");
+        let extractor = MessageExtractor::new();
+        assert!(
+            extractor.contains_ready_for_query(&captured),
+            "captured startup response must include ReadyForQuery (backend is ready for a query)"
         );
     }
 }
