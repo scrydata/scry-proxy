@@ -49,6 +49,40 @@ curl http://localhost:9090/metrics
 
 For a comprehensive getting started guide, see **[Getting Started](docs/getting-started.md)**.
 
+## Run the published image
+
+The recommended way to run Scry is the prebuilt container image, published to
+the GitHub Container Registry. Images are multi-arch (`linux/amd64` +
+`linux/arm64`) and tagged with each release version and `latest`:
+
+```bash
+docker pull ghcr.io/scrydata/scry-proxy:latest
+```
+
+Scry is configured with environment variables (12-factor). Point it at your
+backend database, expose the client-facing port (`5433`) and the metrics port
+(`9090`), then send your application's connections to the proxy instead of the
+database:
+
+```bash
+docker run --rm \
+  -p 5433:5433 -p 9090:9090 \
+  -e SCRY_BACKEND__HOST=your-db.example.com \
+  -e SCRY_BACKEND__PORT=5432 \
+  ghcr.io/scrydata/scry-proxy:latest
+
+# Application (or psql) connects to the proxy on 5433; it forwards to the backend
+psql -h 127.0.0.1 -p 5433 -U postgres
+
+# Prometheus metrics
+curl http://localhost:9090/metrics
+```
+
+See the [Environment Variables Reference](#environment-variables-reference)
+and **[Configuration](docs/configuration.md)** for the full set of options
+(TLS, circuit breaker, event publishing). The `just`-based [Quick Start](#quick-start)
+above builds from source and is intended for local development.
+
 ## Architecture
 
 Scry is built on a high-performance, async architecture:
